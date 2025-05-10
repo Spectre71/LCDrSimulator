@@ -14,3 +14,6 @@ C++ applets that allow you to simulate different LC droplets based on their phys
 ## Can't:
 - simualte bipolar configuration,
 - simulate light propagation through such an anisotropic field such as that of an LC droplet.
+
+# Dependencies
+- Eigen
