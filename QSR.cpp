@@ -578,7 +578,7 @@ int main() {
         int Nx_default = 100, Ny_default = 100, Nz_default = 100, maxIterations_default = 100000;
         double dx_default = 1e-8, dy_default = 1e-8, dz_default = 1e-8;
         double S0_default = 0.5;
-        double A_default = -0.172e6, B_default = 2.12e6, C_default = 1.73e6; // A_default is at phase transition \sim 308 K
+        double A_default = -1.72e6, B_default = 2.12e6, C_default = 1.73e6; // A_default is at \sim 298 K
         double kappa_default = 6.5e-12, gamma_default = 0.1, dt_default = 1e-16;
         double T_default = 298.0, alpha_default = 0.172e6, T_star_default = 308.0;
         double K_field_default = 1e6; // field coupling constant
