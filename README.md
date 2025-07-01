@@ -12,7 +12,7 @@ C++ applets that allow you to simulate different LC droplets based on their phys
 ## Can:
 - effectively simulates a relaxation process of the free energy in a radially configured LC droplet (hedgehog config.) with strong radial ancgoring at the boundary (Solves Landau de Gennes Q-Tensor equations and energy minimization).
 ## Can't:
-- simualte bipolar configuration,
+- simulate bipolar configuration,
 - simulate light propagation through such an anisotropic field such as that of an LC droplet.
 
 # Dependencies
