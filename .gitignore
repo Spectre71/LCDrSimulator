@@ -1,0 +1,16 @@
+output
+pics
+venv
+output_temp_sweep
+x64
+free_energy_vs_iteration.dat
+nematic_field_final.dat
+Qtensor_output_final.dat
+QSR_cpu
+QSR_cuda
+QSR.sln
+QSR.vcxproj
+QSR.vcxproj.filters
+*.user
+.vscode
+.vs
