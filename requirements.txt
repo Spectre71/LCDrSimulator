@@ -1,0 +1,6 @@
+# Python requirements for QSR visualization tools
+numpy
+matplotlib
+imageio
+imageio-ffmpeg
+pillow
