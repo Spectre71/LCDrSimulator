@@ -5,7 +5,6 @@ import glob
 import imageio.v2 as imageio
 import re
 import io
-import shutil
 from typing import Any
 
 def load_qtensor_data(path, comments="#"):
