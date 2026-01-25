@@ -112,3 +112,79 @@ __host__ __device__ NematicField calculateNematicFieldDevice(const QTensor& q_5c
 /*
 nvcc -O3 -arch=sm_75 -std=c++17 -o QSR_cuda QSR.cu
 */
+
+// -------- TESTS ---------
+/*
+
+Select initialization mode: [0] random, [1] radial, [2] isotropic+noise (default: 1): 2
+
+--- Spatial Parameters ---
+Enter grid size Nx [100]: 
+Enter grid size Ny [100]: 
+Enter grid size Nz [100]: 
+Enter dx (m) [1e-08]: 
+Enter dy (m) [1e-08]: 
+Enter dz (m) [1e-08]: 
+
+--- Landau-de Gennes Material Parameters ---
+Enter a (J/m^3/K) [44000]: 
+Enter b (J/m^3) [1.413e+06]: 
+Enter c (J/m^3) [1.153e+06]: 
+Enter T (K) [300]: 312
+Enter T* (K) [A=0, isotropic spinodal] [308]: 
+Enter Bulk Energy convention (1=std, 2=ravnik) [1]: 
+
+Bulk convention: std
+Computed S_c (heuristic) = 0.612749, S_eq(T=312K) = 0
+Bulk transition estimates (uniaxial, homogeneous):
+  T* (A=0, isotropic spinodal) = 308 K
+  T_NI (coexistence, global min) ≈ 310.186 K
+  T_spin,N (nematic disappears)  ≈ 310.46 K
+Enter initial S0 [0.5]: 
+
+--- Elastic and Dynamic Parameters ---
+Enter kappa (J/m) [6.5e-12]: 
+Use Frank-to-LdG mapping with K1=K3 ≠ K2? (y/n) [n]: y
+Enter K1=K3 [6.5e-12]: 
+Enter K2 [4e-12]: 8e-12
+Enter S_ref for mapping (default: S_eq(T)) [0.5]: 
+Mapped L1=1.6e-11, L2=-6e-12, L3=0 (Q=S(nn-I/3), S_ref=0.5, Kappa set to 0)
+Enable correlation-length guard (abort if xi is under-resolved)? (y/n) [y]: n
+
+--- Correlation Length (xi) Estimate ---
+Using L_eff=1.6e-11 J/m (L1), L2=-6e-12
+Bulk convention = std
+Bulk stiffness (linear) |A_lin| = |A| = |3 a (T-T*)| = 528000 J/m^3
+Bulk curvature at S_eq: unavailable (likely isotropic / above T*)
+xi_lin ≈ sqrt(L_eff/|A_lin|) = 5.50482e-09 m
+xi_used = 5.50482e-09 m,  xi/min(dx,dy,dz) = 0.550482
+Suggested resolution: dx ≲ xi/3 => dx ≲ 1.83494e-09 m
+Droplet radius R ≈ 5e-07 m,  R/xi ≈ 90.8295
+Enter weak anchoring W (J/m^2) [0]: 
+Enter gamma (Pa·s) [0.1]: 
+Enter iterations [100000]: 2000000
+Enter print freq [200]: 1000
+Enter tolerance [0.01]: 
+Enter radiality convergence eps RbEps (relative ΔR̄) [0.01]: 
+
+Select simulation mode: [1] Single Temp, [2] Temp Range, [3] Quench (time-dependent T):  [1]: 3
+Output directory for quench results [default: output_quench]: 
+Directory 'output_quench' exists. Delete it and start fresh? (y/n) [y]:  
+Quench protocol (1=step, 2=ramp) [2]: 
+T_high (K) [312]: 
+T_low (K) [307]: 305
+Pre-equilibration iterations at T_high [0]: 10000
+----------------------------------------------
+Ramp iterations (>=1) [1000]: 100 # WHAT WE ARE CURRENTLY TESTING FOR
+----------------------------------------------
+Total iterations [2000000]: 
+Log/print freq [1000]: 
+Snapshot freq to output directory (0=off) [1000]: 
+Noise amplitude for isotropic init [0.001]: 
+
+Maximum stable dt = 5.20833e-08 s
+Enter time step dt (s) [5.20833e-08]: 1e-9
+Enable early-stop once converged at final T? (rel. ΔF/F + rel. ΔR̄/R̄) (y/n) [n]: y
+Radiality threshold (Rbar, 0=disable) [0.998]: 0.995
+Do you want output in the console every 1000 iterations? (y/n): n
+*/

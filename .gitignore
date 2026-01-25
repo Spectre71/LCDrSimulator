@@ -16,3 +16,4 @@ QSR.vcxproj.filters
 .vscode
 .vs
 GEMINI.md
+__pycache__

@@ -211,6 +211,40 @@ def load_nematic_field_data(path, comments="#"):
         text = re.sub(r"(?<=\d)[uU]([+-]\d+)", r"e\1", text)
         return np.loadtxt(io.StringIO(text), comments=comments)
 
+
+def infer_grid_dims_from_nematic_field_file(path: str) -> tuple[int, int, int]:
+    """Infer (Nx,Ny,Nz) from a nematic field dump file.
+
+    Expected columns include integer i j k as the first 3 columns.
+    Uses a streaming scan (no full load into memory).
+    """
+    max_i = -1
+    max_j = -1
+    max_k = -1
+    with open(path, 'r', encoding='utf-8', errors='replace') as f:
+        for line in f:
+            if not line or line.startswith('#'):
+                continue
+            parts = line.split()
+            if len(parts) < 3:
+                continue
+            try:
+                i = int(float(parts[0]))
+                j = int(float(parts[1]))
+                k = int(float(parts[2]))
+            except ValueError:
+                continue
+            if i > max_i:
+                max_i = i
+            if j > max_j:
+                max_j = j
+            if k > max_k:
+                max_k = k
+
+    if max_i < 0 or max_j < 0 or max_k < 0:
+        raise ValueError(f"Could not infer grid dims from: {path}")
+    return max_i + 1, max_j + 1, max_k + 1
+
 def plot_nematic_field_slice(
     filename,
     Nx,
@@ -226,6 +260,7 @@ def plot_nematic_field_slice(
     vmin=None,
     vmax=None,
     print_stats=True,
+    arrows_per_axis=None,
 ):
     """
     Loads pre-calculated nematic field data (S, n), plots a slice, and saves it.
@@ -291,14 +326,36 @@ def plot_nematic_field_slice(
         nz_view = nz[x_min:x_max, y_min:y_max]
 
         extent = (x_min, x_max, y_min, y_max)
-        step = 1 # plot EVERY arrow in zoomed view
+        step = 1  # default: dense in zoomed view
     else:
         S_view = S
         nx_view = nx
         ny_view = ny
         nz_view = nz
         extent = (0, Nx, 0, Ny)
-        step = max(Nx // Nx, 1)  # 20 per axis
+
+        # Default: dense (historical behavior)
+        step = 1
+
+    # --- Quiver density control ---
+    # arrows_per_axis: target number of arrows along the longest axis.
+    # - None: keep historical behavior
+    # - 0: disable quiver
+    if arrows_per_axis is not None:
+        try:
+            arrows_per_axis_int = int(arrows_per_axis)
+        except Exception:
+            arrows_per_axis_int = None
+
+        if arrows_per_axis_int is not None:
+            if arrows_per_axis_int <= 0:
+                step = None  # sentinel: disable quiver
+            else:
+                width = int(extent[1] - extent[0])
+                height = int(extent[3] - extent[2])
+                max_dim = max(width, height)
+                # ceil(max_dim / arrows_per_axis) keeps arrow count <= target
+                step = max(1, int(np.ceil(max_dim / float(arrows_per_axis_int))))
     
     # --- Plotting ---
     fig, ax = plt.subplots(figsize=(9, 8))
@@ -350,28 +407,34 @@ def plot_nematic_field_slice(
     im = ax.imshow(field.T, origin='lower', cmap=cmap, extent=extent, vmin=vmin_use, vmax=vmax_use, interpolation=interpol)
     fig.colorbar(im, ax=ax, label=label)
     
-    # Create grid for quiver
-    x_range = np.arange(extent[0], extent[1], step)
-    y_range = np.arange(extent[2], extent[3], step)
-    x_grid, y_grid = np.meshgrid(x_range, y_range)
+    if step is not None:
+        # Create grid for quiver
+        x_range = np.arange(extent[0], extent[1], step)
+        y_range = np.arange(extent[2], extent[3], step)
+        x_grid, y_grid = np.meshgrid(x_range, y_range)
 
-    # Extract data for quiver at step intervals
-    # Indices for slicing the *view* arrays
-    ix = np.arange(0, S_view.shape[0], step)
-    iy = np.arange(0, S_view.shape[1], step)
+        # Extract data for quiver at step intervals
+        # Indices for slicing the *view* arrays
+        ix = np.arange(0, S_view.shape[0], step)
+        iy = np.arange(0, S_view.shape[1], step)
 
-    # x_grid corresponds to columns (i), y_grid to rows (j)
-    nx_plot = nx_view[np.ix_(ix, iy)].T 
-    ny_plot = ny_view[np.ix_(ix, iy)].T
-    S_plot_mask = S_view[np.ix_(ix, iy)].T
+        # x_grid corresponds to columns (i), y_grid to rows (j)
+        nx_plot = nx_view[np.ix_(ix, iy)].T
+        ny_plot = ny_view[np.ix_(ix, iy)].T
+        S_plot_mask = S_view[np.ix_(ix, iy)].T
 
-    mask = S_plot_mask > 0.1
+        mask = S_plot_mask > 0.1
 
-    if arrowColor is None: arrowColor = 'black'
+        if arrowColor is None:
+            arrowColor = 'black'
 
-    ax.quiver(x_grid[mask], y_grid[mask], nx_plot[mask], ny_plot[mask],
-              color=arrowColor, scale=30 if zoom_radius is None else 15, # Bigger arrows when zoomed
-              headwidth=3, pivot='middle')
+        ax.quiver(
+            x_grid[mask], y_grid[mask], nx_plot[mask], ny_plot[mask],
+            color=arrowColor,
+            scale=30 if zoom_radius is None else 15,
+            headwidth=3,
+            pivot='middle',
+        )
     
     # Extract iteration number from filename for the title
     match = re.search(r'(\d+)', os.path.basename(filename))
@@ -472,12 +535,31 @@ def energy_components():
     plt.savefig('pics/energy_components_vs_iteration.png', dpi=150)
     plt.show()
 
-def create_nematic_field_animation(data_dir, output_gif, Nx, Ny, Nz):
+def create_nematic_field_animation(
+    data_dir,
+    output_gif,
+    Nx,
+    Ny,
+    Nz,
+    *,
+    frames_dir="frames",
+    duration=0.1,
+    frame_stride=1,
+    color_field='S',
+    interpol='nearest',
+    zoom_radius=None,
+    arrowColor=None,
+    arrows_per_axis=None,
+    consistent_scale=True,
+):
+    """Create a GIF from nematic field snapshots in a directory.
+
+    Uses files: {data_dir}/nematic_field_iter_*.dat
     """
-    Finds all nematic field snapshots, plots them, and creates a GIF.
-    """
+    if frame_stride is None or frame_stride < 1:
+        frame_stride = 1
+
     # Create a directory for temporary frames
-    frames_dir = "frames"
     if not os.path.exists(frames_dir):
         os.makedirs(frames_dir)
     else: # Clean up old frames from a previous run
@@ -487,7 +569,7 @@ def create_nematic_field_animation(data_dir, output_gif, Nx, Ny, Nz):
     # Find all nematic field snapshot files and sort them numerically
     files = glob.glob(os.path.join(data_dir, 'nematic_field_iter_*.dat'))
     if not files:
-        print("Error: No 'nematic_field_iter_*.dat' files found in the 'output' directory.")
+        print(f"Error: No 'nematic_field_iter_*.dat' files found in '{data_dir}'.")
         return
         
     def _extract_iter_num(path):
@@ -496,18 +578,65 @@ def create_nematic_field_animation(data_dir, output_gif, Nx, Ny, Nz):
 
     files.sort(key=_extract_iter_num)
 
+    if frame_stride > 1:
+        files = files[::frame_stride]
+
+    # For smooth animations, keep color scaling constant across frames when possible.
+    vmin, vmax = None, None
+    cf = (color_field or 'S').strip().lower()
+    if consistent_scale:
+        if cf in ('s', 'scalar', 'order', 'orderparameter'):
+            z_slice = Nz // 2
+            vals = []
+            for fp in files:
+                try:
+                    S_arr, _, _, _ = _load_nematic_slice_arrays(fp, Nx, Ny, Nz, z_slice)
+                except Exception:
+                    continue
+                v = S_arr[np.isfinite(S_arr)]
+                v = v[v > 0.1]
+                if v.size:
+                    vals.append(v)
+            if vals:
+                vv = np.concatenate(vals)
+                vmin = 0.0
+                vmax = float(np.percentile(vv, 99.0))
+                if vmax <= vmin:
+                    vmax = float(np.max(vv))
+                if vmax <= vmin:
+                    vmax = vmin + 1e-6
+        elif cf in ('nz', 'n_z'):
+            vmin, vmax = -1.0, 1.0
+        elif cf in ('nperp', 'n_perp', 'perp', 'nxy', 'n_xy'):
+            vmin, vmax = 0.0, 1.0
+
     print(f"Found {len(files)} nematic field snapshots. Generating frames...")
 
     frame_paths = []
     for i, file in enumerate(files):
         frame_path = os.path.join(frames_dir, f'frame_{i:04d}.png')
         print(f"  - Plotting {file} -> {frame_path}")
-        plot_nematic_field_slice(file, Nx, Ny, Nz, output_path=frame_path)
+        plot_nematic_field_slice(
+            file,
+            Nx,
+            Ny,
+            Nz,
+            output_path=frame_path,
+            arrowColor=arrowColor,
+            zoom_radius=zoom_radius,
+            interpol=interpol,
+            color_field=color_field,
+            vmin=vmin,
+            vmax=vmax,
+            print_stats=False,
+            arrows_per_axis=arrows_per_axis,
+        )
         frame_paths.append(frame_path)
 
     # Create GIF from the generated frames
     print(f"\nStitching {len(frame_paths)} frames into {output_gif}...")
-    writer: Any = imageio.get_writer(output_gif, mode='I', duration=0.1)
+    os.makedirs(os.path.dirname(output_gif) or '.', exist_ok=True)
+    writer: Any = imageio.get_writer(output_gif, mode='I', duration=float(duration))
     try:
         for frame_path in frame_paths:
             image = imageio.imread(frame_path)
@@ -588,6 +717,124 @@ def plotS_F():
     plt.show()
 
 
+def _resolve_quench_log_path(path: str) -> str:
+    """Resolve a quench log file path.
+
+    Accepts either a file path or a directory (e.g. 'output_quench').
+    Prefers quench_log.dat, then quench_log.csv.
+    """
+    if not path:
+        path = 'output_quench'
+
+    if os.path.isdir(path):
+        cand_dat = os.path.join(path, 'quench_log.dat')
+        cand_csv = os.path.join(path, 'quench_log.csv')
+        if os.path.exists(cand_dat):
+            return cand_dat
+        if os.path.exists(cand_csv):
+            return cand_csv
+
+    return path
+
+
+def load_quench_log(path: str = 'output_quench'):
+    """Load quench log produced by QSR_cuda/QSR_cpu.
+
+    Expected header columns (comma-separated):
+      iteration,time_s,T_K,bulk,elastic,total,radiality,avg_S
+    """
+    log_path = _resolve_quench_log_path(path)
+    if not os.path.exists(log_path):
+        raise FileNotFoundError(f"Quench log not found: {log_path}")
+
+    data = np.genfromtxt(log_path, delimiter=',', names=True, dtype=float, encoding='utf-8')
+    if data.size == 0:
+        raise ValueError(f"Quench log is empty or unreadable: {log_path}")
+    return data, log_path
+
+
+def plot_quench_log(path: str = 'output_quench', out_dir: str = 'pics', show: bool = True):
+    """Plot quench diagnostics: T(t), energy components, total energy, radiality, and <S>.
+
+    Saves a summary figure to pics/quench_summary.png (and also returns (fig, axes)).
+    """
+    data, log_path = load_quench_log(path)
+
+    # Support both scalar row and vector
+    it = np.atleast_1d(data['iteration']).astype(float)
+    t = np.atleast_1d(data['time_s']).astype(float)
+    T = np.atleast_1d(data['T_K']).astype(float)
+    bulk = np.atleast_1d(data['bulk']).astype(float)
+    elastic = np.atleast_1d(data['elastic']).astype(float)
+    total = np.atleast_1d(data['total']).astype(float)
+    radial = np.atleast_1d(data['radiality']).astype(float)
+    avgS = np.atleast_1d(data['avg_S']).astype(float)
+
+    # Relative energy change between consecutive log points
+    rel_dF = np.full_like(total, np.nan)
+    if total.size >= 2:
+        denom = np.where(np.abs(total[:-1]) > 0.0, total[:-1], np.nan)
+        rel_dF[1:] = np.abs((total[1:] - total[:-1]) / denom)
+
+    os.makedirs(out_dir, exist_ok=True)
+
+    fig, axes = plt.subplots(2, 2, figsize=(12, 8))
+    axT, axE, axR, axS = axes[0, 0], axes[0, 1], axes[1, 0], axes[1, 1]
+
+    # T(t)
+    axT.plot(t, T, '-', lw=2)
+    axT.set_xlabel('time [s]')
+    axT.set_ylabel('T [K]')
+    axT.set_title('Temperature protocol')
+    axT.grid(True, alpha=0.3)
+
+    # Energies
+    axE.plot(t, total, '-', lw=2, label='total')
+    axE.plot(t, bulk, '--', lw=1.5, label='bulk')
+    axE.plot(t, elastic, '--', lw=1.5, label='elastic')
+    axE.set_xlabel('time [s]')
+    axE.set_ylabel('Energy')
+    axE.set_title('Energy vs time')
+    axE.grid(True, alpha=0.3)
+    axE.legend()
+
+    # Radiality and rel dF
+    axR.plot(t, radial, '-', lw=2, label='R̄ (radiality)')
+    axR.set_xlabel('time [s]')
+    axR.set_ylabel('R̄')
+    axR.set_ylim(0.0, 1.01)
+    axR.grid(True, alpha=0.3)
+    axR.set_title('Radiality')
+    axR.legend(loc='lower right')
+
+    axR2 = axR.twinx()
+    axR2.plot(t, rel_dF, ':', lw=1.8, color='tab:red', label='|ΔF/F|')
+    axR2.set_ylabel('|ΔF/F|')
+    axR2.set_yscale('log')
+    axR2.grid(False)
+
+    # Average S
+    axS.plot(t, avgS, '-', lw=2)
+    axS.set_xlabel('time [s]')
+    axS.set_ylabel('<S> (droplet)')
+    axS.set_title('Average order parameter')
+    axS.grid(True, alpha=0.3)
+
+    base = os.path.basename(log_path)
+    fig.suptitle(f"Quench log: {base}")
+    fig.tight_layout(rect=(0, 0, 1, 0.96))
+
+    out_path = os.path.join(out_dir, 'quench_summary.png')
+    fig.savefig(out_path, dpi=200)
+    print(f"Saved quench summary plot -> {out_path}")
+
+    if show:
+        plt.show()
+    else:
+        plt.close(fig)
+    return fig, axes
+
+
 def _parse_temperature_from_dir(d):
     # Accept paths like output_temp_sweep/T_300.000000/
     base = os.path.basename(os.path.normpath(d))
@@ -619,6 +866,253 @@ def _load_nematic_slice_arrays(path, Nx, Ny, Nz, z_slice):
             nz[i, j] = row[6]
 
     return S, nx, ny, nz
+
+
+def _wrap_to_pi(x: np.ndarray) -> np.ndarray:
+    """Wrap angles to (-pi, pi]."""
+    return (x + np.pi) % (2.0 * np.pi) - np.pi
+
+
+def defect_density_2d_from_slice(
+    S: np.ndarray,
+    nx: np.ndarray,
+    ny: np.ndarray,
+    *,
+    S_threshold: float = 0.1,
+    charge_cutoff: float = 0.25,
+):
+    """Compute a simple 2D nematic defect-density proxy on a slice.
+
+    Uses the doubled-angle field psi = 2*theta, theta=atan2(ny,nx) to respect n~ -n.
+    Computes the winding on each plaquette and counts |s|>charge_cutoff.
+
+    Returns:
+      density: defects per plaquette (lattice units)
+      s_map: topological charge per plaquette (shape (Nx-1,Ny-1))
+
+    Notes:
+    - This is a 2D proxy (mid-plane slice). For full 3D line-defects, you'd need 3D analysis.
+    """
+    S = np.asarray(S)
+    nx = np.asarray(nx)
+    ny = np.asarray(ny)
+    if S.shape != nx.shape or S.shape != ny.shape:
+        raise ValueError("S,nx,ny must have the same shape")
+
+    mask = (S > float(S_threshold)) & np.isfinite(S) & np.isfinite(nx) & np.isfinite(ny)
+    theta = np.arctan2(ny, nx)
+    psi = 2.0 * theta
+
+    # Plaquette corners
+    p00 = psi[:-1, :-1]
+    p10 = psi[1:, :-1]
+    p11 = psi[1:, 1:]
+    p01 = psi[:-1, 1:]
+
+    # Wrapped increments around plaquette
+    d1 = _wrap_to_pi(p10 - p00)
+    d2 = _wrap_to_pi(p11 - p10)
+    d3 = _wrap_to_pi(p01 - p11)
+    d4 = _wrap_to_pi(p00 - p01)
+    dsum = d1 + d2 + d3 + d4
+
+    w = dsum / (2.0 * np.pi)  # winding of psi
+    s_map = 0.5 * w  # nematic charge
+
+    plaq_mask = mask[:-1, :-1] & mask[1:, :-1] & mask[1:, 1:] & mask[:-1, 1:]
+    s_map = np.where(plaq_mask, s_map, 0.0)
+
+    defects = np.abs(s_map) > float(charge_cutoff)
+    denom = int(np.count_nonzero(plaq_mask))
+    density = (float(np.count_nonzero(defects)) / float(denom)) if denom > 0 else 0.0
+    return density, s_map
+
+
+def correlation_length_2d_from_slice(
+    S: np.ndarray,
+    nx: np.ndarray,
+    ny: np.ndarray,
+    *,
+    S_threshold: float = 0.1,
+    max_r: int | None = None,
+    target: float = np.e ** (-1.0),
+):
+    """Estimate a 2D correlation length xi from a nematic slice.
+
+    Constructs complex order field q = exp(i*psi) with psi=2*atan2(ny,nx) and computes
+    a masked autocorrelation via FFT. Returns xi in lattice units as first r where C(r)<target.
+    """
+    S = np.asarray(S)
+    nx = np.asarray(nx)
+    ny = np.asarray(ny)
+    if S.shape != nx.shape or S.shape != ny.shape:
+        raise ValueError("S,nx,ny must have the same shape")
+
+    mask = (S > float(S_threshold)) & np.isfinite(S) & np.isfinite(nx) & np.isfinite(ny)
+    if np.count_nonzero(mask) < 16:
+        return float('nan'), np.array([]), np.array([])
+
+    theta = np.arctan2(ny, nx)
+    psi = 2.0 * theta
+    q = np.exp(1j * psi) * mask
+
+    # Mask-normalized autocorrelation using FFT
+    Fq = np.fft.fft2(q)
+    corr = np.fft.ifft2(Fq * np.conj(Fq)).real
+    Fm = np.fft.fft2(mask.astype(float))
+    norm = np.fft.ifft2(Fm * np.conj(Fm)).real
+
+    with np.errstate(divide='ignore', invalid='ignore'):
+        C = np.where(norm > 0, corr / norm, 0.0)
+
+    # Shift zero-lag to center for radial averaging
+    C = np.fft.fftshift(C)
+    cx = C.shape[0] // 2
+    cy = C.shape[1] // 2
+    C0 = float(C[cx, cy])
+    if not np.isfinite(C0) or C0 == 0.0:
+        return float('nan'), np.array([]), np.array([])
+    C = C / C0
+
+    nxp, nyp = C.shape
+    yy, xx = np.ogrid[:nxp, :nyp]
+    rr = np.sqrt((yy - cx) ** 2 + (xx - cy) ** 2)
+    r_int = rr.astype(np.int32)
+
+    if max_r is None:
+        max_r = int(min(nxp, nyp) // 2)
+    max_r = int(max(2, min(max_r, r_int.max())))
+
+    # radial average
+    flat_r = r_int.ravel()
+    flat_C = C.ravel()
+    valid = (flat_r >= 0) & (flat_r <= max_r) & np.isfinite(flat_C)
+    flat_r = flat_r[valid]
+    flat_C = flat_C[valid]
+
+    sums = np.bincount(flat_r, weights=flat_C, minlength=max_r + 1)
+    counts = np.bincount(flat_r, minlength=max_r + 1)
+    with np.errstate(divide='ignore', invalid='ignore'):
+        C_r = np.where(counts > 0, sums / counts, np.nan)
+    r = np.arange(max_r + 1, dtype=float)
+
+    # Find xi where correlation drops below target
+    xi = float('nan')
+    for ri in range(1, max_r + 1):
+        if np.isfinite(C_r[ri]) and (C_r[ri] <= float(target)):
+            xi = float(ri)
+            break
+
+    return xi, r, C_r
+
+
+def _nearest_from_log(iter_log: np.ndarray, values: np.ndarray, iter_target: int) -> float:
+    """Nearest-neighbor lookup in a log sampled at iter_log."""
+    iter_log = np.asarray(iter_log, dtype=float)
+    values = np.asarray(values, dtype=float)
+    if iter_log.size == 0:
+        return float('nan')
+    idx = int(np.searchsorted(iter_log, float(iter_target)))
+    if idx <= 0:
+        return float(values[0])
+    if idx >= iter_log.size:
+        return float(values[-1])
+    # choose closer of idx-1, idx
+    if abs(iter_log[idx] - iter_target) < abs(iter_log[idx - 1] - iter_target):
+        return float(values[idx])
+    return float(values[idx - 1])
+
+
+def plot_quench_kz_metrics(
+    path: str = 'output_quench',
+    *,
+    out_dir: str = 'pics',
+    z_slice: int | None = None,
+    frame_stride: int = 10,
+    max_frames: int | None = 50,
+    S_threshold: float = 0.1,
+    show: bool = True,
+):
+    """Reconstruct KZ-style metrics from quench snapshots: defect density and correlation length.
+
+    This uses 2D mid-plane slice analysis as a proxy:
+    - defect density: plaquette winding count (|s|>0.25)
+    - xi: first r where C(r) < 1/e
+    """
+    if not path:
+        path = 'output_quench'
+
+    data, log_path = load_quench_log(path)
+    it_log = np.atleast_1d(data['iteration']).astype(float)
+    t_log = np.atleast_1d(data['time_s']).astype(float)
+    T_log = np.atleast_1d(data['T_K']).astype(float)
+
+    data_dir = os.path.dirname(log_path) if os.path.isfile(log_path) else path
+    files = glob.glob(os.path.join(data_dir, 'nematic_field_iter_*.dat'))
+    if not files:
+        raise FileNotFoundError(f"No nematic_field_iter_*.dat snapshots found in {data_dir}")
+
+    def _iter_num(p: str) -> int:
+        m = re.search(r'(\d+)', os.path.basename(p))
+        return int(m.group(1)) if m else -1
+
+    files.sort(key=_iter_num)
+    if frame_stride is None or frame_stride < 1:
+        frame_stride = 1
+    files = files[::frame_stride]
+    if max_frames is not None and max_frames > 0:
+        files = files[:max_frames]
+
+    Nx, Ny, Nz = infer_grid_dims_from_nematic_field_file(files[0])
+    if z_slice is None:
+        z_slice = Nz // 2
+
+    rows = []
+    for fp in files:
+        iter_i = _iter_num(fp)
+        S2, nx2, ny2, _ = _load_nematic_slice_arrays(fp, Nx, Ny, Nz, z_slice)
+        n_def, _ = defect_density_2d_from_slice(S2, nx2, ny2, S_threshold=S_threshold)
+        xi, _, _ = correlation_length_2d_from_slice(S2, nx2, ny2, S_threshold=S_threshold)
+        t_i = _nearest_from_log(it_log, t_log, iter_i)
+        T_i = _nearest_from_log(it_log, T_log, iter_i)
+        rows.append((iter_i, t_i, T_i, xi, n_def))
+
+    rows = np.array(rows, dtype=float)
+    iters = rows[:, 0]
+    t = rows[:, 1]
+    T = rows[:, 2]
+    xi = rows[:, 3]
+    ndef = rows[:, 4]
+
+    os.makedirs(out_dir, exist_ok=True)
+    tag = os.path.basename(os.path.normpath(data_dir)) or 'quench'
+    csv_path = os.path.join(out_dir, f'kz_metrics_{tag}.csv')
+    with open(csv_path, 'w', encoding='utf-8') as f:
+        f.write('iteration,time_s,T_K,xi_lattice,defect_density_per_plaquette\n')
+        for (ii, tt, TT, xii, nd) in rows:
+            f.write(f"{int(ii)},{tt:.8g},{TT:.8g},{xii:.8g},{nd:.8g}\n")
+
+    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(10, 7), sharex=True)
+    ax1.plot(t, xi, 'o-', lw=1.5)
+    ax1.set_ylabel(r'$\xi$ (lattice units)')
+    ax1.grid(True, alpha=0.3)
+    ax1.set_title(f'KZ proxies from {tag} (z={z_slice}, stride={frame_stride}, S>{S_threshold})')
+
+    ax2.plot(t, ndef, 'o-', color='tab:red', lw=1.5)
+    ax2.set_xlabel('time [s]')
+    ax2.set_ylabel('defect density (per plaquette)')
+    ax2.grid(True, alpha=0.3)
+
+    fig.tight_layout()
+    out_path = os.path.join(out_dir, f'kz_metrics_{tag}.png')
+    fig.savefig(out_path, dpi=200)
+    print(f"Saved KZ metrics -> {out_path}")
+    print(f"Saved KZ metrics CSV -> {csv_path}")
+    if show:
+        plt.show()
+    else:
+        plt.close(fig)
+    return rows, out_path, csv_path
 
 def animate_tempSweep(Vname=None, choice=None):
     # Find all temperature directories (sorted numerically by T)
@@ -818,10 +1312,13 @@ if __name__ == '__main__':
               "3: Plot Energy Components vs Iteration\n"
               "4: Plot Average S and Free Energy vs Temperature\n"
               "5: Animate Temperature Sweep\n"
-              "Enter your choice (0-5): ").strip()
-    while not i.isdigit() or int(i) < 0 or int(i) > 5:
-        print("Invalid input. Please enter a number between 0 and 5.")
-        i = input("Please enter a number between 0 and 5: ").strip()
+              "6: Plot Quench Log (T, energies, radiality, <S>)\n"
+              "7: Create Quench animation (GIF)\n"
+              "8: Plot KZ metrics from quench (xi + defect density)\n"
+              "Enter your choice (0-8): ").strip()
+    while not i.isdigit() or int(i) < 0 or int(i) > 8:
+        print("Invalid input. Please enter a number between 0 and 8.")
+        i = input("Please enter a number between 0 and 8: ").strip()
     i = int(i)
     # ---------------------------------------------------------------------- PART 1 ----------------------------------------------------------------------------|
     if i == 0:
@@ -896,6 +1393,112 @@ if __name__ == '__main__':
         elif ch == 'g':
             print("\nAnimating Temperature Sweep...")
         animate_tempSweep(Vname=V_name, choice=ch)
+    # ---------------------------------------------------------------------- PART 4 --------------------------------------------------------------------------------|
+    elif i == 6:
+        # --- Plot Quench Log ---
+        print("\nPlotting quench log...")
+        in_path = input("Path to quench log file or directory [default: output_quench]: ").strip()
+        if not in_path:
+            in_path = 'output_quench'
+        try:
+            plot_quench_log(in_path, out_dir='pics', show=True)
+        except Exception as e:
+            print(f"Error plotting quench log: {e}")
+    elif i == 7:
+        # --- Create Quench Animation ---
+        print("\nCreating quench animation (GIF) from output_quench/nematic_field_iter_*.dat...")
+        data_dir = input("Data directory [default: output_quench]: ").strip()
+        if not data_dir:
+            data_dir = 'output_quench'
+
+        # Auto-detect grid size from first snapshot (helps if Nx,Ny,Nz differ from defaults)
+        Nx_use, Ny_use, Nz_use = Nx, Ny, Nz
+        try:
+            snap_files = glob.glob(os.path.join(data_dir, 'nematic_field_iter_*.dat'))
+            if snap_files:
+                def _snap_iter_num(p: str) -> int:
+                    m = re.search(r'(\d+)', os.path.basename(p))
+                    return int(m.group(1)) if m else -1
+                snap_files.sort(key=_snap_iter_num)
+                Nx_use, Ny_use, Nz_use = infer_grid_dims_from_nematic_field_file(snap_files[0])
+                print(f"Detected grid: Nx={Nx_use}, Ny={Ny_use}, Nz={Nz_use} (from {os.path.basename(snap_files[0])})")
+        except Exception as e:
+            print(f"Warning: could not auto-detect grid dims ({e}); using defaults Nx={Nx}, Ny={Ny}, Nz={Nz}.")
+
+        inpt = input("Please specify filename for the quench animation gif [default: quench_evolution]: ").strip()
+        if not inpt:
+            inpt = 'quench_evolution'
+        if not inpt.lower().endswith('.gif'):
+            out_gif = f'pics/{inpt}.gif'
+        else:
+            out_gif = os.path.join('pics', inpt)
+
+        color_field = input("Choose color field (S, nz, n_perp) [default: S]: ").strip()
+        if not color_field:
+            color_field = 'S'
+        interpol = input("Choose interpolation method (nearest, bilinear, bicubic, spline16, spline36, sinc) [default: nearest]: ").strip()
+        if not interpol:
+            interpol = 'nearest'
+        do_zoom = input("Zoom into center? (y/n): ").lower() == 'y'
+        zoom_radius = 15 if do_zoom else None
+        dur = input("Frame duration in seconds [default: 0.08]: ").strip()
+        try:
+            duration = float(dur) if dur else 0.08
+        except ValueError:
+            duration = 0.08
+        stride_in = input("Use every N-th snapshot (frame stride) [default: 1]: ").strip()
+        try:
+            stride = int(stride_in) if stride_in else 1
+        except ValueError:
+            stride = 1
+
+        arrows_in = input("Number of arrows per axis (0=disable quiver) [default: 20]: ").strip()
+        try:
+            arrows_per_axis = int(arrows_in) if arrows_in else 20
+        except ValueError:
+            arrows_per_axis = 20
+
+        try:
+            create_nematic_field_animation(
+                data_dir=data_dir,
+                output_gif=out_gif,
+                Nx=Nx_use, Ny=Ny_use, Nz=Nz_use,
+                frames_dir='frames_quench',
+                duration=duration,
+                frame_stride=stride,
+                color_field=color_field,
+                interpol=interpol,
+                zoom_radius=zoom_radius,
+                arrowColor='black',
+                arrows_per_axis=arrows_per_axis,
+                consistent_scale=True,
+            )
+        except Exception as e:
+            print(f"Error creating quench animation: {e}")
+    elif i == 8:
+        print("\nComputing KZ metrics (2D proxies) from quench snapshots...")
+        in_path = input("Path to quench directory or quench_log.dat [default: output_quench]: ").strip()
+        if not in_path:
+            in_path = 'output_quench'
+        stride_in = input("Use every N-th snapshot (frame stride) [default: 10]: ").strip()
+        try:
+            stride = int(stride_in) if stride_in else 10
+        except ValueError:
+            stride = 10
+        max_in = input("Max frames to analyze (blank=no limit) [default: 50]: ").strip()
+        try:
+            max_frames = int(max_in) if max_in else 50
+        except ValueError:
+            max_frames = 50
+        sth_in = input("S threshold for droplet mask [default: 0.1]: ").strip()
+        try:
+            sthr = float(sth_in) if sth_in else 0.1
+        except ValueError:
+            sthr = 0.1
+        try:
+            plot_quench_kz_metrics(in_path, out_dir='pics', frame_stride=stride, max_frames=max_frames, S_threshold=sthr, show=True)
+        except Exception as e:
+            print(f"Error computing KZ metrics: {e}")
     # ---------------------------------------------------------------------- FIN --------------------------------------------------------------------------------|
 
 # WHAT I NEED TO DO:

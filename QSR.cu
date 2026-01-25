@@ -958,6 +958,9 @@ int main() {
         int maxIterations = prompt_with_default("Enter iterations", maxIterations_default);
         int printFreq = prompt_with_default("Enter print freq", 200);
         double tolerance = prompt_with_default("Enter tolerance", 1e-2);
+        // Relative convergence threshold for radiality changes between consecutive samples.
+        // Example: 1e-2 means "< 1% change".
+        double RbEps = prompt_with_default("Enter radiality convergence eps RbEps (relative ΔR̄)", 1e-2);
 
         // Host Memory
         size_t num_elements = Nx * Ny * Nz;
@@ -1050,8 +1053,22 @@ int main() {
         };
 
         if (sim_mode == 3) {
-            if (fs::exists("output_quench")) fs::remove_all("output_quench");
-            fs::create_directory("output_quench");
+            std::cout << "Output directory for quench results [default: output_quench]: ";
+            std::string out_dir_name;
+            std::getline(std::cin, out_dir_name);
+            if (out_dir_name.empty()) out_dir_name = "output_quench";
+
+            fs::path out_dir = out_dir_name;
+            if (fs::exists(out_dir)) {
+                bool overwrite = prompt_yes_no(
+                    ("Directory '" + out_dir.string() + "' exists. Delete it and start fresh?").c_str(),
+                    true
+                );
+                if (overwrite) {
+                    fs::remove_all(out_dir);
+                }
+            }
+            fs::create_directories(out_dir);
 
             int protocol = prompt_with_default("Quench protocol (1=step, 2=ramp)", 2);
             double T_high = prompt_with_default("T_high (K)", T);
@@ -1066,7 +1083,7 @@ int main() {
             if (total_iters < 1) total_iters = 1;
             int logFreq = prompt_with_default("Log/print freq", printFreq);
             if (logFreq < 1) logFreq = 1;
-            int snapshotFreq = prompt_with_default("Snapshot freq to output_quench (0=off)", 1000);
+            int snapshotFreq = prompt_with_default("Snapshot freq to output directory (0=off)", 1000);
 
             double noise_amplitude = 0.0;
             if (mode == 2) {
@@ -1086,13 +1103,14 @@ int main() {
 
             // Optional convergence/early-stop guard (useful when you only care about final aligned state).
             // For a quench/ramp, we only allow early-stop once the protocol has reached the final temperature.
-            // Criterion: relative energy change between consecutive energy samples + radiality threshold.
+            // Criterion: relative energy change + relative radiality change between consecutive samples,
+            // optionally combined with an absolute radiality threshold.
             const bool enable_early_stop = prompt_yes_no(
-                "Enable early-stop once converged at final T? (rel. energy change + radiality)",
+                "Enable early-stop once converged at final T? (rel. ΔF/F + rel. ΔR̄/R̄)",
                 false
             );
             const double radiality_threshold = enable_early_stop
-                ? prompt_with_default("Radiality threshold (Rbar)", 0.998)
+                ? prompt_with_default("Radiality threshold (Rbar, 0=disable)", 0.998)
                 : 0.0;
 
             char user_choice = 'y';
@@ -1101,7 +1119,7 @@ int main() {
             std::getline(std::cin, user_choice_line);
             if (!user_choice_line.empty()) user_choice = user_choice_line[0];
 
-            std::ofstream quench_log("output_quench/quench_log.dat");
+            std::ofstream quench_log((out_dir / "quench_log.dat").string());
             quench_log << "iteration,time_s,T_K,bulk,elastic,total,radiality,avg_S\n";
 
             auto compute_T_current = [&](int iter) -> double {
@@ -1129,6 +1147,7 @@ int main() {
 
             double physical_time = 0.0;
             double prev_F_for_stop = std::numeric_limits<double>::quiet_NaN();
+            double prev_R_for_stop = std::numeric_limits<double>::quiet_NaN();
             for (int iter = 0; iter < total_iters; ++iter) {
                 const double T_current = compute_T_current(iter);
                 DimensionalParams params_q = {a, b, c, T_current, T_star, L1, L2, L3, W};
@@ -1181,22 +1200,32 @@ int main() {
                         }
 
                         if (enable_early_stop && has_reached_final_T(iter)) {
+                            bool energy_converged = false;
+                            bool radiality_converged = false;
+
                             if (std::isfinite(prev_F_for_stop) && prev_F_for_stop != 0.0) {
-                                const double rel_change = std::abs((total_F - prev_F_for_stop) / prev_F_for_stop);
-                                const bool energy_converged = rel_change < tolerance;
-                                const bool radially_aligned = avg_rad > radiality_threshold;
-                                if (energy_converged && radially_aligned) {
-                                    std::cout << "\n=== Early-stop: converged at final T ===\n";
-                                    break;
-                                }
+                                const double rel_dF = std::abs((total_F - prev_F_for_stop) / prev_F_for_stop);
+                                energy_converged = rel_dF < tolerance;
                             }
-                            // Update reference energy for the *next* convergence check.
+                            if (std::isfinite(prev_R_for_stop) && prev_R_for_stop != 0.0) {
+                                const double rel_dR = std::abs((avg_rad - prev_R_for_stop) / prev_R_for_stop);
+                                radiality_converged = rel_dR < RbEps;
+                            }
+
+                            const bool radially_aligned = (radiality_threshold <= 0.0) ? true : (avg_rad > radiality_threshold);
+                            if (energy_converged && radiality_converged && radially_aligned) {
+                                std::cout << "\n=== Early-stop: converged at final T ===\n";
+                                break;
+                            }
+
+                            // Update references for the *next* convergence check.
                             prev_F_for_stop = total_F;
+                            prev_R_for_stop = avg_rad;
                         }
                     }
 
                     if (do_snap) {
-                        saveNematicFieldToFile(h_nf, Nx, Ny, Nz, "output_quench/nematic_field_iter_" + std::to_string(iter) + ".dat");
+                        saveNematicFieldToFile(h_nf, Nx, Ny, Nz, (out_dir / ("nematic_field_iter_" + std::to_string(iter) + ".dat")).string());
                     }
                 }
             }
@@ -1209,8 +1238,8 @@ int main() {
             std::vector<NematicField> finalNF(num_elements);
             cudaMemcpy(finalNF.data(), d_nf, num_elements * sizeof(NematicField), cudaMemcpyDeviceToHost);
             cudaFree(d_nf);
-            saveNematicFieldToFile(finalNF, Nx, Ny, Nz, "output_quench/nematic_field_final.dat");
-            saveQTensorToFile(h_Q, Nx, Ny, Nz, "output_quench/Qtensor_output_final.dat");
+            saveNematicFieldToFile(finalNF, Nx, Ny, Nz, (out_dir / "nematic_field_final.dat").string());
+            saveQTensorToFile(h_Q, Nx, Ny, Nz, (out_dir / "Qtensor_output_final.dat").string());
             quench_log.close();
 
         } else if (sim_mode == 2) {
@@ -1389,6 +1418,7 @@ int main() {
             if (!user_choice_line.empty()) user_choice = user_choice_line[0];
 
             double prev_F = std::numeric_limits<double>::max();
+            double prev_R = std::numeric_limits<double>::quiet_NaN();
             double physical_time = 0.0;
             double radiality_threshold = 0.998;
             double min_alignment_time = 0.5 * tau_align;
@@ -1441,12 +1471,18 @@ int main() {
                             bool energy_converged = energy_change < tolerance;
                             bool radially_aligned = avg_rad > radiality_threshold;
                             bool time_sufficient = physical_time > min_alignment_time;
-                            if (energy_converged && radially_aligned && time_sufficient) {
+                            bool radiality_converged = false;
+                            if (std::isfinite(prev_R) && prev_R != 0.0) {
+                                double rad_change = std::abs((avg_rad - prev_R) / prev_R);
+                                radiality_converged = rad_change < RbEps;
+                            }
+                            if (energy_converged && radiality_converged && radially_aligned && time_sufficient) {
                                 std::cout << "\n=== Convergence Achieved ===";
                                 break;
                             }
                         }
                         prev_F = total_F;
+                        prev_R = avg_rad;
                     }
                 }
                 energy_log.close();
@@ -1496,12 +1532,18 @@ int main() {
                         if (iter > 100 && prev_F != 0.0) {
                             double energy_change = std::abs((total_F - prev_F) / prev_F);
                             bool energy_converged = energy_change < tolerance;
-                            if (energy_converged && avg_rad > radiality_threshold && physical_time > min_alignment_time) {
+                            bool radiality_converged = false;
+                            if (std::isfinite(prev_R) && prev_R != 0.0) {
+                                double rad_change = std::abs((avg_rad - prev_R) / prev_R);
+                                radiality_converged = rad_change < RbEps;
+                            }
+                            if (energy_converged && radiality_converged && avg_rad > radiality_threshold && physical_time > min_alignment_time) {
                                 std::cout << "\n=== Convergence Achieved ===";
                                 break;
                             }
                         }
                         prev_F = total_F;
+                        prev_R = avg_rad;
                     }
                 }
                 energy_components_log.close();
