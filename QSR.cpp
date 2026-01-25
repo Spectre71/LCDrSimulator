@@ -3,6 +3,9 @@
 namespace fs = std::filesystem;
 #pragma warning(disable: 4996) 
 
+static double computeTransitionTemperature(double a, double b, double c, double T_star, int modechoice);
+static void addIsotropicNoise(std::vector<QTensor>& Q, int Nx, int Ny, int Nz, double amplitude);
+
 // Calculates the nematic field (director and order parameter) from a Q-tensor.
 NematicField calculateNematicField(const QTensor& q_5comp) {
     FullQTensor q(q_5comp);
@@ -935,9 +938,128 @@ int main() {
         std::cout << "\nSelect simulation mode:\n";
         std::cout << "  [1] Single Temperature\n";
         std::cout << "  [2] Temperature Range\n";
+        std::cout << "  [3] Quench Dynamics (time-dependent T)\n";
         int sim_mode = prompt_with_default("Enter mode", 1);
 
-        if (sim_mode == 2) {
+        if (sim_mode == 3) {
+            if (fs::exists("output_quench")) {
+                fs::remove_all("output_quench");
+            }
+            fs::create_directory("output_quench");
+
+            // Estimate a coexistence temperature for reference (depends on bulk convention).
+            double T_trans = computeTransitionTemperature(a, b, c, T_star, modechoice);
+            std::cout << "\nEstimated coexistence temperature T_NI ≈ " << T_trans << " K (based on modechoice=" << modechoice << ")\n";
+            std::cout << "(Note: T* is the spinodal/supercooling reference in this model.)\n";
+
+            std::cout << "\nQuench protocol:\n";
+            std::cout << "  [1] Step quench (T_high -> T_low instantly)\n";
+            std::cout << "  [2] Linear ramp (T_high -> T_low over N_ramp steps)\n";
+            int qprot = prompt_with_default("Enter protocol", 2);
+            if (qprot != 1 && qprot != 2) qprot = 2;
+
+            double T_high = prompt_with_default("Enter high temperature T_high (K)", T_trans + 2.0);
+            double T_low = prompt_with_default("Enter low temperature T_low (K)", T_star - 2.0);
+            int pre_equil_iters = prompt_with_default("Enter pre-equilibration steps at T_high", 0);
+            int ramp_iters = (qprot == 2) ? prompt_with_default("Enter ramp steps N_ramp", 2000) : 0;
+            int total_iters = prompt_with_default("Enter total steps", maxIterations);
+            int snapshotFreq = prompt_with_default("Enter snapshot frequency (iterations)", printFreq);
+
+            // Choose initialization specific for quench dynamics
+            std::cout << "\nInitialize from isotropic state (Q=0) + small noise? (y/n) [y]: ";
+            std::string iso_in;
+            std::getline(std::cin, iso_in);
+            bool iso_init = iso_in.empty() || iso_in[0] == 'y' || iso_in[0] == 'Y';
+            double noise_amp = 0.0;
+            if (iso_init) {
+                noise_amp = prompt_with_default("Noise amplitude for initial Q components", 1e-4);
+                initializeQTensor(Q, Nx, Ny, Nz, 0.0, 0);
+                addIsotropicNoise(Q, Nx, Ny, Nz, noise_amp);
+            } else {
+                initializeQTensor(Q, Nx, Ny, Nz, S0, mode);
+            }
+
+            double min_dx = std::min({ dx, dy, dz });
+            double D = (L1 > 0 ? L1 : kappa) / gamma;
+            if (D == 0.0) D = 1e-12;
+            double dt_max = 0.5 * (min_dx * min_dx) / (6.0 * D);
+            std::cout << "\nMaximum stable dt ≈ " << dt_max << " s" << std::endl;
+            double dt = prompt_with_default("Enter time step dt (s)", dt_max);
+            if (dt > dt_max) dt = dt_max;
+
+            std::ofstream quench_log("output_quench/quench_log.dat");
+            quench_log << "iteration,time_s,T_K,bulk,elastic,field,total,avg_S,radiality\n";
+
+            DimensionalParams params_q;
+            params_q.a = a; params_q.b = b; params_q.c = c;
+            params_q.T = T_high; params_q.T_star = T_star;
+            params_q.L1 = L1; params_q.L2 = L2; params_q.L3 = L3;
+            params_q.W = W;
+
+            double physical_time = 0.0;
+            for (int iter = 0; iter < total_iters; ++iter) {
+                physical_time += dt;
+
+                // Temperature protocol T(iter)
+                double T_current = T_high;
+                if (iter < pre_equil_iters) {
+                    T_current = T_high;
+                } else if (qprot == 1) {
+                    T_current = T_low;
+                } else {
+                    int t0 = iter - pre_equil_iters;
+                    if (t0 <= 0) {
+                        T_current = T_high;
+                    } else if (t0 >= ramp_iters) {
+                        T_current = T_low;
+                    } else {
+                        double s = (double)t0 / (double)ramp_iters;
+                        T_current = T_high + (T_low - T_high) * s;
+                    }
+                }
+
+                params_q.T = T_current;
+
+                // Shell order parameter: switch on when below T* (consistent with current usage)
+                double S_shell = (T_current > T_star) ? 0.0 : S0;
+
+                computeLaplacian(Q, laplacianQ, Nx, Ny, Nz, dx, dy, dz);
+                computeChemicalPotential(Q, mu, laplacianQ, Nx, Ny, Nz, dx, dy, dz, params_q, kappa, modechoice);
+                applyWeakAnchoringPenalty(mu, Q, Nx, Ny, Nz, is_shell, S_shell, params_q.W);
+                updateQTensor(Q, mu, Nx, Ny, Nz, dt, is_shell, gamma, params_q.W);
+                applyBoundaryConditions(Q, Nx, Ny, Nz, is_shell, S_shell, params_q.W);
+
+                if (iter % printFreq == 0) {
+                    EnergyComponents ec = computeEnergyComponents(Q, Nx, Ny, Nz, dx, dy, dz, params_q, kappa, modechoice);
+                    double avg_S = calculateAverageS(Q, Nx, Ny, Nz);
+                    double radiality = computeRadiality(Q, Nx, Ny, Nz);
+                    quench_log << iter << "," << physical_time << "," << T_current << ","
+                              << ec.bulk << "," << ec.elastic << "," << ec.field << "," << ec.total() << ","
+                              << avg_S << "," << radiality << "\n";
+                    std::cout << "Iter " << iter << "  t=" << physical_time << " s  T=" << T_current
+                              << " K  F=" << ec.total() << "  <S>=" << avg_S << "  R̄=" << radiality << std::endl;
+                }
+
+                if (snapshotFreq > 0 && iter % snapshotFreq == 0) {
+                    std::string nematic_filename = "output_quench/nematic_field_iter_" + std::to_string(iter) + ".dat";
+                    std::vector<NematicField> nematicField(Nx * Ny * Nz);
+                    #pragma omp parallel for collapse(3)
+                    for (int i = 0; i < Nx; ++i) {
+                        for (int j = 0; j < Ny; ++j) {
+                            for (int k = 0; k < Nz; ++k) {
+                                nematicField[idx(i, j, k)] = calculateNematicField(Q[idx(i, j, k)]);
+                            }
+                        }
+                    }
+                    saveNematicFieldToFile(nematicField, Nx, Ny, Nz, nematic_filename);
+                }
+            }
+
+            quench_log.close();
+            saveQTensorToFile(Q, Nx, Ny, Nz, "output_quench/Qtensor_output_final.dat");
+            std::cout << "\nQuench simulation finished. Logs in output_quench/quench_log.dat" << std::endl;
+        }
+        else if (sim_mode == 2) {
             if (fs::exists("output_temp_sweep")) {
                 fs::remove_all("output_temp_sweep");
             }
@@ -1212,4 +1334,46 @@ int main() {
     std::cout << "Exiting. Press enter to close." << std::endl;
     std::cin.get();
     return 0;
+}
+
+static double computeTransitionTemperature(double a, double b, double c, double T_star, int modechoice) {
+    // Uses the uniaxial scalar reduction of your bulk convention.
+    // modechoice==1 -> f(S)=a dT S^2 - (b/3) S^3 + (c/2) S^4  => dT_NI = b^2/(18 a c)
+    // modechoice==2 -> f(S)=a dT S^2 - b S^3 + c S^4          => dT_NI = b^2/(4 a c)
+    if (a == 0.0 || c == 0.0) return T_star;
+    if (modechoice == 2) {
+        return T_star + (b * b) / (4.0 * a * c);
+    }
+    return T_star + (b * b) / (18.0 * a * c);
+}
+
+static void addIsotropicNoise(std::vector<QTensor>& Q, int Nx, int Ny, int Nz, double amplitude) {
+    if (amplitude <= 0.0) return;
+    double cx = Nx / 2.0, cy = Ny / 2.0, cz = Nz / 2.0;
+    double R = std::min({ (double)Nx, (double)Ny, (double)Nz }) / 2.0;
+    auto idx = [&](int i, int j, int k) { return k + Nz * (j + Ny * i); };
+
+    #pragma omp parallel
+    {
+        std::mt19937 gen(std::random_device{}() + 1337u * (unsigned)omp_get_thread_num());
+        std::normal_distribution<double> dist(0.0, amplitude);
+
+        #pragma omp for collapse(3)
+        for (int i = 0; i < Nx; ++i) {
+            for (int j = 0; j < Ny; ++j) {
+                for (int k = 0; k < Nz; ++k) {
+                    double x = i - cx, y = j - cy, z = k - cz;
+                    double r = std::sqrt(x * x + y * y + z * z);
+                    if (r >= R) continue;
+
+                    QTensor& q = Q[idx(i, j, k)];
+                    q.Qxx += dist(gen);
+                    q.Qxy += dist(gen);
+                    q.Qxz += dist(gen);
+                    q.Qyy += dist(gen);
+                    q.Qyz += dist(gen);
+                }
+            }
+        }
+    }
 }

@@ -3,6 +3,7 @@ pics
 venv
 output_temp_sweep
 x64
+output_quench
 free_energy_vs_iteration.dat
 nematic_field_final.dat
 Qtensor_output_final.dat

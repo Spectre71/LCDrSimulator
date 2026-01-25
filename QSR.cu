@@ -783,6 +783,35 @@ void initializeQTensor(std::vector<QTensor>& Q, int Nx, int Ny, int Nz, double q
     }
 }
 
+static void initializeIsotropicWithNoise(std::vector<QTensor>& Q, int Nx, int Ny, int Nz, double noise_amplitude) {
+    Q.assign((size_t)Nx * (size_t)Ny * (size_t)Nz, {0, 0, 0, 0, 0});
+    if (noise_amplitude <= 0.0) return;
+
+    double cx = Nx / 2.0, cy = Ny / 2.0, cz = Nz / 2.0;
+    double R = std::min({ (double)Nx, (double)Ny, (double)Nz }) / 2.0;
+    auto idx = [&](int i, int j, int k) { return (size_t)k + (size_t)Nz * ((size_t)j + (size_t)Ny * (size_t)i); };
+
+    std::mt19937 gen(std::random_device{}());
+    std::normal_distribution<double> dist(0.0, noise_amplitude);
+
+    for (int i = 0; i < Nx; ++i) {
+        for (int j = 0; j < Ny; ++j) {
+            for (int k = 0; k < Nz; ++k) {
+                double x = i - cx, y = j - cy, z = k - cz;
+                double r = std::sqrt(x * x + y * y + z * z);
+                if (r < R) {
+                    QTensor& q = Q[idx(i, j, k)];
+                    q.Qxx = dist(gen);
+                    q.Qxy = dist(gen);
+                    q.Qxz = dist(gen);
+                    q.Qyy = dist(gen);
+                    q.Qyz = dist(gen);
+                }
+            }
+        }
+    }
+}
+
 // ------------------------------------------------------------------
 // Main
 // ------------------------------------------------------------------
@@ -801,9 +830,11 @@ int main() {
         std::cout << "\033[1mQ-tensor evolution simulation (CUDA Accelerated)\033[0m\n" << std::endl;
         std::cout << "Press {\033[1;33mEnter\033[0m} to use [\033[1;34mdefault\033[0m] values.\n" << std::endl;
 
-        std::cout << "Select initialization mode: [0] random, [1] radial (default: 1): ";
+        std::cout << "Select initialization mode: [0] random, [1] radial, [2] isotropic+noise (default: 1): ";
         std::string mode_input; std::getline(std::cin, mode_input);
-        int mode = (mode_input == "0") ? 0 : 1;
+        int mode = 1;
+        if (mode_input == "0") mode = 0;
+        else if (mode_input == "2") mode = 2;
 
         std::cout << "\n--- Spatial Parameters ---" << std::endl;
         int Nx = prompt_with_default("Enter grid size Nx", Nx_default);
@@ -979,7 +1010,7 @@ int main() {
         dim3 threadsPerBlock(8, 8, 8);
         dim3 numBlocks((Nx + 7) / 8, (Ny + 7) / 8, (Nz + 7) / 8);
 
-        std::cout << "\nSelect simulation mode: [1] Single Temp, [2] Temp Range: ";
+        std::cout << "\nSelect simulation mode: [1] Single Temp, [2] Temp Range, [3] Quench (time-dependent T): ";
         int sim_mode = prompt_with_default("", 1);
 
         auto compute_avg_S_droplet = [&](const std::vector<NematicField>& nf) -> double {
@@ -1018,7 +1049,171 @@ int main() {
             return {bulk_sum, elastic_sum};
         };
 
-        if (sim_mode == 2) {
+        if (sim_mode == 3) {
+            if (fs::exists("output_quench")) fs::remove_all("output_quench");
+            fs::create_directory("output_quench");
+
+            int protocol = prompt_with_default("Quench protocol (1=step, 2=ramp)", 2);
+            double T_high = prompt_with_default("T_high (K)", T);
+            double T_low = prompt_with_default("T_low (K)", T_high - 5.0);
+            int pre_equil_iters = prompt_with_default("Pre-equilibration iterations at T_high", 0);
+            int ramp_iters = 0;
+            if (protocol == 2) {
+                ramp_iters = prompt_with_default("Ramp iterations (>=1)", 1000);
+                if (ramp_iters < 1) ramp_iters = 1;
+            }
+            int total_iters = prompt_with_default("Total iterations", maxIterations);
+            if (total_iters < 1) total_iters = 1;
+            int logFreq = prompt_with_default("Log/print freq", printFreq);
+            if (logFreq < 1) logFreq = 1;
+            int snapshotFreq = prompt_with_default("Snapshot freq to output_quench (0=off)", 1000);
+
+            double noise_amplitude = 0.0;
+            if (mode == 2) {
+                noise_amplitude = prompt_with_default("Noise amplitude for isotropic init", 1e-3);
+                initializeIsotropicWithNoise(h_Q, Nx, Ny, Nz, noise_amplitude);
+            } else {
+                initializeQTensor(h_Q, Nx, Ny, Nz, S0, mode);
+            }
+            cudaMemcpy(d_Q, h_Q.data(), size_Q, cudaMemcpyHostToDevice);
+
+            double min_dx = std::min({ dx, dy, dz });
+            double D = (L1 > 0 ? L1 : kappa) / gamma; if (D == 0) D = 1e-12;
+            double dt_max = 0.5 * (min_dx * min_dx) / (6.0 * D);
+            std::cout << "\nMaximum stable dt = " << dt_max << " s" << std::endl;
+            double dt = prompt_with_default("Enter time step dt (s)", dt_max);
+            if (dt > dt_max) dt = dt_max;
+
+            // Optional convergence/early-stop guard (useful when you only care about final aligned state).
+            // For a quench/ramp, we only allow early-stop once the protocol has reached the final temperature.
+            // Criterion: relative energy change between consecutive energy samples + radiality threshold.
+            const bool enable_early_stop = prompt_yes_no(
+                "Enable early-stop once converged at final T? (rel. energy change + radiality)",
+                false
+            );
+            const double radiality_threshold = enable_early_stop
+                ? prompt_with_default("Radiality threshold (Rbar)", 0.998)
+                : 0.0;
+
+            char user_choice = 'y';
+            std::cout << "Do you want output in the console every " << logFreq << " iterations? (y/n): ";
+            std::string user_choice_line;
+            std::getline(std::cin, user_choice_line);
+            if (!user_choice_line.empty()) user_choice = user_choice_line[0];
+
+            std::ofstream quench_log("output_quench/quench_log.dat");
+            quench_log << "iteration,time_s,T_K,bulk,elastic,total,radiality,avg_S\n";
+
+            auto compute_T_current = [&](int iter) -> double {
+                if (iter < pre_equil_iters) return T_high;
+                if (protocol == 1) return T_low;
+                const int t = iter - pre_equil_iters;
+                if (t <= 0) return T_high;
+                if (t >= ramp_iters) return T_low;
+                const double alpha = (double)t / (double)ramp_iters;
+                return T_high + (T_low - T_high) * alpha;
+            };
+
+            auto has_reached_final_T = [&](int iter) -> bool {
+                if (iter < pre_equil_iters) return false;
+                if (protocol == 1) return true; // step: after pre-equil we are at T_low
+                return (iter >= pre_equil_iters + ramp_iters);
+            };
+
+            auto compute_S_shell = [&](double Tcur) -> double {
+                double A_c = 0.0, B_c = 0.0, C_c = 0.0;
+                bulk_ABC_from_convention(a, b, c, Tcur, T_star, modechoice, A_c, B_c, C_c);
+                double S_eq_cur = S_eq_uniaxial_from_ABC(A_c, B_c, C_c);
+                return (S_eq_cur > 0.0) ? S_eq_cur : 0.0;
+            };
+
+            double physical_time = 0.0;
+            double prev_F_for_stop = std::numeric_limits<double>::quiet_NaN();
+            for (int iter = 0; iter < total_iters; ++iter) {
+                const double T_current = compute_T_current(iter);
+                DimensionalParams params_q = {a, b, c, T_current, T_star, L1, L2, L3, W};
+                const double S_shell = compute_S_shell(T_current);
+
+                computeLaplacianKernel<<<numBlocks, threadsPerBlock>>>(d_Q, d_laplacianQ, Nx, Ny, Nz, dx, dy, dz);
+                if (L2 != 0.0) computeDivergenceKernel<<<numBlocks, threadsPerBlock>>>(d_Q, d_Dcol_x, d_Dcol_y, d_Dcol_z, Nx, Ny, Nz, dx, dy, dz);
+                computeChemicalPotentialKernel<<<numBlocks, threadsPerBlock>>>(d_Q, d_mu, d_laplacianQ, Nx, Ny, Nz, dx, dy, dz, params_q, kappa, modechoice, d_Dcol_x, d_Dcol_y, d_Dcol_z);
+                applyWeakAnchoringPenaltyKernel<<<numBlocks, threadsPerBlock>>>(d_mu, d_Q, Nx, Ny, Nz, d_is_shell, S_shell, W);
+                updateQTensorKernel<<<numBlocks, threadsPerBlock>>>(d_Q, d_mu, Nx, Ny, Nz, dt, d_is_shell, gamma, W);
+                applyBoundaryConditionsKernel<<<numBlocks, threadsPerBlock>>>(d_Q, Nx, Ny, Nz, d_is_shell, S_shell, W);
+
+                physical_time += dt;
+
+                const bool do_log = (iter % logFreq == 0) || (iter == total_iters - 1);
+                const bool do_snap = (snapshotFreq > 0) && ((iter % snapshotFreq == 0) || (iter == total_iters - 1));
+
+                if (do_log || do_snap) {
+                    computeRadialityKernel<<<numBlocks, threadsPerBlock>>>(d_Q, d_radiality_vals, d_count_vals, Nx, Ny, Nz);
+                    auto [bulk_sum, elastic_sum] = reduce_energy(params_q);
+                    double total_F = bulk_sum + elastic_sum;
+
+                    std::vector<double> h_rad(num_elements);
+                    std::vector<int> h_count(num_elements);
+                    cudaMemcpy(h_rad.data(), d_radiality_vals, size_double, cudaMemcpyDeviceToHost);
+                    cudaMemcpy(h_count.data(), d_count_vals, size_int, cudaMemcpyDeviceToHost);
+                    double total_rad = 0.0;
+                    int rad_count = 0;
+                    for (size_t ii = 0; ii < num_elements; ++ii) {
+                        total_rad += h_rad[ii];
+                        rad_count += h_count[ii];
+                    }
+                    double avg_rad = (rad_count > 0) ? total_rad / rad_count : 0.0;
+
+                    NematicField* d_nf;
+                    cudaMalloc(&d_nf, num_elements * sizeof(NematicField));
+                    computeNematicFieldKernel<<<numBlocks, threadsPerBlock>>>(d_Q, d_nf, Nx, Ny, Nz);
+                    std::vector<NematicField> h_nf(num_elements);
+                    cudaMemcpy(h_nf.data(), d_nf, num_elements * sizeof(NematicField), cudaMemcpyDeviceToHost);
+                    cudaFree(d_nf);
+                    double avg_S = compute_avg_S_droplet(h_nf);
+
+                    if (do_log) {
+                        quench_log << iter << "," << physical_time << "," << T_current << "," << bulk_sum << "," << elastic_sum
+                                  << "," << total_F << "," << avg_rad << "," << avg_S << "\n";
+                        quench_log.flush();
+                        if (user_choice == 'y' || user_choice == 'Y') {
+                            std::cout << "Iter " << iter << "  t=" << physical_time << " s  T=" << T_current
+                                      << " K  F=" << total_F << "  Rbar=" << avg_rad << "  <S>=" << avg_S << std::endl;
+                        }
+
+                        if (enable_early_stop && has_reached_final_T(iter)) {
+                            if (std::isfinite(prev_F_for_stop) && prev_F_for_stop != 0.0) {
+                                const double rel_change = std::abs((total_F - prev_F_for_stop) / prev_F_for_stop);
+                                const bool energy_converged = rel_change < tolerance;
+                                const bool radially_aligned = avg_rad > radiality_threshold;
+                                if (energy_converged && radially_aligned) {
+                                    std::cout << "\n=== Early-stop: converged at final T ===\n";
+                                    break;
+                                }
+                            }
+                            // Update reference energy for the *next* convergence check.
+                            prev_F_for_stop = total_F;
+                        }
+                    }
+
+                    if (do_snap) {
+                        saveNematicFieldToFile(h_nf, Nx, Ny, Nz, "output_quench/nematic_field_iter_" + std::to_string(iter) + ".dat");
+                    }
+                }
+            }
+
+            // Final save
+            cudaMemcpy(h_Q.data(), d_Q, size_Q, cudaMemcpyDeviceToHost);
+            NematicField* d_nf;
+            cudaMalloc(&d_nf, num_elements * sizeof(NematicField));
+            computeNematicFieldKernel<<<numBlocks, threadsPerBlock>>>(d_Q, d_nf, Nx, Ny, Nz);
+            std::vector<NematicField> finalNF(num_elements);
+            cudaMemcpy(finalNF.data(), d_nf, num_elements * sizeof(NematicField), cudaMemcpyDeviceToHost);
+            cudaFree(d_nf);
+            saveNematicFieldToFile(finalNF, Nx, Ny, Nz, "output_quench/nematic_field_final.dat");
+            saveQTensorToFile(h_Q, Nx, Ny, Nz, "output_quench/Qtensor_output_final.dat");
+            quench_log.close();
+
+        } else if (sim_mode == 2) {
             if (fs::exists("output_temp_sweep")) fs::remove_all("output_temp_sweep");
             fs::create_directory("output_temp_sweep");
             std::ofstream sweep_log("output_temp_sweep/summary.dat");
@@ -1056,7 +1251,12 @@ int main() {
                 }
             }
 
-            initializeQTensor(h_Q, Nx, Ny, Nz, S0, mode);
+            if (mode == 2) {
+                double noise_amplitude = prompt_with_default("Noise amplitude for isotropic init", 1e-3);
+                initializeIsotropicWithNoise(h_Q, Nx, Ny, Nz, noise_amplitude);
+            } else {
+                initializeQTensor(h_Q, Nx, Ny, Nz, S0, mode);
+            }
             cudaMemcpy(d_Q, h_Q.data(), size_Q, cudaMemcpyHostToDevice);
 
             double min_dx = std::min({ dx, dy, dz });
@@ -1169,7 +1369,12 @@ int main() {
             double dt = prompt_with_default("Enter time step dt (s)", dt_max);
             if (dt > dt_max) dt = dt_max;
 
-            initializeQTensor(h_Q, Nx, Ny, Nz, S0, mode);
+            if (mode == 2) {
+                double noise_amplitude = prompt_with_default("Noise amplitude for isotropic init", 1e-3);
+                initializeIsotropicWithNoise(h_Q, Nx, Ny, Nz, noise_amplitude);
+            } else {
+                initializeQTensor(h_Q, Nx, Ny, Nz, S0, mode);
+            }
             cudaMemcpy(d_Q, h_Q.data(), size_Q, cudaMemcpyHostToDevice);
 
             // Boundary amplitude used for anchoring in single-temp mode.
