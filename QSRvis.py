@@ -995,11 +995,19 @@ def correlation_length_2d_from_slice(
         C_r = np.where(counts > 0, sums / counts, np.nan)
     r = np.arange(max_r + 1, dtype=float)
 
-    # Find xi where correlation drops below target
+    # Find xi where correlation drops below target (sub-lattice via linear interpolation)
     xi = float('nan')
+    targ = float(target)
     for ri in range(1, max_r + 1):
-        if np.isfinite(C_r[ri]) and (C_r[ri] <= float(target)):
-            xi = float(ri)
+        if np.isfinite(C_r[ri]) and (C_r[ri] <= targ):
+            # interpolate between (ri-1, C_r[ri-1]) and (ri, C_r[ri])
+            c0 = float(C_r[ri - 1])
+            c1 = float(C_r[ri])
+            if np.isfinite(c0) and np.isfinite(c1) and (c1 != c0):
+                frac = (targ - c0) / (c1 - c0)
+                xi = float((ri - 1) + frac)
+            else:
+                xi = float(ri)
             break
 
     return xi, r, C_r
@@ -1112,6 +1120,679 @@ def plot_quench_kz_metrics(
     else:
         plt.close(fig)
     return rows, out_path, csv_path
+
+
+def _infer_dt_from_log(iteration: np.ndarray, time_s: np.ndarray) -> float:
+    """Infer dt from logged (iteration, time) pairs."""
+    it = np.asarray(iteration, dtype=float)
+    t = np.asarray(time_s, dtype=float)
+    if it.size < 2 or t.size != it.size:
+        return float('nan')
+    di = np.diff(it)
+    dt = np.diff(t)
+    m = (di > 0) & np.isfinite(di) & np.isfinite(dt)
+    if np.count_nonzero(m) == 0:
+        return float('nan')
+    vals = dt[m] / di[m]
+    vals = vals[np.isfinite(vals) & (vals > 0)]
+    if vals.size == 0:
+        return float('nan')
+    return float(np.median(vals))
+
+
+def _infer_trailing_int(name: str) -> int | None:
+    m = re.search(r'(\d+)$', name or '')
+    return int(m.group(1)) if m else None
+
+
+def _estimate_ramp_from_log(iteration: np.ndarray, time_s: np.ndarray, T_K: np.ndarray, run_name: str = '', eps_T: float = 1e-6):
+    """Estimate ramp duration and rate from a quench log.
+
+    Returns:
+      t_ramp: seconds spent changing T (0 for step/unknown)
+      rate_abs: |dT/dt| during the ramp (K/s) (nan if not estimable)
+      protocol: 'ramp' or 'step_or_unknown'
+
+    Heuristic:
+    - Find indices where |ΔT| > eps_T (temperature actually changes between samples).
+    - Use first..last change as the ramp window and fit T(t) linearly there.
+    - If run_name ends with digits (e.g. output_quench_1000), interpret as ramp_iters and
+      compute t_ramp ≈ ramp_iters * dt (dt inferred from log). This helps when logFreq is coarse.
+    """
+    it = np.asarray(iteration, dtype=float)
+    t = np.asarray(time_s, dtype=float)
+    T = np.asarray(T_K, dtype=float)
+    if t.size < 3 or T.size != t.size or it.size != t.size:
+        return 0.0, float('nan'), 'step_or_unknown'
+
+    dT = np.diff(T)
+    changing = np.where(np.abs(dT) > float(eps_T))[0]
+    if changing.size == 0:
+        return 0.0, float('nan'), 'step_or_unknown'
+
+    i0 = int(changing[0])
+    i1 = int(changing[-1] + 1)
+    if i1 <= i0:
+        return 0.0, float('nan'), 'step_or_unknown'
+
+    t0 = float(t[i0])
+    t1 = float(t[i1])
+    t_ramp = max(0.0, t1 - t0)
+    if t_ramp <= 0.0:
+        return 0.0, float('nan'), 'step_or_unknown'
+
+    # Linear fit for rate (from the sampled ramp window)
+    tt = t[i0:i1 + 1]
+    TT = T[i0:i1 + 1]
+    if tt.size < 2:
+        return t_ramp, float('nan'), 'ramp'
+
+    # Fit TT ≈ a + b*tt
+    try:
+        b = float(np.polyfit(tt, TT, 1)[0])
+    except Exception:
+        b = float('nan')
+    rate_abs = abs(b) if np.isfinite(b) else float('nan')
+
+    # If run name encodes ramp_iters, prefer t_ramp = ramp_iters * dt
+    ramp_iters = _infer_trailing_int(run_name)
+    dt_inf = _infer_dt_from_log(it, t)
+    if ramp_iters is not None and np.isfinite(dt_inf) and dt_inf > 0:
+        t_ramp_name = float(ramp_iters) * float(dt_inf)
+        if t_ramp_name > 0:
+            t_ramp = t_ramp_name
+            dT = float(np.nanmax(T) - np.nanmin(T))
+            if t_ramp > 0:
+                rate_abs = abs(dT / t_ramp)
+
+    return t_ramp, rate_abs, 'ramp'
+
+
+def _choose_final_field_file(run_dir: str) -> str:
+    """Pick a representative field file for KZ metrics."""
+    cand = os.path.join(run_dir, 'nematic_field_final.dat')
+    if os.path.exists(cand):
+        return cand
+    files = glob.glob(os.path.join(run_dir, 'nematic_field_iter_*.dat'))
+    if not files:
+        raise FileNotFoundError(f"No nematic field files found in {run_dir}")
+
+    def _iter_num(p: str) -> int:
+        m = re.search(r'(\d+)', os.path.basename(p))
+        return int(m.group(1)) if m else -1
+
+    files.sort(key=_iter_num)
+    return files[-1]
+
+
+def _select_snapshot_by_time(run_dir: str, desired_time_s: float, it_log: np.ndarray, t_log: np.ndarray) -> str:
+    """Pick the snapshot file whose logged time is closest to desired_time_s."""
+    files = glob.glob(os.path.join(run_dir, 'nematic_field_iter_*.dat'))
+    if not files:
+        cand = os.path.join(run_dir, 'nematic_field_final.dat')
+        if os.path.exists(cand):
+            return cand
+        raise FileNotFoundError(f"No nematic_field_iter_*.dat or nematic_field_final.dat in {run_dir}")
+
+    def _iter_num(p: str) -> int:
+        m = re.search(r'(\d+)', os.path.basename(p))
+        return int(m.group(1)) if m else -1
+
+    best_fp = None
+    best_dt = float('inf')
+    for fp in files:
+        it = _iter_num(fp)
+        if it < 0:
+            continue
+        tt = _nearest_from_log(it_log, t_log, it)
+        if not np.isfinite(tt):
+            continue
+        d = abs(float(tt) - float(desired_time_s))
+        if d < best_dt:
+            best_dt = d
+            best_fp = fp
+
+    if best_fp is None:
+        # fallback
+        cand = os.path.join(run_dir, 'nematic_field_final.dat')
+        if os.path.exists(cand):
+            return cand
+        files.sort(key=_iter_num)
+        return files[-1]
+    return best_fp
+
+
+def _choose_z_slices_for_avg(
+    Nz: int,
+    *,
+    z_center: int | None,
+    z_avg: int,
+    z_min: int | None = None,
+    z_max: int | None = None,
+) -> list[int]:
+    """Choose a list of z-slices to average over.
+
+    - If z_avg <= 1: returns a single slice (center or mid-plane).
+    - If z_center is None: picks z_avg slices evenly spaced across [z_min, z_max].
+    - If z_center is given: picks z_avg slices evenly spaced across the full symmetric span
+      around z_center that fits inside [z_min, z_max].
+    """
+    Nz = int(Nz)
+    if Nz < 1:
+        return [0]
+
+    z_lo = 0 if z_min is None else int(z_min)
+    z_hi = (Nz - 1) if z_max is None else int(z_max)
+    z_lo = max(0, min(Nz - 1, z_lo))
+    z_hi = max(0, min(Nz - 1, z_hi))
+    if z_hi < z_lo:
+        z_lo, z_hi = z_hi, z_lo
+
+    if z_avg <= 1:
+        z0 = (Nz // 2) if z_center is None else int(z_center)
+        return [max(0, min(Nz - 1, z0))]
+
+    if z_center is None:
+        zz = np.linspace(z_lo, z_hi, int(z_avg))
+    else:
+        zc = max(0, min(Nz - 1, int(z_center)))
+        span = min(zc - z_lo, z_hi - zc)
+        zz = np.linspace(zc - span, zc + span, int(z_avg))
+
+    z_int = [int(round(v)) for v in zz]
+    # Deduplicate while preserving order
+    out: list[int] = []
+    seen = set()
+    for z in z_int:
+        z = max(0, min(Nz - 1, z))
+        if z not in seen:
+            out.append(z)
+            seen.add(z)
+    return out
+
+
+def _crossing_time_from_log(T: np.ndarray, t: np.ndarray, Tc: float) -> float:
+    """Estimate the time when temperature crosses from above Tc to <= Tc.
+
+    Uses the first downward crossing (T[i] > Tc and T[i+1] <= Tc) with linear interpolation.
+    If not found:
+      - If max(T) <= Tc: returns first time.
+      - If min(T)  > Tc: returns last time.
+    """
+    T = np.asarray(T, dtype=float)
+    t = np.asarray(t, dtype=float)
+    if T.size < 1 or t.size < 1:
+        return float('nan')
+    Tc = float(Tc)
+
+    if np.nanmax(T) <= Tc:
+        return float(t[0])
+    if np.nanmin(T) > Tc:
+        return float(t[-1])
+
+    for i in range(int(T.size) - 1):
+        Ti = float(T[i])
+        Tj = float(T[i + 1])
+        if not (np.isfinite(Ti) and np.isfinite(Tj)):
+            continue
+        if (Ti > Tc) and (Tj <= Tc):
+            ti = float(t[i])
+            tj = float(t[i + 1])
+            dT = (Tj - Ti)
+            if not (np.isfinite(ti) and np.isfinite(tj)):
+                return ti if np.isfinite(ti) else tj
+            if dT == 0.0:
+                return tj
+            alpha = (Tc - Ti) / dT
+            alpha = max(0.0, min(1.0, float(alpha)))
+            return ti + (tj - ti) * alpha
+
+    return float(t[-1])
+
+
+def _fit_powerlaw_loglog(xv, yv, *, x_min: float | None = None, x_max: float | None = None):
+    """Fit y = prefactor * x^slope in log–log space.
+
+    Optional x-range filtering can be applied via x_min/x_max (inclusive).
+    """
+    xv = np.asarray(xv, dtype=float)
+    yv = np.asarray(yv, dtype=float)
+    m = np.isfinite(xv) & np.isfinite(yv) & (xv > 0) & (yv > 0)
+    if x_min is not None and np.isfinite(float(x_min)):
+        m &= (xv >= float(x_min))
+    if x_max is not None and np.isfinite(float(x_max)):
+        m &= (xv <= float(x_max))
+    if np.count_nonzero(m) < 3:
+        return float('nan'), float('nan')
+    a, b = np.polyfit(np.log(xv[m]), np.log(yv[m]), 1)
+    return float(a), float(np.exp(b))
+
+
+def _kz_metrics_over_z_slices(
+    field_path: str,
+    Nx: int,
+    Ny: int,
+    Nz: int,
+    z_slices: list[int],
+    *,
+    S_threshold: float,
+    min_valid_points: int = 64,
+) -> tuple[float, float, int, float, float]:
+    """Compute (xi_mean, defect_mean, n_used, xi_std, defect_std) across z_slices.
+
+    Skips slices with too few valid (S>S_threshold) points or non-finite metrics.
+    """
+    xi_vals: list[float] = []
+    def_vals: list[float] = []
+    diag = []
+
+    for z in z_slices:
+        z_use = max(0, min(int(Nz) - 1, int(z)))
+        S2, nx2, ny2, _ = _load_nematic_slice_arrays(field_path, Nx, Ny, Nz, z_use)
+        n_valid = int(np.count_nonzero(np.isfinite(S2)))
+        n_mask = int(np.count_nonzero((S2 > S_threshold) & np.isfinite(S2)))
+        smax = float(np.nanmax(S2)) if n_valid else float('nan')
+        diag.append((int(z_use), n_mask, n_valid, smax))
+        if n_mask < int(min_valid_points):
+            continue
+        n_def, _ = defect_density_2d_from_slice(S2, nx2, ny2, S_threshold=S_threshold)
+        xi, _, _ = correlation_length_2d_from_slice(S2, nx2, ny2, S_threshold=S_threshold)
+        if np.isfinite(xi) and xi > 0:
+            xi_vals.append(float(xi))
+        if np.isfinite(n_def) and n_def >= 0:
+            def_vals.append(float(n_def))
+
+    n_used = min(len(xi_vals), len(def_vals))
+    if n_used < 1:
+        # Include a tiny diagnostic so it's clear this is usually a mask/threshold issue, not "file is empty".
+        if diag:
+            best = max(diag, key=lambda x: x[1])  # by n_mask
+            zbest, nmask_best, nvalid_best, smax_best = best
+            raise ValueError(
+                f"No valid z-slices found for metrics in {os.path.basename(field_path)} (S_threshold={S_threshold}, "
+                f"min_valid_points={int(min_valid_points)}). Best slice z={zbest}: mask={nmask_best}/{nvalid_best}, "
+                f"Smax={smax_best:.3g}."
+            )
+        raise ValueError(
+            f"No valid z-slices found for metrics in {os.path.basename(field_path)} (S_threshold={S_threshold}, "
+            f"min_valid_points={int(min_valid_points)})."
+        )
+
+    xi_arr = np.array(xi_vals[:n_used], dtype=float)
+    d_arr = np.array(def_vals[:n_used], dtype=float)
+    return float(np.mean(xi_arr)), float(np.mean(d_arr)), int(n_used), float(np.std(xi_arr)), float(np.std(d_arr))
+
+
+def aggregate_kz_scaling(
+    parent_dir: str = '.',
+    *,
+    pattern: str = 'output_quench*',
+    out_dir: str = 'pics',
+    z_slice: int | None = None,
+    z_avg: int = 1,
+    z_margin_frac: float = 0.0,
+    S_threshold: float = 0.1,
+    x_axis: str = 't_ramp',
+    fit_x_min: float | None = None,
+    fit_x_max: float | None = None,
+    measure: str = 'final',
+    after_Tlow_s: float = 0.0,
+    Tc: float | None = None,
+    after_Tc_s: float = 0.0,
+    show: bool = True,
+    plot: bool = True,
+    write_files: bool = True,
+):
+    """Aggregate KZ proxies across multiple quench runs.
+
+    Scans subdirectories matching pattern that contain quench_log.dat, computes:
+      - t_ramp and |dT/dt| from log
+      - xi and defect density from final nematic field (2D mid-plane slice proxy)
+
+    x_axis:
+      - 't_ramp' : seconds
+      - 'rate'   : |dT/dt| (K/s)
+    """
+    if not parent_dir:
+        parent_dir = '.'
+
+    parent_dir = os.path.abspath(parent_dir)
+    cand_dirs = [d for d in glob.glob(os.path.join(parent_dir, pattern)) if os.path.isdir(d)]
+    cand_dirs.sort()
+    run_dirs = []
+    for d in cand_dirs:
+        if os.path.exists(os.path.join(d, 'quench_log.dat')):
+            run_dirs.append(d)
+
+    if not run_dirs:
+        raise FileNotFoundError(f"No quench runs found in {parent_dir} matching {pattern} (missing quench_log.dat)")
+
+    measure_norm = (measure or 'final').strip().lower()
+    if measure_norm in ('after_tlow', 'after_t_low', 'tlow', 'after_final_t'):
+        offset = float(after_Tlow_s)
+        offset_label = f"{offset:g}s".replace('.', 'p').replace('-', 'm')
+        measure_label = f"after_Tlow_{offset_label}"
+    elif measure_norm in ('after_tc', 'after_t_c', 'tc', 'after_transition'):
+        offset = float(after_Tc_s)
+        offset_label = f"{offset:g}s".replace('.', 'p').replace('-', 'm')
+        Tc_label = f"{float(Tc) if Tc is not None else float('nan'):g}K".replace('.', 'p').replace('-', 'm')
+        measure_label = f"after_Tc_{Tc_label}_{offset_label}"
+    else:
+        measure_label = 'final'
+
+    rows = []
+    for run_dir in run_dirs:
+        data, log_path = load_quench_log(run_dir)
+        it = np.atleast_1d(data['iteration']).astype(float)
+        t = np.atleast_1d(data['time_s']).astype(float)
+        T = np.atleast_1d(data['T_K']).astype(float)
+        t_ramp, rate_abs, protocol = _estimate_ramp_from_log(it, t, T, run_name=os.path.basename(run_dir))
+
+        # Choose which state to analyze
+        if measure_norm in ('after_tlow', 'after_t_low', 'tlow', 'after_final_t'):
+            # time when we reach final temperature (heuristic: first time within eps of min(T))
+            Tmin = float(np.nanmin(T))
+            epsT = 1e-9
+            idxs = np.where(np.abs(T - Tmin) <= epsT)[0]
+            if idxs.size == 0:
+                t_reach = float(t[-1])
+            else:
+                t_reach = float(t[int(idxs[0])])
+            t_meas = t_reach + float(after_Tlow_s)
+            field_path = _select_snapshot_by_time(run_dir, t_meas, it, t)
+        elif measure_norm in ('after_tc', 'after_t_c', 'tc', 'after_transition'):
+            if Tc is None or not np.isfinite(float(Tc)):
+                raise ValueError("measure=after_Tc requires Tc to be set")
+            t_cross = _crossing_time_from_log(T, t, float(Tc))
+            t_meas = float(t_cross) + float(after_Tc_s)
+            field_path = _select_snapshot_by_time(run_dir, t_meas, it, t)
+        else:
+            field_path = _choose_final_field_file(run_dir)
+        def _iter_num(p: str) -> int:
+            m = re.search(r'(\d+)', os.path.basename(p))
+            return int(m.group(1)) if m else -1
+
+        def _compute_metrics_for_field(fp: str):
+            Nx, Ny, Nz = infer_grid_dims_from_nematic_field_file(fp)
+            z_center = None if z_slice is None else int(z_slice)
+
+            z_margin = float(z_margin_frac)
+            if not np.isfinite(z_margin):
+                z_margin = 0.0
+            z_margin = max(0.0, min(0.45, z_margin))
+            if int(z_avg) > 1 and z_margin > 0.0:
+                z_lo = int(round(z_margin * (Nz - 1)))
+                z_hi = int(round((1.0 - z_margin) * (Nz - 1)))
+            else:
+                z_lo, z_hi = 0, Nz - 1
+
+            z_slices = _choose_z_slices_for_avg(Nz, z_center=z_center, z_avg=int(z_avg), z_min=z_lo, z_max=z_hi)
+            xi, n_def, n_used, xi_std, ndef_std = _kz_metrics_over_z_slices(
+                fp,
+                Nx,
+                Ny,
+                Nz,
+                z_slices,
+                S_threshold=S_threshold,
+            )
+            z_use = (Nz // 2) if z_center is None else max(0, min(Nz - 1, z_center))
+            return Nx, Ny, Nz, xi, n_def, n_used, xi_std, ndef_std, z_use
+
+        # For time-targeted measurements, Tc/Tlow can fall between sparse snapshot files. If the chosen snapshot
+        # is still essentially isotropic (no S>S_threshold points), try the next snapshot(s).
+        max_retries = 12
+        tried = []
+        files_sorted = None
+        if measure_norm in ('after_tlow', 'after_t_low', 'tlow', 'after_final_t', 'after_tc', 'after_t_c', 'tc', 'after_transition'):
+            files_sorted = glob.glob(os.path.join(run_dir, 'nematic_field_iter_*.dat'))
+            files_sorted.sort(key=_iter_num)
+
+        fp_try = field_path
+        last_err: Exception | None = None
+        # Initialize for static analyzers; these will be overwritten on success.
+        Nx = Ny = Nz = 0
+        xi = float('nan')
+        n_def = float('nan')
+        n_used = 0
+        xi_std = float('nan')
+        ndef_std = float('nan')
+        z_use = 0
+        for _attempt in range(max_retries + 1):
+            try:
+                Nx, Ny, Nz, xi, n_def, n_used, xi_std, ndef_std, z_use = _compute_metrics_for_field(fp_try)
+                field_path = fp_try
+                break
+            except ValueError as e:
+                last_err = e
+                tried.append(os.path.basename(fp_try))
+                msg = str(e)
+                if ('No valid z-slices found for metrics' not in msg) or (not files_sorted):
+                    raise
+                it_cur = _iter_num(fp_try)
+                # Advance to the next snapshot file by iteration
+                idx = -1
+                for j, fp in enumerate(files_sorted):
+                    if _iter_num(fp) == it_cur:
+                        idx = j
+                        break
+                if idx < 0 or idx + 1 >= len(files_sorted):
+                    break
+                fp_try = files_sorted[idx + 1]
+        else:
+            last_err = last_err or ValueError('No valid z-slices found for metrics')
+
+        if not (np.isfinite(xi) and np.isfinite(n_def) and int(n_used) > 0):
+            if last_err is not None and 'No valid z-slices found for metrics' in str(last_err):
+                tried_s = ','.join(tried[:6]) + ('...' if len(tried) > 6 else '')
+                raise ValueError(f"{last_err} Tried snapshots: {tried_s}")
+            if last_err is not None:
+                raise last_err
+            raise ValueError(f"Failed to compute KZ metrics for run {os.path.basename(run_dir)}")
+        # A convenient "quench time" scale for ramp: tau_Q ~ t_ramp
+        tau_Q = float(t_ramp)
+        rows.append(
+            (
+                os.path.basename(run_dir),
+                protocol,
+                tau_Q,
+                rate_abs,
+                xi,
+                n_def,
+                z_use,
+                S_threshold,
+                int(z_avg),
+                int(n_used),
+                xi_std,
+                ndef_std,
+                os.path.basename(field_path),
+            )
+        )
+
+    out_path = None
+    csv_path = None
+    tag = os.path.basename(parent_dir) or 'runs'
+    tag_full = f"{tag}_{measure_label}"
+    if write_files:
+        os.makedirs(out_dir, exist_ok=True)
+        csv_path = os.path.join(out_dir, f'kz_scaling_{tag_full}.csv')
+        with open(csv_path, 'w', encoding='utf-8') as f:
+            f.write('run,protocol,t_ramp_s,rate_K_per_s,xi_lattice,defect_density,z_center,S_threshold,z_avg,z_used,xi_std,defect_std,field_file\n')
+            for r in rows:
+                f.write(
+                    f"{r[0]},{r[1]},{r[2]:.8g},{r[3]:.8g},{r[4]:.8g},{r[5]:.8g},{int(r[6])},{r[7]:.8g},{int(r[8])},{int(r[9])},{r[10]:.8g},{r[11]:.8g},{r[12]}\n"
+                )
+
+    # Prepare arrays for plotting
+    arr = np.array([[r[2], r[3], r[4], r[5]] for r in rows], dtype=float)
+    t_ramp = arr[:, 0]
+    rate = arr[:, 1]
+    xi = arr[:, 2]
+    ndef = arr[:, 3]
+
+    if x_axis.strip().lower() == 'rate':
+        x = rate
+        x_label = r'$|dT/dt|$ [K/s]'
+        x_name = 'rate'
+    else:
+        x = t_ramp
+        x_label = r'$t_{ramp}$ [s]'
+        x_name = 't_ramp'
+
+    slope_xi, pref_xi = _fit_powerlaw_loglog(x, xi, x_min=fit_x_min, x_max=fit_x_max)
+    slope_nd, pref_nd = _fit_powerlaw_loglog(x, ndef, x_min=fit_x_min, x_max=fit_x_max)
+
+    if plot:
+        fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(10, 8), sharex=True)
+        ax1.loglog(x, xi, 'o', ms=7)
+        ax1.set_ylabel(r'$\xi$ (lattice units)')
+        ax1.grid(True, which='both', alpha=0.3)
+
+        if np.isfinite(slope_xi) and np.isfinite(pref_xi):
+            xs = np.linspace(np.nanmin(x[x > 0]), np.nanmax(x[x > 0]), 100)
+            ax1.loglog(xs, pref_xi * xs ** slope_xi, '--', lw=1.5, label=f'fit: slope={slope_xi:.3g}')
+            ax1.legend()
+
+        ax2.loglog(x, ndef, 'o', ms=7, color='tab:red')
+        ax2.set_xlabel(x_label)
+        ax2.set_ylabel('defect density (per plaquette)')
+        ax2.grid(True, which='both', alpha=0.3)
+
+        if np.isfinite(slope_nd) and np.isfinite(pref_nd):
+            xs = np.linspace(np.nanmin(x[x > 0]), np.nanmax(x[x > 0]), 100)
+            ax2.loglog(xs, pref_nd * xs ** slope_nd, '--', lw=1.5, color='tab:red', label=f'fit: slope={slope_nd:.3g}')
+            ax2.legend()
+
+        fig.suptitle(
+            f'KZ scaling (2D proxies) across {len(rows)} runs | measure={measure_label} | x={x_name} | S>{S_threshold} | z_avg={int(z_avg)}'
+        )
+        fig.tight_layout(rect=(0, 0, 1, 0.96))
+
+        if write_files:
+            out_path = os.path.join(out_dir, f'kz_scaling_{tag_full}_{x_name}.png')
+            fig.savefig(out_path, dpi=220)
+            print(f"Saved KZ scaling plot -> {out_path}")
+            print(f"Saved KZ scaling CSV  -> {csv_path}")
+
+        if show:
+            plt.show()
+        else:
+            plt.close(fig)
+
+    return rows, out_path, csv_path
+
+
+def sweep_kz_slope_stability(
+    parent_dir: str = '.',
+    *,
+    pattern: str = 'output_quench*',
+    out_dir: str = 'pics',
+    x_axis: str = 't_ramp',
+    S_threshold: float = 0.02,
+    z_slice: int | None = None,
+    z_avg: int = 11,
+    z_margin_frac: float = 0.2,
+    Tc: float = 310.2,
+    snapshotFreq_iters: int = 10000,
+    offsets_in_snaps: list[int] | None = None,
+    show: bool = True,
+):
+    """Sweep measurement offset after crossing Tc and report fitted slopes.
+
+    Offsets are specified in *snapshot counts* (integers). They are converted to seconds using
+    dt inferred from the quench_log (median Δt/Δiter).
+    """
+    if offsets_in_snaps is None:
+        offsets_in_snaps = [0, 1, 2, 5, 10]
+    snapshotFreq_iters = int(snapshotFreq_iters)
+    if snapshotFreq_iters < 1:
+        snapshotFreq_iters = 1
+
+    parent_abs = os.path.abspath(parent_dir or '.')
+    cand_dirs = [d for d in glob.glob(os.path.join(parent_abs, pattern)) if os.path.isdir(d)]
+    cand_dirs.sort()
+    run_dirs = [d for d in cand_dirs if os.path.exists(os.path.join(d, 'quench_log.dat'))]
+    if not run_dirs:
+        raise FileNotFoundError(f"No quench runs found in {parent_abs} matching {pattern} (missing quench_log.dat)")
+
+    # Infer dt from the first available run
+    data0, _ = load_quench_log(run_dirs[0])
+    it0 = np.atleast_1d(data0['iteration']).astype(float)
+    t0 = np.atleast_1d(data0['time_s']).astype(float)
+    if it0.size < 2:
+        raise ValueError("Not enough log points to infer dt")
+    dit = np.diff(it0)
+    dtm = np.diff(t0)
+    m = np.isfinite(dit) & np.isfinite(dtm) & (dit > 0)
+    if np.count_nonzero(m) < 1:
+        raise ValueError("Cannot infer dt from log")
+    dt_inf = float(np.median(dtm[m] / dit[m]))
+    dt_snap = dt_inf * float(snapshotFreq_iters)
+    if not (np.isfinite(dt_snap) and dt_snap > 0):
+        raise ValueError("Inferred dt_snap is invalid")
+
+    offsets_s = [int(k) * dt_snap for k in offsets_in_snaps]
+    slopes = []
+    for k, off_s in zip(offsets_in_snaps, offsets_s):
+        rows, _, _ = aggregate_kz_scaling(
+            parent_dir,
+            pattern=pattern,
+            out_dir=out_dir,
+            z_slice=z_slice,
+            z_avg=z_avg,
+            z_margin_frac=z_margin_frac,
+            S_threshold=S_threshold,
+            x_axis=x_axis,
+            measure='after_Tc',
+            Tc=Tc,
+            after_Tc_s=float(off_s),
+            show=False,
+            plot=False,
+            write_files=False,
+        )
+
+        arr = np.array([[r[2], r[3], r[4], r[5]] for r in rows], dtype=float)
+        t_ramp = arr[:, 0]
+        rate = arr[:, 1]
+        xi = arr[:, 2]
+        ndef = arr[:, 3]
+        x = rate if x_axis.strip().lower() == 'rate' else t_ramp
+
+        slope_xi, _ = _fit_powerlaw_loglog(x, xi)
+        slope_nd, _ = _fit_powerlaw_loglog(x, ndef)
+        slopes.append((int(k), float(off_s), float(slope_xi), float(slope_nd)))
+
+    os.makedirs(out_dir, exist_ok=True)
+    tag = os.path.basename(parent_abs) or 'runs'
+    csv_name = f'slope_stability_{tag}_after_Tc_{float(Tc):g}K.csv'.replace('.', 'p')
+    csv_path = os.path.join(out_dir, csv_name)
+    with open(csv_path, 'w', encoding='utf-8') as f:
+        f.write('offset_snaps,offset_s,slope_xi,slope_defect\n')
+        for k, off_s, sx, sd in slopes:
+            f.write(f"{k},{off_s:.8g},{sx:.8g},{sd:.8g}\n")
+
+    ks = np.array([s[0] for s in slopes], dtype=float)
+    sx = np.array([s[2] for s in slopes], dtype=float)
+    sd = np.array([s[3] for s in slopes], dtype=float)
+
+    fig, ax = plt.subplots(1, 1, figsize=(9, 4.8))
+    ax.plot(ks, sx, 'o-', label=r'slope($\xi$)')
+    ax.plot(ks, sd, 'o-', label='slope(defects)')
+    ax.set_xlabel('offset after Tc (snapshots)')
+    ax.set_ylabel('fitted log–log slope')
+    ax.grid(True, alpha=0.3)
+    ax.legend()
+    ax.set_title(f'Slope stability vs offset | Tc={Tc:g}K | dt_snap≈{dt_snap:.3g}s | z_avg={int(z_avg)} | margin={z_margin_frac:g}')
+    out_png = os.path.join(out_dir, f'slope_stability_{tag}_after_Tc.png')
+    fig.tight_layout()
+    fig.savefig(out_png, dpi=220)
+    print(f"Saved slope stability plot -> {out_png}")
+    print(f"Saved slope stability CSV  -> {csv_path}")
+    if show:
+        plt.show()
+    else:
+        plt.close(fig)
+
+    return slopes, out_png, csv_path
 
 def animate_tempSweep(Vname=None, choice=None):
     # Find all temperature directories (sorted numerically by T)
@@ -1314,10 +1995,12 @@ if __name__ == '__main__':
               "6: Plot Quench Log (T, energies, radiality, <S>)\n"
               "7: Create Quench animation (GIF)\n"
               "8: Plot KZ metrics from quench (xi + defect density)\n"
-              "Enter your choice (0-8): ").strip()
-    while not i.isdigit() or int(i) < 0 or int(i) > 8:
-        print("Invalid input. Please enter a number between 0 and 8.")
-        i = input("Please enter a number between 0 and 8: ").strip()
+              "9: Aggregate KZ scaling across runs (log-log fit)\n"
+              "10: Sweep KZ slope stability vs offset after Tc\n"
+              "Enter your choice (0-10): ").strip()
+    while not i.isdigit() or int(i) < 0 or int(i) > 10:
+        print("Invalid input. Please enter a number between 0 and 10.")
+        i = input("Please enter a number between 0 and 10: ").strip()
     i = int(i)
     # ---------------------------------------------------------------------- PART 1 ----------------------------------------------------------------------------|
     if i == 0:
@@ -1498,6 +2181,164 @@ if __name__ == '__main__':
             plot_quench_kz_metrics(in_path, out_dir='pics', frame_stride=stride, max_frames=max_frames, S_threshold=sthr, show=True)
         except Exception as e:
             print(f"Error computing KZ metrics: {e}")
+    elif i == 9:
+        print("\nAggregating KZ scaling across multiple quench runs...")
+        parent = input("Parent directory to scan [default: .]: ").strip() or '.'
+        pattern = input("Folder pattern [default: output_quench*]: ").strip() or 'output_quench*'
+        x_axis = input("X-axis (t_ramp or rate) [default: t_ramp]: ").strip() or 't_ramp'
+        measure = input("Measure state (final / after_Tlow / after_Tc) [default: final]: ").strip() or 'final'
+        after_Tlow_s = 0.0
+        Tc = None
+        after_Tc_s = 0.0
+        if measure.strip().lower() in ('after_tlow', 'after_t_low', 'tlow', 'after_final_t'):
+            off_in = input("Time offset after reaching T_low in seconds [default: 0.0]: ").strip()
+            try:
+                after_Tlow_s = float(off_in) if off_in else 0.0
+            except ValueError:
+                after_Tlow_s = 0.0
+        elif measure.strip().lower() in ('after_tc', 'after_t_c', 'tc', 'after_transition'):
+            tc_in = input("Transition temperature Tc in Kelvin [default: 310.2]: ").strip()
+            try:
+                Tc = float(tc_in) if tc_in else 310.2
+            except ValueError:
+                Tc = 310.2
+            off_in = input("Time offset after crossing Tc in seconds [default: 0.0]: ").strip()
+            try:
+                after_Tc_s = float(off_in) if off_in else 0.0
+            except ValueError:
+                after_Tc_s = 0.0
+        sth_in = input("S threshold for droplet mask [default: 0.1]: ").strip()
+        try:
+            sthr = float(sth_in) if sth_in else 0.1
+        except ValueError:
+            sthr = 0.1
+        z_in = input("z-slice (blank=mid-plane): ").strip()
+        z_slice = None
+        if z_in:
+            try:
+                z_slice = int(z_in)
+            except ValueError:
+                z_slice = None
+
+        zavg_in = input("Average over N z-slices (1=off) [default: 1]: ").strip()
+        try:
+            z_avg = int(zavg_in) if zavg_in else 1
+        except ValueError:
+            z_avg = 1
+        if z_avg < 1:
+            z_avg = 1
+
+        fit_x_min = None
+        fit_x_max = None
+        if x_axis.strip().lower() == 'rate':
+            fx1 = input("Fit window min |dT/dt| [K/s] (blank=all): ").strip()
+            fx2 = input("Fit window max |dT/dt| [K/s] (blank=all): ").strip()
+        else:
+            fx1 = input("Fit window min t_ramp [s] (blank=all): ").strip()
+            fx2 = input("Fit window max t_ramp [s] (blank=all): ").strip()
+        try:
+            fit_x_min = float(fx1) if fx1 else None
+        except ValueError:
+            fit_x_min = None
+        try:
+            fit_x_max = float(fx2) if fx2 else None
+        except ValueError:
+            fit_x_max = None
+
+        z_margin_frac = 0.0
+        if z_avg > 1:
+            zm_in = input("Exclude outer z band fraction (0..0.45) [default: 0.2]: ").strip()
+            try:
+                z_margin_frac = float(zm_in) if zm_in else 0.2
+            except ValueError:
+                z_margin_frac = 0.2
+            z_margin_frac = max(0.0, min(0.45, z_margin_frac))
+        try:
+            aggregate_kz_scaling(
+                parent,
+                pattern=pattern,
+                out_dir='pics',
+                z_slice=z_slice,
+                z_avg=z_avg,
+                z_margin_frac=z_margin_frac,
+                S_threshold=sthr,
+                x_axis=x_axis,
+                fit_x_min=fit_x_min,
+                fit_x_max=fit_x_max,
+                measure=measure,
+                after_Tlow_s=after_Tlow_s,
+                Tc=Tc,
+                after_Tc_s=after_Tc_s,
+                show=True,
+            )
+        except Exception as e:
+            print(f"Error aggregating KZ scaling: {e}")
+    elif i == 10:
+        print("\nSweeping KZ slope stability vs offset after Tc...")
+        parent = input("Parent directory to scan [default: .]: ").strip() or '.'
+        pattern = input("Folder pattern [default: output_quench*]: ").strip() or 'output_quench*'
+        x_axis = input("X-axis (t_ramp or rate) [default: t_ramp]: ").strip() or 't_ramp'
+        tc_in = input("Transition temperature Tc in Kelvin [default: 310.2]: ").strip()
+        try:
+            Tc = float(tc_in) if tc_in else 310.2
+        except ValueError:
+            Tc = 310.2
+        sf_in = input("Snapshot frequency in iterations [default: 10000]: ").strip()
+        try:
+            snapshotFreq_iters = int(float(sf_in)) if sf_in else 10000
+        except ValueError:
+            snapshotFreq_iters = 10000
+        sth_in = input("S threshold for droplet mask [default: 0.02]: ").strip()
+        try:
+            sthr = float(sth_in) if sth_in else 0.02
+        except ValueError:
+            sthr = 0.02
+        z_in = input("z-slice (blank=mid-plane): ").strip()
+        z_slice = None
+        if z_in:
+            try:
+                z_slice = int(z_in)
+            except ValueError:
+                z_slice = None
+        zavg_in = input("Average over N z-slices [default: 11]: ").strip()
+        try:
+            z_avg = int(zavg_in) if zavg_in else 11
+        except ValueError:
+            z_avg = 11
+        if z_avg < 1:
+            z_avg = 1
+        zm_in = input("Exclude outer z band fraction (0..0.45) [default: 0.2]: ").strip()
+        try:
+            z_margin_frac = float(zm_in) if zm_in else 0.2
+        except ValueError:
+            z_margin_frac = 0.2
+        z_margin_frac = max(0.0, min(0.45, z_margin_frac))
+
+        off_in = input("Offsets after Tc in snapshots (comma-separated) [default: 0,1,2,5,10]: ").strip()
+        offsets_in_snaps = None
+        if off_in:
+            try:
+                offsets_in_snaps = [int(s.strip()) for s in off_in.split(',') if s.strip()]
+            except ValueError:
+                offsets_in_snaps = None
+
+        try:
+            sweep_kz_slope_stability(
+                parent,
+                pattern=pattern,
+                out_dir='pics',
+                x_axis=x_axis,
+                S_threshold=sthr,
+                z_slice=z_slice,
+                z_avg=z_avg,
+                z_margin_frac=z_margin_frac,
+                Tc=Tc,
+                snapshotFreq_iters=snapshotFreq_iters,
+                offsets_in_snaps=offsets_in_snaps,
+                show=True,
+            )
+        except Exception as e:
+            print(f"Error sweeping slope stability: {e}")
     # ---------------------------------------------------------------------- FIN --------------------------------------------------------------------------------|
 
 # WHAT I NEED TO DO:

@@ -1,4 +1,7 @@
 #include "QSR.cuh"
+#include <cctype>
+#include <limits>
+#include <type_traits>
 
 namespace fs = std::filesystem;
 
@@ -525,10 +528,32 @@ T prompt_with_default(const std::string& prompt, T default_value) {
     std::cout << prompt << " [" << default_value << "]: ";
     std::getline(std::cin, line);
     if (line.empty()) return default_value;
-    std::istringstream iss(line);
-    T value;
-    if (!(iss >> value)) return default_value;
-    return value;
+
+    // NOTE: for integral types, operator>> would parse "1e6" as 1 (stops at 'e').
+    // We instead parse via floating-point and round when the target is integral.
+    if constexpr (std::is_integral_v<T> && !std::is_same_v<T, bool>) {
+        try {
+            size_t idx = 0;
+            long double v = std::stold(line, &idx);
+            while (idx < line.size() && std::isspace(static_cast<unsigned char>(line[idx]))) {
+                ++idx;
+            }
+            if (idx != line.size()) return default_value;
+
+            long double vr = std::llround(v);
+            const long double lo = static_cast<long double>(std::numeric_limits<T>::min());
+            const long double hi = static_cast<long double>(std::numeric_limits<T>::max());
+            if (vr < lo || vr > hi) return default_value;
+            return static_cast<T>(vr);
+        } catch (...) {
+            return default_value;
+        }
+    } else {
+        std::istringstream iss(line);
+        T value;
+        if (!(iss >> value)) return default_value;
+        return value;
+    }
 }
 
 static bool prompt_yes_no(const std::string& prompt, bool default_yes) {
