@@ -250,6 +250,7 @@ def plot_nematic_field_slice(
     Ny,
     Nz,
     z_slice=None,
+    slice_axis: str = 'z',
     output_path=None,
     arrowColor=None,
     zoom_radius=None,
@@ -265,8 +266,21 @@ def plot_nematic_field_slice(
     Loads pre-calculated nematic field data (S, n), plots a slice, and saves it.
     This function is much more direct as it doesn't need to calculate eigenvalues.
     """
+    axis = (slice_axis or 'z').strip().lower()
+    axis = axis[0] if axis else 'z'
+    if axis not in ('x', 'y', 'z'):
+        print(f"Warning: Unknown slice_axis='{slice_axis}'. Falling back to 'z'.")
+        axis = 'z'
+
+    # Backwards-compatible: keep the argument name z_slice, but interpret it as
+    # the slice index along the chosen axis.
     if z_slice is None:
-        z_slice = Nz // 2
+        if axis == 'z':
+            z_slice = Nz // 2
+        elif axis == 'y':
+            z_slice = Ny // 2
+        else:  # axis == 'x'
+            z_slice = Nx // 2
 
     # Load the raw data from the simulation output.
     # Columns are: i, j, k, S, nx, ny, nz
@@ -277,52 +291,94 @@ def plot_nematic_field_slice(
         print(f"Warning: Could not read file '{filename}'. Skipping.")
         return
 
-    # Select the data for the desired z-slice
-    slice_data = data[data[:, 2] == z_slice]
+    # Select the data for the desired slice plane
+    # Columns are: i, j, k, S, nx, ny, nz
+    if axis == 'z':
+        slice_data = data[data[:, 2] == z_slice]
+        plane_u, plane_v = int(Nx), int(Ny)
+        u_label, v_label = '$x$', '$y$'
+        slice_label = 'z'
+        # Vector components in the plane
+        vec_u_name, vec_v_name = 'nx', 'ny'
+    elif axis == 'y':
+        slice_data = data[data[:, 1] == z_slice]
+        plane_u, plane_v = int(Nx), int(Nz)
+        u_label, v_label = '$x$', '$z$'
+        slice_label = 'y'
+        vec_u_name, vec_v_name = 'nx', 'nz'
+    else:  # axis == 'x'
+        slice_data = data[data[:, 0] == z_slice]
+        plane_u, plane_v = int(Ny), int(Nz)
+        u_label, v_label = '$y$', '$z$'
+        slice_label = 'x'
+        vec_u_name, vec_v_name = 'ny', 'nz'
 
     if slice_data.shape[0] == 0:
-        print(f"Warning: No data found for z_slice = {z_slice} in {filename}. Skipping.")
+        print(f"Warning: No data found for {slice_label}_slice = {z_slice} in {filename}. Skipping.")
         return
 
-    # Prepare 2D arrays for S, n
-    S = np.zeros((Nx, Ny))
-    nx = np.zeros((Nx, Ny))
-    ny = np.zeros((Nx, Ny))
-    nz = np.zeros((Nx, Ny))
+    # Prepare 2D arrays for S, n (in the chosen plane)
+    S = np.zeros((plane_u, plane_v))
+    nx = np.zeros((plane_u, plane_v))
+    ny = np.zeros((plane_u, plane_v))
+    nz = np.zeros((plane_u, plane_v))
 
     # Directly populate arrays from the file data
     for row in slice_data:
-        i, j = int(row[0]), int(row[1])
-        if i < Nx and j < Ny:
-            S[i, j] = row[3]
-            nx[i, j] = row[4]
-            ny[i, j] = row[5]
-            nz[i, j] = row[6]
+        ii, jj, kk = int(row[0]), int(row[1]), int(row[2])
+        if axis == 'z':
+            u, v = ii, jj
+        elif axis == 'y':
+            u, v = ii, kk
+        else:  # axis == 'x'
+            u, v = jj, kk
+
+        if 0 <= u < plane_u and 0 <= v < plane_v:
+            S[u, v] = row[3]
+            nx[u, v] = row[4]
+            ny[u, v] = row[5]
+            nz[u, v] = row[6]
+
+    # Vector components to plot in the plane
+    if vec_u_name == 'nx':
+        vec_u = nx
+    elif vec_u_name == 'ny':
+        vec_u = ny
+    else:
+        vec_u = nz
+    if vec_v_name == 'nx':
+        vec_v = nx
+    elif vec_v_name == 'ny':
+        vec_v = ny
+    else:
+        vec_v = nz
 
     if print_stats:
-        ci, cj = Nx // 2, Ny // 2
-        if 0 <= ci < Nx and 0 <= cj < Ny:
+        cu, cv = plane_u // 2, plane_v // 2
+        if 0 <= cu < plane_u and 0 <= cv < plane_v:
             print(
-                f"[{os.path.basename(filename)} | z={z_slice}] "
-                f"S_center={S[ci, cj]:.6g}, "
+                f"[{os.path.basename(filename)} | {slice_label}={z_slice}] "
+                f"S_center={S[cu, cv]:.6g}, "
                 f"S_min={np.min(S):.6g}, S_max={np.max(S):.6g}; "
-                f"n_center=({nx[ci, cj]:.4g},{ny[ci, cj]:.4g},{nz[ci, cj]:.4g}), "
-                f"|n_perp|_center={np.sqrt(nx[ci, cj]**2 + ny[ci, cj]**2):.6g}"
+                f"n_center=({nx[cu, cv]:.4g},{ny[cu, cv]:.4g},{nz[cu, cv]:.4g}), "
+                f"|n_perp(view)|_center={np.sqrt(vec_u[cu, cv]**2 + vec_v[cu, cv]**2):.6g}"
             )
 
     # --- Handle zooming ---
     if zoom_radius is not None:
-        center_x, center_y = Nx // 2, Ny // 2
-        x_min = max(0, center_x - zoom_radius)
-        x_max = min(Nx, center_x + zoom_radius)
-        y_min = max(0, center_y - zoom_radius)
-        y_max = min(Ny, center_y + zoom_radius)
+        center_u, center_v = plane_u // 2, plane_v // 2
+        x_min = max(0, center_u - zoom_radius)
+        x_max = min(plane_u, center_u + zoom_radius)
+        y_min = max(0, center_v - zoom_radius)
+        y_max = min(plane_v, center_v + zoom_radius)
 
         # Slice the arrays
         S_view = S[x_min:x_max, y_min:y_max]
         nx_view = nx[x_min:x_max, y_min:y_max]
         ny_view = ny[x_min:x_max, y_min:y_max]
         nz_view = nz[x_min:x_max, y_min:y_max]
+        vec_u_view = vec_u[x_min:x_max, y_min:y_max]
+        vec_v_view = vec_v[x_min:x_max, y_min:y_max]
 
         extent = (x_min, x_max, y_min, y_max)
         step = 1  # default: dense in zoomed view
@@ -331,7 +387,9 @@ def plot_nematic_field_slice(
         nx_view = nx
         ny_view = ny
         nz_view = nz
-        extent = (0, Nx, 0, Ny)
+        vec_u_view = vec_u
+        vec_v_view = vec_v
+        extent = (0, plane_u, 0, plane_v)
 
         # Default: dense (historical behavior)
         step = 1
@@ -397,9 +455,19 @@ def plot_nematic_field_slice(
         vmin_use = -1.0 if vmin is None else float(vmin)
         vmax_use = 1.0 if vmax is None else float(vmax)
     else:  # n_perp
-        field = np.sqrt(nx_view * nx_view + ny_view * ny_view)
+        if axis == 'z':
+            field = np.sqrt(nx_view * nx_view + ny_view * ny_view)
+        elif axis == 'y':
+            field = np.sqrt(nx_view * nx_view + nz_view * nz_view)
+        else:  # axis == 'x'
+            field = np.sqrt(ny_view * ny_view + nz_view * nz_view)
         cmap = 'magma'
-        label = r'$|n_\perp|=\sqrt{n_x^2+n_y^2}$'
+        if axis == 'z':
+            label = r'$|n_\perp(z)|=\sqrt{n_x^2+n_y^2}$'
+        elif axis == 'y':
+            label = r'$|n_\perp(y)|=\sqrt{n_x^2+n_z^2}$'
+        else:
+            label = r'$|n_\perp(x)|=\sqrt{n_y^2+n_z^2}$'
         vmin_use = 0.0 if vmin is None else float(vmin)
         vmax_use = 1.0 if vmax is None else float(vmax)
 
@@ -418,8 +486,8 @@ def plot_nematic_field_slice(
         iy = np.arange(0, S_view.shape[1], step)
 
         # x_grid corresponds to columns (i), y_grid to rows (j)
-        nx_plot = nx_view[np.ix_(ix, iy)].T
-        ny_plot = ny_view[np.ix_(ix, iy)].T
+        nx_plot = vec_u_view[np.ix_(ix, iy)].T
+        ny_plot = vec_v_view[np.ix_(ix, iy)].T
         S_plot_mask = S_view[np.ix_(ix, iy)].T
 
         mask = S_plot_mask > 0.1
@@ -438,14 +506,14 @@ def plot_nematic_field_slice(
     # Extract iteration number from filename for the title
     match = re.search(r'(\d+)', os.path.basename(filename))
     iter_str = match.group(1) if match else "Final"
-    title = f"Nematično polje pri ($z={z_slice}$, Iter: {iter_str}, barva: {color_field_norm})"
+    title = f"Nematično polje pri (${slice_label}={z_slice}$, Iter: {iter_str}, barva: {color_field_norm})"
     if zoom_radius: title += " [ZOOMED]"
         
     ax.set_title(title)
-    ax.set_xlabel('$x$')
-    ax.set_ylabel('$y$')
-    ax.set_xlim(0, Nx)
-    ax.set_ylim(0, Ny)
+    ax.set_xlabel(u_label)
+    ax.set_ylabel(v_label)
+    ax.set_xlim(0, plane_u)
+    ax.set_ylim(0, plane_v)
     ax.set_aspect('equal', adjustable='box')
     fig.tight_layout()
 
@@ -1143,6 +1211,229 @@ def _infer_dt_from_log(iteration: np.ndarray, time_s: np.ndarray) -> float:
 def _infer_trailing_int(name: str) -> int | None:
     m = re.search(r'(\d+)$', name or '')
     return int(m.group(1)) if m else None
+
+
+def _resolve_run_dir_from_path(path: str) -> str:
+    """Resolve a run directory from an input path.
+
+    Accepts either a directory (e.g. output_quench_0) or a file path
+    (e.g. output_quench_0/quench_log.dat).
+    """
+    if not path:
+        return 'output_quench'
+    if os.path.isdir(path):
+        return path
+    if os.path.isfile(path):
+        d = os.path.dirname(path)
+        return d if d else '.'
+    return path
+
+
+def _list_snapshot_files(run_dir: str) -> list[tuple[int, str]]:
+    files = glob.glob(os.path.join(run_dir, 'nematic_field_iter_*.dat'))
+    out: list[tuple[int, str]] = []
+    for fp in files:
+        stem = os.path.splitext(os.path.basename(fp))[0]
+        it = _infer_trailing_int(stem)
+        if it is None:
+            continue
+        out.append((int(it), fp))
+    out.sort(key=lambda x: x[0])
+    return out
+
+
+def prompt_plot_snapshot_slice_from_dir(
+    in_path: str,
+    *,
+    out_dir: str = 'pics',
+    default_Tc: float = 310.2,
+    show: bool = True,
+) -> None:
+    """Interactive prompt to plot a slice from a selected quench snapshot.
+
+    - Lists available `nematic_field_iter_*.dat` files.
+    - Lets you choose by index/iteration or by time relative to Tc (if log exists).
+    - Calls `plot_nematic_field_slice(...)` and saves a PNG in `out_dir`.
+    """
+    run_dir = _resolve_run_dir_from_path(in_path)
+    snaps = _list_snapshot_files(run_dir)
+    if not snaps:
+        print(f"No nematic_field_iter_*.dat snapshots found in: {run_dir}")
+        return
+
+    os.makedirs(out_dir, exist_ok=True)
+
+    iters = [it for it, _ in snaps]
+    print(f"Found {len(snaps)} snapshots in {run_dir}")
+    print(f"Iteration range: {iters[0]} .. {iters[-1]}")
+    if len(iters) >= 2:
+        diffs = np.diff(np.asarray(iters, dtype=int))
+        diffs = diffs[diffs > 0]
+        if diffs.size:
+            print(f"Estimated snapshot period (iters): ~{int(np.median(diffs))}")
+
+    # Auto-detect grid from first snapshot
+    Nx_use, Ny_use, Nz_use = infer_grid_dims_from_nematic_field_file(snaps[0][1])
+    print(f"Detected grid: Nx={Nx_use}, Ny={Ny_use}, Nz={Nz_use} (from {os.path.basename(snaps[0][1])})")
+
+    # Preview list (first/last few)
+    n_show = min(8, len(snaps))
+    print("Sample snapshots:")
+    for idx in range(n_show):
+        it, fp = snaps[idx]
+        print(f"  [{idx}] iter={it}  file={os.path.basename(fp)}")
+    if len(snaps) > n_show:
+        print("  ...")
+        base = max(0, len(snaps) - n_show)
+        for rel, idx in enumerate(range(base, len(snaps))):
+            it, fp = snaps[idx]
+            print(f"  [{idx}] iter={it}  file={os.path.basename(fp)}")
+
+    # Check if we can select by Tc/time
+    have_log = False
+    log_path: str = ''
+    it_log: np.ndarray = np.empty(0, dtype=float)
+    t_log: np.ndarray = np.empty(0, dtype=float)
+    T_log: np.ndarray = np.empty(0, dtype=float)
+    try:
+        data, log_path = load_quench_log(run_dir)
+        it_log = np.atleast_1d(data['iteration']).astype(float)
+        t_log = np.atleast_1d(data['time_s']).astype(float)
+        T_log = np.atleast_1d(data['T_K']).astype(float)
+        have_log = True
+    except Exception:
+        have_log = False
+
+    if have_log:
+        default_method = 'a'
+        print(f"Detected quench log: {os.path.basename(str(log_path))}")
+    else:
+        default_method = 'n'
+
+    method = input(
+        "Select snapshot by: (n) index, (i) iteration number, (a) after Tc+offset, (q) quit "
+        f"[default: {default_method}]: "
+    ).strip().lower()
+    if not method:
+        method = default_method
+    if method == 'q':
+        return
+
+    chosen_fp = None
+    chosen_iter = None
+    if method == 'i':
+        it_in = input("Iteration to plot (must match an available snapshot iter): ").strip()
+        try:
+            want_it = int(float(it_in))
+        except ValueError:
+            print("Invalid iteration.")
+            return
+        d = {it: fp for it, fp in snaps}
+        if want_it not in d:
+            print("That iteration is not available as a snapshot.")
+            return
+        chosen_iter = want_it
+        chosen_fp = d[want_it]
+    elif method == 'n':
+        idx_in = input("Snapshot index to plot (see list above) [default: 0]: ").strip()
+        try:
+            idx = int(idx_in) if idx_in else 0
+        except ValueError:
+            idx = 0
+        idx = max(0, min(len(snaps) - 1, idx))
+        chosen_iter, chosen_fp = snaps[idx]
+    elif method == 'a':
+        if not have_log:
+            print("No quench log found; cannot select by Tc/time.")
+            return
+        tc_in = input(f"Tc [K] [default: {default_Tc}]: ").strip()
+        try:
+            Tc = float(tc_in) if tc_in else float(default_Tc)
+        except ValueError:
+            Tc = float(default_Tc)
+        off_in = input("Time offset after crossing Tc [s] [default: 0.0]: ").strip()
+        try:
+            after_Tc_s = float(off_in) if off_in else 0.0
+        except ValueError:
+            after_Tc_s = 0.0
+
+        # Defensive casts: keep type checkers happy and make runtime robust.
+        T_use = np.asarray(T_log, dtype=float)
+        t_use = np.asarray(t_log, dtype=float)
+        it_use = np.asarray(it_log, dtype=float)
+
+        t_cross = _crossing_time_from_log(T_use, t_use, float(Tc))
+        t_meas = float(t_cross) + float(after_Tc_s)
+        chosen_fp = _select_snapshot_by_time(run_dir, t_meas, it_use, t_use)
+        stem = os.path.splitext(os.path.basename(chosen_fp))[0]
+        chosen_iter = _infer_trailing_int(stem)
+        print(f"Selected snapshot closest to t = t_cross + offset = {t_meas:.6g} s -> {os.path.basename(chosen_fp)}")
+    else:
+        print("Unknown selection method.")
+        return
+
+    # Plot params
+    ax_in = input("View axis / look along (x/y/z) [default: z]: ").strip().lower()
+    if not ax_in:
+        ax_in = 'z'
+    axis = ax_in[0] if ax_in else 'z'
+    if axis not in ('x', 'y', 'z'):
+        print("Invalid axis; using 'z'.")
+        axis = 'z'
+
+    if axis == 'z':
+        max_idx = Nz_use - 1
+        default_idx = Nz_use // 2
+        axis_label = 'z'
+    elif axis == 'y':
+        max_idx = Ny_use - 1
+        default_idx = Ny_use // 2
+        axis_label = 'y'
+    else:
+        max_idx = Nx_use - 1
+        default_idx = Nx_use // 2
+        axis_label = 'x'
+
+    sl_in = input(f"{axis_label}-slice index (0..{max_idx}) [default: {default_idx}]: ").strip()
+    try:
+        slice_idx = int(sl_in) if sl_in else int(default_idx)
+    except ValueError:
+        slice_idx = int(default_idx)
+    slice_idx = max(0, min(int(max_idx), int(slice_idx)))
+
+    color_field = input("Choose color field (S, nz, n_perp) [default: S]: ").strip() or 'S'
+    interpol = input("Choose interpolation method (nearest, bilinear, bicubic, spline16, spline36, sinc) [default: nearest]: ").strip() or 'nearest'
+    do_zoom = input("Zoom into center? (y/n) [default: n]: ").strip().lower() == 'y'
+    zoom_radius = 15 if do_zoom else None
+    arrows_in = input("Number of arrows per axis (0=disable quiver) [default: 20]: ").strip()
+    try:
+        arrows_per_axis = int(arrows_in) if arrows_in else 20
+    except ValueError:
+        arrows_per_axis = 20
+
+    tag = input("Optional name tag to append [default: none]: ").strip()
+    tag = ("_" + re.sub(r'[^A-Za-z0-9_.-]+', '_', tag)) if tag else ''
+    it_tag = f"{int(chosen_iter)}" if chosen_iter is not None else "unknown"
+    out_path = os.path.join(out_dir, f"snap_slice_{color_field}_iter_{it_tag}_{axis_label}{int(slice_idx)}{tag}.png")
+
+    plot_nematic_field_slice(
+        filename=chosen_fp,
+        Nx=Nx_use,
+        Ny=Ny_use,
+        Nz=Nz_use,
+        z_slice=slice_idx,
+        slice_axis=axis_label,
+        output_path=out_path,
+        arrowColor='black',
+        zoom_radius=zoom_radius,
+        interpol=interpol,
+        color_field=color_field,
+        print_stats=True,
+        arrows_per_axis=arrows_per_axis,
+    )
+    print(f"Saved snapshot slice -> {out_path}")
+    if show:
+        plt.show()
 
 
 def _estimate_ramp_from_log(iteration: np.ndarray, time_s: np.ndarray, T_K: np.ndarray, run_name: str = '', eps_T: float = 1e-6):
@@ -2006,6 +2297,34 @@ if __name__ == '__main__':
     if i == 0:
         # --- Plotting Individual Final States ---
         print("Plotting final state from pre-calculated Nematic Field data...")
+        ax_in = input("View axis / look along (x/y/z) [default: z]: ").strip().lower()
+        if not ax_in:
+            ax_in = 'z'
+        axis = ax_in[0] if ax_in else 'z'
+        if axis not in ('x', 'y', 'z'):
+            print("Invalid axis; using 'z'.")
+            axis = 'z'
+
+        if axis == 'z':
+            max_idx = Nz - 1
+            default_idx = Nz // 2
+            axis_label = 'z'
+        elif axis == 'y':
+            max_idx = Ny - 1
+            default_idx = Ny // 2
+            axis_label = 'y'
+        else:
+            max_idx = Nx - 1
+            default_idx = Nx // 2
+            axis_label = 'x'
+
+        sl_in = input(f"{axis_label}-slice index (0..{max_idx}) [default: {default_idx}]: ").strip()
+        try:
+            slice_idx = int(sl_in) if sl_in else int(default_idx)
+        except ValueError:
+            slice_idx = int(default_idx)
+        slice_idx = max(0, min(int(max_idx), int(slice_idx)))
+
         do_zoom = input("Zoom into center? (y/n): ").lower() == 'y'
         radius = 15 if do_zoom else None # +/- 15 units = 30x30 window
         interpol=input("Choose interpolation method (nearest, bilinear, bicubic, spline16, spline36, sinc) [default: nearest]: ").strip()
@@ -2020,7 +2339,8 @@ if __name__ == '__main__':
         plot_nematic_field_slice(
             filename='nematic_field_final.dat',
             Nx=Nx, Ny=Ny, Nz=Nz,
-            z_slice=z_slice_to_plot,
+            z_slice=slice_idx,
+            slice_axis=axis_label,
             output_path=f'pics/{color_field}_final_state_{custom_name}.png',
             arrowColor='black' if not do_zoom else 'black',
             zoom_radius=radius,
@@ -2181,6 +2501,12 @@ if __name__ == '__main__':
             plot_quench_kz_metrics(in_path, out_dir='pics', frame_stride=stride, max_frames=max_frames, S_threshold=sthr, show=True)
         except Exception as e:
             print(f"Error computing KZ metrics: {e}")
+        try:
+            do_snap = input("Plot a z-slice from one of the available nematic_field_iter_*.dat snapshots? (y/n): ").strip().lower()
+            if do_snap == 'y':
+                prompt_plot_snapshot_slice_from_dir(in_path, out_dir='pics', show=True)
+        except Exception as e:
+            print(f"Error plotting snapshot slice: {e}")
     elif i == 9:
         print("\nAggregating KZ scaling across multiple quench runs...")
         parent = input("Parent directory to scan [default: .]: ").strip() or '.'

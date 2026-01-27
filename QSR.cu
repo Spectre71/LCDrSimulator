@@ -1108,7 +1108,53 @@ int main() {
             if (total_iters < 1) total_iters = 1;
             int logFreq = prompt_with_default("Log/print freq", printFreq);
             if (logFreq < 1) logFreq = 1;
-            int snapshotFreq = prompt_with_default("Snapshot freq to output directory (0=off)", 1000);
+
+            std::cout << "\nSnapshot intent: [0] Off (final only), [1] GIF (regular snapshots), [2] KZ (snapshots around Tc)" << std::endl;
+            int snapshot_mode = prompt_with_default("Select snapshot mode", 2);
+            if (snapshot_mode < 0) snapshot_mode = 0;
+            if (snapshot_mode > 2) snapshot_mode = 2;
+
+            // GIF mode: save every snapshotFreq iterations.
+            int snapshotFreq = 0;
+            if (snapshot_mode == 1) {
+                snapshotFreq = prompt_with_default("GIF snapshot frequency in iterations (0=off)", 10000);
+                if (snapshotFreq < 0) snapshotFreq = 0;
+            }
+
+            // KZ mode: save snapshots only near the transition. This keeps disk usage low while still
+            // letting Python choose an offset after Tc (or do slope-stability sweeps).
+            double Tc_KZ = std::numeric_limits<double>::quiet_NaN();
+            double Tc_window_K = 0.0;
+            int kzSnapshotFreq = 0;
+            int kzItersAfterStep = 0;
+            bool kz_stop_early = false;
+            int kzExtraIters = 0;
+            if (snapshot_mode == 2) {
+                std::cout << "\n[KZ MODE] Snapshots will be saved around Tc so you can measure at a chosen offset." << std::endl;
+                std::cout << "         Use a relatively dense snapshot frequency for flexibility (e.g. 1k–10k iters)." << std::endl;
+                Tc_KZ = prompt_with_default("Tc for KZ snapshots (K)", 310.2);
+                if (protocol == 2) {
+                    Tc_window_K = prompt_with_default("Temperature window half-width around Tc (K)", 0.5);
+                    if (Tc_window_K < 0.0) Tc_window_K = -Tc_window_K;
+                    kzSnapshotFreq = prompt_with_default("KZ snapshot frequency in iterations", 1000);
+                    if (kzSnapshotFreq < 1) kzSnapshotFreq = 1;
+                } else {
+                    std::cout << "\n[NOTE] Step quench has no Tc ramp. We'll snapshot for a fixed number of iterations after the step." << std::endl;
+                    kzItersAfterStep = prompt_with_default("Iterations after the step to record KZ snapshots", 200000);
+                    if (kzItersAfterStep < 1) kzItersAfterStep = 1;
+                    kzSnapshotFreq = prompt_with_default("KZ snapshot frequency in iterations", 1000);
+                    if (kzSnapshotFreq < 1) kzSnapshotFreq = 1;
+                }
+
+                kz_stop_early = prompt_yes_no(
+                    "In KZ mode, stop simulation once recording window is finished? (saves final state at stop)",
+                    true
+                );
+                if (kz_stop_early) {
+                    kzExtraIters = prompt_with_default("Extra iterations after leaving window (for coarsening/offset flexibility)", 0);
+                    if (kzExtraIters < 0) kzExtraIters = 0;
+                }
+            }
 
             double noise_amplitude = 0.0;
             if (mode == 2) {
@@ -1173,6 +1219,8 @@ int main() {
             double physical_time = 0.0;
             double prev_F_for_stop = std::numeric_limits<double>::quiet_NaN();
             double prev_R_for_stop = std::numeric_limits<double>::quiet_NaN();
+            bool kz_entered_window = false;
+            int kz_exit_iter = -1;
             for (int iter = 0; iter < total_iters; ++iter) {
                 const double T_current = compute_T_current(iter);
                 DimensionalParams params_q = {a, b, c, T_current, T_star, L1, L2, L3, W};
@@ -1188,7 +1236,34 @@ int main() {
                 physical_time += dt;
 
                 const bool do_log = (iter % logFreq == 0) || (iter == total_iters - 1);
-                const bool do_snap = (snapshotFreq > 0) && ((iter % snapshotFreq == 0) || (iter == total_iters - 1));
+
+                bool in_kz_window = false;
+                bool do_snap = false;
+                if (snapshot_mode == 1) {
+                    // GIF: regular snapshots.
+                    do_snap = (snapshotFreq > 0) && ((iter % snapshotFreq == 0) || (iter == total_iters - 1));
+                } else if (snapshot_mode == 2) {
+                    // KZ: snapshots only around Tc (ramp) or after step (step quench).
+                    if (protocol == 2) {
+                        if (std::isfinite(Tc_KZ) && std::isfinite(Tc_window_K) && Tc_window_K > 0.0) {
+                            in_kz_window = (std::abs(T_current - Tc_KZ) <= Tc_window_K);
+                        } else {
+                            // If window is degenerate, fall back to saving around the crossing point only.
+                            in_kz_window = std::isfinite(Tc_KZ) ? (std::abs(T_current - Tc_KZ) <= 1e-12) : false;
+                        }
+                    } else {
+                        // Step quench: snapshot early-time ordering after the step.
+                        const int step_iter = pre_equil_iters;
+                        in_kz_window = (iter >= step_iter) && (iter <= step_iter + kzItersAfterStep);
+                    }
+
+                    // Optional: keep saving snapshots for a short period after leaving the window.
+                    bool in_post = false;
+                    if (kz_stop_early && kzExtraIters > 0 && kz_exit_iter >= 0) {
+                        in_post = (iter > kz_exit_iter) && (iter <= kz_exit_iter + kzExtraIters);
+                    }
+                    do_snap = (kzSnapshotFreq > 0) && ((iter % kzSnapshotFreq) == 0) && (in_kz_window || in_post);
+                }
 
                 if (do_log || do_snap) {
                     computeRadialityKernel<<<numBlocks, threadsPerBlock>>>(d_Q, d_radiality_vals, d_count_vals, Nx, Ny, Nz);
@@ -1251,6 +1326,32 @@ int main() {
 
                     if (do_snap) {
                         saveNematicFieldToFile(h_nf, Nx, Ny, Nz, (out_dir / ("nematic_field_iter_" + std::to_string(iter) + ".dat")).string());
+                    }
+                }
+
+                // KZ speed-up: if we only care about the transition window, end the run once the
+                // recording window has finished (plus optional extra iterations).
+                if (snapshot_mode == 2 && kz_stop_early) {
+                    if (protocol == 2) {
+                        if (in_kz_window) {
+                            kz_entered_window = true;
+                        }
+                        // Stop after we've entered the window and then cooled below Tc - ΔT.
+                        const bool below_window = (std::isfinite(Tc_KZ) && std::isfinite(Tc_window_K)) ? (T_current < (Tc_KZ - Tc_window_K)) : false;
+                        if (kz_entered_window && !in_kz_window && below_window) {
+                            if (kz_exit_iter < 0) kz_exit_iter = iter;
+                            if (iter >= kz_exit_iter + kzExtraIters) {
+                                std::cout << "\n=== KZ mode: stopping after leaving Tc window ===\n";
+                                break;
+                            }
+                        }
+                    } else {
+                        const int step_iter = pre_equil_iters;
+                        const int stop_iter = step_iter + kzItersAfterStep + kzExtraIters;
+                        if (iter >= stop_iter) {
+                            std::cout << "\n=== KZ mode: stopping after post-step recording window ===\n";
+                            break;
+                        }
                     }
                 }
             }
