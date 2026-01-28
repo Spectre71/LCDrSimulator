@@ -900,6 +900,8 @@ int main() {
         double S0 = prompt_with_default("Enter initial S0", S_eq > 0 ? S_eq : 0.5);
         
         std::cout << "\n--- Elastic and Dynamic Parameters ---" << std::endl;
+        // color yellow text: \033[1;33m
+        std::cout << "Generally: \033[1;33m Twist (K2) < Splay (K1) < Bend (K3)\033[0m" << std::endl;
         double kappa = prompt_with_default("Enter kappa (J/m)", kappa_default);
         std::cout << "Use Frank-to-LdG mapping with K1=K3 ≠ K2? (y/n) [n]: ";
         std::string use_frank_map_in; std::getline(std::cin, use_frank_map_in);

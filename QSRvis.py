@@ -2478,35 +2478,44 @@ if __name__ == '__main__':
         except Exception as e:
             print(f"Error creating quench animation: {e}")
     elif i == 8:
-        print("\nComputing KZ metrics (2D proxies) from quench snapshots...")
-        in_path = input("Path to quench directory or quench_log.dat [default: output_quench]: ").strip()
-        if not in_path:
-            in_path = 'output_quench'
-        stride_in = input("Use every N-th snapshot (frame stride) [default: 10]: ").strip()
-        try:
-            stride = int(stride_in) if stride_in else 10
-        except ValueError:
-            stride = 10
-        max_in = input("Max frames to analyze (blank=no limit) [default: 50]: ").strip()
-        try:
-            max_frames = int(max_in) if max_in else 50
-        except ValueError:
-            max_frames = 50
-        sth_in = input("S threshold for droplet mask [default: 0.1]: ").strip()
-        try:
-            sthr = float(sth_in) if sth_in else 0.1
-        except ValueError:
-            sthr = 0.1
-        try:
-            plot_quench_kz_metrics(in_path, out_dir='pics', frame_stride=stride, max_frames=max_frames, S_threshold=sthr, show=True)
-        except Exception as e:
-            print(f"Error computing KZ metrics: {e}")
-        try:
-            do_snap = input("Plot a z-slice from one of the available nematic_field_iter_*.dat snapshots? (y/n): ").strip().lower()
-            if do_snap == 'y':
-                prompt_plot_snapshot_slice_from_dir(in_path, out_dir='pics', show=True)
-        except Exception as e:
-            print(f"Error plotting snapshot slice: {e}")
+        kzin = input("\nPlot a single slice from quench snapshots, or compute KZ metrics? (snap/kz_metrics) [default: kz_metrics]: ").strip().lower()
+        while kzin not in ('snap', 'kz_metrics', ''):
+            print("Invalid input. Please enter 'snap' or 'kz_metrics'.")
+            kzin = input("Please enter 'snap' or 'kz_metrics': ").strip().lower()
+        if kzin in ('kz_metrics', ''):
+            print("\nComputing KZ metrics (2D proxies) from quench snapshots...")
+            in_path = input("Path to quench directory or quench_log.dat [default: output_quench]: ").strip()
+            if not in_path:
+                in_path = 'output_quench'
+            stride_in = input("Use every N-th snapshot (frame stride) [default: 10]: ").strip()
+            try:
+                stride = int(stride_in) if stride_in else 10
+            except ValueError:
+                stride = 10
+            max_in = input("Max frames to analyze (blank=no limit) [default: 50]: ").strip()
+            try:
+                max_frames = int(max_in) if max_in else 50
+            except ValueError:
+                max_frames = 50
+            sth_in = input("S threshold for droplet mask [default: 0.1]: ").strip()
+            try:
+                sthr = float(sth_in) if sth_in else 0.1
+            except ValueError:
+                sthr = 0.1
+            try:
+                plot_quench_kz_metrics(in_path, out_dir='pics', frame_stride=stride, max_frames=max_frames, S_threshold=sthr, show=True)
+            except Exception as e:
+                print(f"Error computing KZ metrics: {e}")
+        elif kzin == 'snap':
+            in_path = input("Path to quench directory or quench_log.dat [default: output_quench]: ").strip()
+            if not in_path:
+                in_path = 'output_quench'
+            try:
+                do_snap = input("Plot a z-slice from one of the available nematic_field_iter_*.dat snapshots? (y/n): ").strip().lower()
+                if do_snap == 'y':
+                    prompt_plot_snapshot_slice_from_dir(in_path, out_dir='pics', show=True)
+            except Exception as e:
+                print(f"Error plotting snapshot slice: {e}")
     elif i == 9:
         print("\nAggregating KZ scaling across multiple quench runs...")
         parent = input("Parent directory to scan [default: .]: ").strip() or '.'

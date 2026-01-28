@@ -1,7 +1,7 @@
 pics
 venv
 x64
-output*
+out*
 frames*
 *.dat
 *.sln
