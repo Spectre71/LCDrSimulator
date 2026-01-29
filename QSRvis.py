@@ -7,6 +7,42 @@ import re
 import io
 from typing import Any
 
+
+def prompt_pick_folder(
+    *,
+    prompt: str,
+    default: str,
+    pattern: str | None = None,
+    must_exist: bool = True,
+) -> str:
+    """Lightweight "folder picker" for CLI.
+
+    - If pattern is given, lists matching directories and lets user choose by index.
+    - User may also paste a path.
+    """
+    candidates: list[str] = []
+    if pattern:
+        candidates = [p for p in glob.glob(pattern) if os.path.isdir(p)]
+        candidates.sort()
+        if candidates:
+            print("Available folders:")
+            for idx, p in enumerate(candidates):
+                print(f"  [{idx}] {p}")
+
+    raw = input(f"{prompt} [default: {default}]: ").strip()
+    if not raw:
+        chosen = default
+    elif raw.isdigit() and candidates:
+        idx = int(raw)
+        idx = max(0, min(len(candidates) - 1, idx))
+        chosen = candidates[idx]
+    else:
+        chosen = raw
+
+    if must_exist and chosen and not os.path.exists(chosen):
+        raise FileNotFoundError(f"Path not found: {chosen}")
+    return chosen
+
 # Optional deps for 3D analysis (installed in venv when needed).
 # Keep them as Any so type-checkers don't get confused by conditional imports.
 ndi: Any = None
@@ -542,10 +578,26 @@ def plot_nematic_field_slice(
         
     plt.close(fig)
 
-def plot_energy_VS_iter():
-    # Load the data, skipping the header
+def _resolve_data_file(path_or_dir: str, filename: str) -> str:
+    """Resolve a data file path from either a directory or a direct file path."""
+    if not path_or_dir:
+        path_or_dir = '.'
+    if os.path.isdir(path_or_dir):
+        return os.path.join(path_or_dir, filename)
+    return path_or_dir
+
+
+def plot_energy_VS_iter(path: str = '.', out_dir: str = 'pics', show: bool = True):
+    """Plot free energy vs iteration from free_energy_vs_iteration.dat.
+
+    `path` may be a directory (containing the dat file) or a direct file path.
+    """
+    data_path = _resolve_data_file(path, 'free_energy_vs_iteration.dat')
+    if not os.path.exists(data_path):
+        raise FileNotFoundError(f"Missing file: {data_path}")
+
     # Format: iteration,free_energy,radiality,time
-    data = np.genfromtxt('free_energy_vs_iteration.dat', delimiter=',', names=True)
+    data = np.genfromtxt(data_path, delimiter=',', names=True)
 
     # Create subplots for energy, radiality, and time
     fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(10, 8))
@@ -574,10 +626,15 @@ def plot_energy_VS_iter():
     ax2.grid(True, alpha=0.3)
     
     fig.tight_layout()
-    if not os.path.exists('pics'):
-        os.makedirs('pics')
-    plt.savefig('pics/free_energy_vs_iteration.png', dpi=150)
-    plt.show()
+    os.makedirs(out_dir, exist_ok=True)
+    tag = os.path.basename(os.path.normpath(os.path.dirname(data_path) or '.'))
+    out_path = os.path.join(out_dir, f'free_energy_vs_iteration_{tag}.png')
+    plt.savefig(out_path, dpi=150)
+    print(f"Saved plot -> {out_path}")
+    if show:
+        plt.show()
+    else:
+        plt.close(fig)
 
 def energy_components():
     # Format: iteration,bulk,elastic,total,radiality,time
@@ -734,9 +791,12 @@ def create_nematic_field_animation(
 
     print(f"\nAnimation saved to {output_gif}")
 
-def plotS_F():
+def plotS_F(path: str = 'output_temp_sweep', out_dir: str = 'pics', show: bool = True):
+    """Plot average S(T) and final free energy F(T) from a temperature sweep summary.
 
-    summary_path = 'output_temp_sweep/summary.dat'
+    `path` may be a directory containing summary.dat or a direct summary.dat path.
+    """
+    summary_path = _resolve_data_file(path, 'summary.dat')
     if not os.path.exists(summary_path):
         print(f"Missing file: {summary_path}")
         return
@@ -781,10 +841,15 @@ def plotS_F():
     plt.grid(True)
     plt.legend()
     plt.tight_layout()
-    if not os.path.exists('pics'):
-        os.makedirs('pics')
-    plt.savefig('pics/average_S_vs_T.png')
-    plt.show()
+    os.makedirs(out_dir, exist_ok=True)
+    tag = os.path.basename(os.path.normpath(os.path.dirname(summary_path) or '.'))
+    out1 = os.path.join(out_dir, f'average_S_vs_T_{tag}.png')
+    plt.savefig(out1)
+    print(f"Saved plot -> {out1}")
+    if show:
+        plt.show()
+    else:
+        plt.close()
 
     # Plot Free Energy vs Temperature
     plt.figure(figsize=(8, 5))
@@ -795,8 +860,82 @@ def plotS_F():
     plt.grid(True)
     plt.legend()
     plt.tight_layout()
-    plt.savefig('pics/free_energy_vs_T.png')
-    plt.show()
+    out2 = os.path.join(out_dir, f'free_energy_vs_T_{tag}.png')
+    plt.savefig(out2)
+    print(f"Saved plot -> {out2}")
+    if show:
+        plt.show()
+    else:
+        plt.close()
+
+
+def plot_quench_energy_vs_iteration(path: str = 'output_quench', out_dir: str = 'pics', show: bool = True):
+    """Plot quench energy components vs iteration (separate, cleaner figure)."""
+    data, log_path = load_quench_log(path)
+    it = np.atleast_1d(data['iteration']).astype(float)
+    bulk = np.atleast_1d(data['bulk']).astype(float)
+    elastic = np.atleast_1d(data['elastic']).astype(float)
+    total = np.atleast_1d(data['total']).astype(float)
+
+    m = np.isfinite(it) & np.isfinite(bulk) & np.isfinite(elastic) & np.isfinite(total)
+    if not np.any(m):
+        raise ValueError(f"Quench log contains no finite energy rows: {log_path}")
+    it, bulk, elastic, total = it[m], bulk[m], elastic[m], total[m]
+
+    os.makedirs(out_dir, exist_ok=True)
+    tag = os.path.basename(os.path.normpath(os.path.dirname(log_path) or '.'))
+
+    fig, ax = plt.subplots(1, 1, figsize=(10, 5))
+    ax.plot(it, total, '-', lw=2, label='total')
+    ax.plot(it, bulk, '--', lw=1.5, label='bulk')
+    ax.plot(it, elastic, '--', lw=1.5, label='elastic')
+    ax.set_xlabel('iteration')
+    ax.set_ylabel('Energy')
+    ax.set_title(f'Quench energies vs iteration ({tag})')
+    ax.grid(True, alpha=0.3)
+    ax.legend()
+    fig.tight_layout()
+
+    out_path = os.path.join(out_dir, f'quench_energies_vs_iteration_{tag}.png')
+    fig.savefig(out_path, dpi=200)
+    print(f"Saved quench energy plot -> {out_path}")
+    if show:
+        plt.show()
+    else:
+        plt.close(fig)
+    return out_path
+
+
+def plot_quench_order_vs_iteration(path: str = 'output_quench', out_dir: str = 'pics', show: bool = True):
+    """Plot quench average order parameter <S> vs iteration (separate, cleaner figure)."""
+    data, log_path = load_quench_log(path)
+    it = np.atleast_1d(data['iteration']).astype(float)
+    avgS = np.atleast_1d(data['avg_S']).astype(float)
+
+    m = np.isfinite(it) & np.isfinite(avgS)
+    if not np.any(m):
+        raise ValueError(f"Quench log contains no finite avg_S rows: {log_path}")
+    it, avgS = it[m], avgS[m]
+
+    os.makedirs(out_dir, exist_ok=True)
+    tag = os.path.basename(os.path.normpath(os.path.dirname(log_path) or '.'))
+
+    fig, ax = plt.subplots(1, 1, figsize=(10, 5))
+    ax.plot(it, avgS, '-', lw=2)
+    ax.set_xlabel('iteration')
+    ax.set_ylabel('<S> (droplet)')
+    ax.set_title(f'Average order parameter vs iteration ({tag})')
+    ax.grid(True, alpha=0.3)
+    fig.tight_layout()
+
+    out_path = os.path.join(out_dir, f'quench_avgS_vs_iteration_{tag}.png')
+    fig.savefig(out_path, dpi=200)
+    print(f"Saved quench <S> plot -> {out_path}")
+    if show:
+        plt.show()
+    else:
+        plt.close(fig)
+    return out_path
 
 
 def _resolve_quench_log_path(path: str) -> str:
@@ -3091,6 +3230,7 @@ def animate_tempSweep(Vname=None, choice=None):
         print(f"Animation saved to {gif_path}")
 
 # Use imageio or ffmpeg to make an animation from the frames
+# ----------------------------------------------------------------------- MAIN SCRIPT ---------------------------------------------------------------------------|
 if __name__ == '__main__':
     # --- Configuration ---
     # These should match the parameters used in your C++ simulation
@@ -3123,7 +3263,7 @@ if __name__ == '__main__':
         print("Invalid input. Please enter a number between 0 and 12.")
         i = input("Please enter a number between 0 and 12: ").strip()
     i = int(i)
-    # ---------------------------------------------------------------------- PART 1 ----------------------------------------------------------------------------|
+# ---------------------------------------------------------------------- PART 1 ----------------------------------------------------------------------------|
     if i == 0:
         # --- Plotting Individual Final States ---
         print("Plotting final state from pre-calculated Nematic Field data...")
@@ -3198,17 +3338,35 @@ if __name__ == '__main__':
     elif i == 2:
         # --- Plotting Free Energy vs Iteration ---
         print("\nPlotting Free Energy vs Iteration...")
-        plot_energy_VS_iter()
-    # ---------------------------------------------------------------------- PART 2 -----------------------------------------------------------------------------|
+        try:
+            in_path = prompt_pick_folder(
+                prompt="Folder (or file) containing free_energy_vs_iteration.dat",
+                default='.',
+                pattern='*',
+                must_exist=True,
+            )
+            plot_energy_VS_iter(in_path, out_dir='pics', show=True)
+        except Exception as e:
+            print(f"Error plotting free energy vs iteration: {e}")
+# ---------------------------------------------------------------------- PART 2 -----------------------------------------------------------------------------|
     elif i == 3:
         # --- Plotting Energy Components vs Iteration ---
         print("\nPlotting Energy Components vs Iteration...")
         energy_components()
-    # ---------------------------------------------------------------------- PART 3 -----------------------------------------------------------------------------|
+# ---------------------------------------------------------------------- PART 3 -----------------------------------------------------------------------------|
     elif i == 4:
         # --- Plotting S vs Temperature and Free Energy ---
         print("\nPlotting Average S and Free Energy vs Temperature...")
-        plotS_F()
+        try:
+            in_path = prompt_pick_folder(
+                prompt="Temperature sweep folder (or summary.dat path)",
+                default='output_temp_sweep',
+                pattern='output_temp_sweep*',
+                must_exist=True,
+            )
+            plotS_F(in_path, out_dir='pics', show=True)
+        except Exception as e:
+            print(f"Error plotting sweep summary: {e}")
     elif i == 5:
         # --- Animate Temperature Sweep ---
         # Ask until we get a valid choice
@@ -3225,15 +3383,31 @@ if __name__ == '__main__':
         elif ch == 'g':
             print("\nAnimating Temperature Sweep...")
         animate_tempSweep(Vname=V_name, choice=ch)
-    # ---------------------------------------------------------------------- PART 4 --------------------------------------------------------------------------------|
+# ---------------------------------------------------------------------- PART 4 --------------------------------------------------------------------------------|
     elif i == 6:
         # --- Plot Quench Log ---
         print("\nPlotting quench log...")
-        in_path = input("Path to quench log file or directory [default: output_quench]: ").strip()
-        if not in_path:
-            in_path = 'output_quench'
         try:
-            plot_quench_log(in_path, out_dir='pics', show=True)
+            mode = input(
+                "Choose quench plot: (s) summary vs time, (2) energies vs iteration, (4) <S> vs iteration, (a) all "
+                "[default: s]: "
+            ).strip().lower()
+            if not mode:
+                mode = 's'
+
+            in_path = prompt_pick_folder(
+                prompt="Quench run folder (or quench_log.* path)",
+                default='output_quench',
+                pattern='output_quench*',
+                must_exist=True,
+            )
+
+            if mode in ('s', 'a'):
+                plot_quench_log(in_path, out_dir='pics', show=True)
+            if mode in ('2', 'a'):
+                plot_quench_energy_vs_iteration(in_path, out_dir='pics', show=True)
+            if mode in ('4', 'a'):
+                plot_quench_order_vs_iteration(in_path, out_dir='pics', show=True)
         except Exception as e:
             print(f"Error plotting quench log: {e}")
     elif i == 7:
@@ -3346,6 +3520,7 @@ if __name__ == '__main__':
                     prompt_plot_snapshot_slice_from_dir(in_path, out_dir='pics', show=True)
             except Exception as e:
                 print(f"Error plotting snapshot slice: {e}")
+# ----------------------------------------------------------------------- PART 5 ------------------------------------------------------------------------------|
     elif i == 9:
         print("\nAggregating KZ scaling across multiple quench runs...")
         parent = input("Parent directory to scan [default: .]: ").strip() or '.'
