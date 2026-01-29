@@ -98,7 +98,10 @@ struct DimensionalParams {
 // Kernel declarations
 __global__ void computeLaplacianKernel(const QTensor* Q, QTensor* laplacianQ, int Nx, int Ny, int Nz, double dx, double dy, double dz);
 __global__ void computeChemicalPotentialKernel(const QTensor* Q, QTensor* mu, const QTensor* laplacianQ, int Nx, int Ny, int Nz, double dx, double dy, double dz, DimensionalParams params, double kappa, int modechoice, double* Dcol_x, double* Dcol_y, double* Dcol_z);
-__global__ void applyWeakAnchoringPenaltyKernel(QTensor* mu, const QTensor* Q, int Nx, int Ny, int Nz, const bool* is_shell, double S_shell, double W);
+// Weak anchoring W is interpreted as a surface energy density (J/m^2).
+// Internally we convert it to a volumetric penalty via W_eff = W / shell_thickness.
+__global__ void applyWeakAnchoringPenaltyKernel(QTensor* mu, const QTensor* Q, int Nx, int Ny, int Nz,
+                                               const bool* is_shell, double S_shell, double W, double shell_thickness);
 __global__ void updateQTensorKernel(QTensor* Q, const QTensor* mu, int Nx, int Ny, int Nz, double dt, const bool* is_shell, double gamma, double W);
 __global__ void applyBoundaryConditionsKernel(QTensor* Q, int Nx, int Ny, int Nz, const bool* is_shell, double S0, double W);
 __global__ void computeEnergyKernel(const QTensor* Q, double* bulk_energy, double* elastic_energy, int Nx, int Ny, int Nz, double dx, double dy, double dz, DimensionalParams params, double kappa, int modechoice);

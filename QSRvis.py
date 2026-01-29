@@ -7,6 +7,21 @@ import re
 import io
 from typing import Any
 
+# Optional deps for 3D analysis (installed in venv when needed).
+# Keep them as Any so type-checkers don't get confused by conditional imports.
+ndi: Any = None
+skeletonize_3d: Any = None
+try:  # pragma: no cover
+    import scipy.ndimage as ndi  # type: ignore
+except Exception:  # pragma: no cover
+    pass
+try:  # pragma: no cover
+    # Newer scikit-image versions expose a 3D-capable `skeletonize` (M,N[,P]).
+    from skimage.morphology import skeletonize as _skeletonize  # type: ignore
+    skeletonize_3d = _skeletonize
+except Exception:  # pragma: no cover
+    pass
+
 def load_qtensor_data(path, comments="#"):
     """Loads Qtensor output with columns: i j k Qxx Qxy Qxz Qyx Qyy Qyz Qzx Qzy Qzz."""
     return load_nematic_field_data(path, comments=comments)
@@ -837,11 +852,31 @@ def plot_quench_log(path: str = 'output_quench', out_dir: str = 'pics', show: bo
     radial = np.atleast_1d(data['radiality']).astype(float)
     avgS = np.atleast_1d(data['avg_S']).astype(float)
 
+    # Drop invalid rows early to avoid matplotlib inf/nan axis limits
+    m = (
+        np.isfinite(it)
+        & np.isfinite(t)
+        & np.isfinite(T)
+        & np.isfinite(bulk)
+        & np.isfinite(elastic)
+        & np.isfinite(total)
+        & np.isfinite(radial)
+        & np.isfinite(avgS)
+    )
+    if not np.any(m):
+        raise ValueError(f"Quench log contains no finite rows: {log_path}")
+    it, t, T = it[m], t[m], T[m]
+    bulk, elastic, total = bulk[m], elastic[m], total[m]
+    radial, avgS = radial[m], avgS[m]
+
     # Relative energy change between consecutive log points
     rel_dF = np.full_like(total, np.nan)
     if total.size >= 2:
         denom = np.where(np.abs(total[:-1]) > 0.0, total[:-1], np.nan)
         rel_dF[1:] = np.abs((total[1:] - total[:-1]) / denom)
+        # Ensure finite, strictly-positive values for log-scale plotting
+        rel_dF[~np.isfinite(rel_dF)] = np.nan
+        rel_dF[rel_dF <= 0.0] = np.nan
 
     os.makedirs(out_dir, exist_ok=True)
 
@@ -875,9 +910,19 @@ def plot_quench_log(path: str = 'output_quench', out_dir: str = 'pics', show: bo
     axR.legend(loc='lower right')
 
     axR2 = axR.twinx()
-    axR2.plot(t, rel_dF, ':', lw=1.8, color='tab:red', label='|ΔF/F|')
-    axR2.set_ylabel('|ΔF/F|')
-    axR2.set_yscale('log')
+    if np.any(np.isfinite(rel_dF)):
+        axR2.plot(t, rel_dF, ':', lw=1.8, color='tab:red', label='|ΔF/F|')
+        axR2.set_ylabel('|ΔF/F|')
+        axR2.set_yscale('log')
+        # Constrain y-limits to avoid ticker overflow for extreme/degenerate data
+        y_min = float(np.nanmin(rel_dF))
+        y_max = float(np.nanmax(rel_dF))
+        if np.isfinite(y_min) and np.isfinite(y_max) and y_min > 0.0 and y_max > 0.0:
+            axR2.set_ylim(y_min * 0.8, y_max * 1.2)
+    else:
+        # No valid positive data to show on a log scale
+        axR2.set_ylabel('|ΔF/F| (n/a)')
+        axR2.set_yticks([])
     axR2.grid(False)
 
     # Average S
@@ -1079,6 +1124,457 @@ def correlation_length_2d_from_slice(
             break
 
     return xi, r, C_r
+
+
+def _qtensor_from_Sn(
+    S: np.ndarray,
+    nx: np.ndarray,
+    ny: np.ndarray,
+    nz: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Construct a symmetric traceless Q-tensor from (S, n).
+
+    Uses uniaxial form: Q_ij = S (n_i n_j - δ_ij/3).
+    Invariant under n -> -n.
+    """
+    S = np.asarray(S)
+    nx = np.asarray(nx)
+    ny = np.asarray(ny)
+    nz = np.asarray(nz)
+    one_third = 1.0 / 3.0
+    Qxx = S * (nx * nx - one_third)
+    Qyy = S * (ny * ny - one_third)
+    Qzz = S * (nz * nz - one_third)
+    Qxy = S * (nx * ny)
+    Qxz = S * (nx * nz)
+    Qyz = S * (ny * nz)
+    return Qxx, Qxy, Qxz, Qyy, Qyz, Qzz
+
+
+def _radial_average_nd(C: np.ndarray, *, max_r: int | None = None):
+    """Radial average of an nD correlation volume around its center."""
+    C = np.asarray(C, dtype=float)
+    if C.ndim < 2:
+        return np.array([]), np.array([])
+
+    center = tuple(s // 2 for s in C.shape)
+    grids = np.ogrid[tuple(slice(0, s) for s in C.shape)]
+    rr2: np.ndarray = np.zeros(C.shape, dtype=float)
+    for ax, g in enumerate(grids):
+        d = (g - center[ax]).astype(float)
+        rr2 = rr2 + d * d
+    rr = np.sqrt(rr2)
+    r_int = rr.astype(np.int32)
+
+    if max_r is None:
+        max_r = int(min(C.shape) // 2)
+    max_r = int(max(2, min(int(max_r), int(r_int.max()))))
+
+    flat_r = r_int.ravel()
+    flat_C = C.ravel()
+    valid = (flat_r >= 0) & (flat_r <= max_r) & np.isfinite(flat_C)
+    flat_r = flat_r[valid]
+    flat_C = flat_C[valid]
+
+    sums = np.bincount(flat_r, weights=flat_C, minlength=max_r + 1)
+    counts = np.bincount(flat_r, minlength=max_r + 1)
+    with np.errstate(divide='ignore', invalid='ignore'):
+        C_r = np.where(counts > 0, sums / counts, np.nan)
+    r = np.arange(max_r + 1, dtype=float)
+    return r, C_r
+
+
+def correlation_length_3d_from_qtensor(
+    Qxx: np.ndarray,
+    Qxy: np.ndarray,
+    Qxz: np.ndarray,
+    Qyy: np.ndarray,
+    Qyz: np.ndarray,
+    Qzz: np.ndarray,
+    *,
+    mask: np.ndarray | None = None,
+    max_r: int | None = None,
+    target: float = np.e ** (-1.0),
+):
+    """Estimate a 3D correlation length xi from a Q-tensor field.
+
+    Computes a masked autocorrelation of the Frobenius inner product:
+        C(r) ~ < Q_ij(x) Q_ij(x+r) >_mask / < Q_ij(x)^2 >
+    using FFTs. Returns xi in lattice units as first r where C(r) < target.
+    """
+    Qxx = np.asarray(Qxx, dtype=float)
+    Qxy = np.asarray(Qxy, dtype=float)
+    Qxz = np.asarray(Qxz, dtype=float)
+    Qyy = np.asarray(Qyy, dtype=float)
+    Qyz = np.asarray(Qyz, dtype=float)
+    Qzz = np.asarray(Qzz, dtype=float)
+    if not (Qxx.shape == Qxy.shape == Qxz.shape == Qyy.shape == Qyz.shape == Qzz.shape):
+        raise ValueError("All Q components must have the same shape")
+
+    if mask is None:
+        mask = np.isfinite(Qxx) & np.isfinite(Qyy) & np.isfinite(Qzz)
+    mask = np.asarray(mask, dtype=bool)
+    if mask.shape != Qxx.shape:
+        raise ValueError("mask must have the same shape as Q components")
+    if np.count_nonzero(mask) < 64:
+        return float('nan'), np.array([]), np.array([])
+
+    mask_f = mask.astype(float)
+
+    # mask-normalized correlation via FFT
+    Fm = np.fft.fftn(mask_f)
+    norm = np.fft.ifftn(Fm * np.conj(Fm)).real
+
+    corr_sum = 0.0
+    for comp in (Qxx, Qyy, Qzz, Qxy, Qxz, Qyz):
+        a = np.where(mask, comp, 0.0) * mask_f
+        Fa = np.fft.fftn(a)
+        corr_sum = corr_sum + np.fft.ifftn(Fa * np.conj(Fa)).real
+
+    with np.errstate(divide='ignore', invalid='ignore'):
+        C = np.where(norm > 0, corr_sum / norm, 0.0)
+
+    C = np.fft.fftshift(C)
+    center = tuple(s // 2 for s in C.shape)
+    C0 = float(C[center])
+    if not np.isfinite(C0) or C0 == 0.0:
+        return float('nan'), np.array([]), np.array([])
+    C = C / C0
+
+    r, C_r = _radial_average_nd(C, max_r=max_r)
+    if r.size == 0:
+        return float('nan'), r, C_r
+
+    xi = float('nan')
+    targ = float(target)
+    for ri in range(1, int(r.size)):
+        if np.isfinite(C_r[ri]) and (C_r[ri] <= targ):
+            c0 = float(C_r[ri - 1])
+            c1 = float(C_r[ri])
+            if np.isfinite(c0) and np.isfinite(c1) and (c1 != c0):
+                frac = (targ - c0) / (c1 - c0)
+                xi = float((ri - 1) + frac)
+            else:
+                xi = float(ri)
+            break
+
+    return xi, r, C_r
+
+
+def load_nematic_field_volume(path: str, Nx: int, Ny: int, Nz: int):
+    """Load full 3D arrays (S,nx,ny,nz) from nematic_field_*.dat."""
+    data = load_nematic_field_data(path, comments="#")
+    if data.ndim != 2 or data.shape[1] < 7:
+        raise ValueError(f"Unexpected nematic field format in {path}")
+
+    S = np.zeros((Nx, Ny, Nz), dtype=float)
+    nx = np.zeros((Nx, Ny, Nz), dtype=float)
+    ny = np.zeros((Nx, Ny, Nz), dtype=float)
+    nz = np.zeros((Nx, Ny, Nz), dtype=float)
+
+    # Vectorized fill (much faster than Python loop for ~1e6 rows)
+    ii = data[:, 0].astype(np.int32, copy=False)
+    jj = data[:, 1].astype(np.int32, copy=False)
+    kk = data[:, 2].astype(np.int32, copy=False)
+    m = (ii >= 0) & (ii < int(Nx)) & (jj >= 0) & (jj < int(Ny)) & (kk >= 0) & (kk < int(Nz))
+    if np.any(m):
+        i = ii[m]
+        j = jj[m]
+        k = kk[m]
+        S[i, j, k] = data[m, 3]
+        nx[i, j, k] = data[m, 4]
+        ny[i, j, k] = data[m, 5]
+        nz[i, j, k] = data[m, 6]
+    return S, nx, ny, nz
+
+
+def load_qtensor_volume(path: str, Nx: int, Ny: int, Nz: int):
+    """Load full 3D arrays of Q components from Qtensor_output_*.dat."""
+    data = load_qtensor_data(path, comments="#")
+    if data.ndim != 2 or data.shape[1] < 12:
+        raise ValueError(f"Unexpected Qtensor format in {path}")
+
+    Qxx = np.zeros((Nx, Ny, Nz), dtype=float)
+    Qxy = np.zeros((Nx, Ny, Nz), dtype=float)
+    Qxz = np.zeros((Nx, Ny, Nz), dtype=float)
+    Qyy = np.zeros((Nx, Ny, Nz), dtype=float)
+    Qyz = np.zeros((Nx, Ny, Nz), dtype=float)
+    Qzz = np.zeros((Nx, Ny, Nz), dtype=float)
+
+    # Vectorized fill
+    ii = data[:, 0].astype(np.int32, copy=False)
+    jj = data[:, 1].astype(np.int32, copy=False)
+    kk = data[:, 2].astype(np.int32, copy=False)
+    m = (ii >= 0) & (ii < int(Nx)) & (jj >= 0) & (jj < int(Ny)) & (kk >= 0) & (kk < int(Nz))
+    if np.any(m):
+        i = ii[m]
+        j = jj[m]
+        k = kk[m]
+        Qxx[i, j, k] = data[m, 3]
+        Qxy[i, j, k] = 0.5 * (data[m, 4] + data[m, 6])
+        Qxz[i, j, k] = 0.5 * (data[m, 5] + data[m, 9])
+        Qyy[i, j, k] = data[m, 7]
+        Qyz[i, j, k] = 0.5 * (data[m, 8] + data[m, 10])
+        Qzz[i, j, k] = data[m, 11]
+
+    return Qxx, Qxy, Qxz, Qyy, Qyz, Qzz
+
+
+def _infer_num_columns_from_text_file(path: str) -> int:
+    """Infer number of whitespace-delimited columns from the first data row."""
+    with open(path, 'r', encoding='utf-8', errors='replace') as f:
+        for line in f:
+            if not line:
+                continue
+            s = line.strip()
+            if not s or s.startswith('#'):
+                continue
+            return len(s.split())
+    return 0
+
+
+def correlation_length_3d_from_field_file(
+    path: str,
+    *,
+    S_threshold: float = 0.1,
+    max_r: int | None = None,
+    target: float = np.e ** (-1.0),
+):
+    """Compute 3D xi from either nematic_field_*.dat or Qtensor_output_*.dat."""
+    Nx, Ny, Nz = infer_grid_dims_from_nematic_field_file(path)
+
+    ncol = int(_infer_num_columns_from_text_file(path))
+    if ncol <= 0:
+        raise ValueError(f"Could not infer columns for {path}")
+
+    if ncol >= 12:
+        Qxx, Qxy, Qxz, Qyy, Qyz, Qzz = load_qtensor_volume(path, Nx, Ny, Nz)
+        # approximate S magnitude for masking
+        trQ2 = Qxx * Qxx + Qyy * Qyy + Qzz * Qzz + 2.0 * (Qxy * Qxy + Qxz * Qxz + Qyz * Qyz)
+        S_mag = np.sqrt(np.maximum(0.0, 1.5 * trQ2))
+        mask = (S_mag > float(S_threshold)) & np.isfinite(S_mag)
+        xi, r, C_r = correlation_length_3d_from_qtensor(
+            Qxx, Qxy, Qxz, Qyy, Qyz, Qzz,
+            mask=mask,
+            max_r=max_r,
+            target=target,
+        )
+        return xi, r, C_r, (Nx, Ny, Nz)
+
+    if ncol >= 7:
+        S, nx, ny, nz = load_nematic_field_volume(path, Nx, Ny, Nz)
+        Qxx, Qxy, Qxz, Qyy, Qyz, Qzz = _qtensor_from_Sn(S, nx, ny, nz)
+        mask = (S > float(S_threshold)) & np.isfinite(S)
+        xi, r, C_r = correlation_length_3d_from_qtensor(
+            Qxx, Qxy, Qxz, Qyy, Qyz, Qzz,
+            mask=mask,
+            max_r=max_r,
+            target=target,
+        )
+        return xi, r, C_r, (Nx, Ny, Nz)
+
+    raise ValueError(f"Unsupported field file format in {path} (ncol={ncol})")
+
+
+def _largest_connected_component_3d(mask: np.ndarray) -> np.ndarray:
+    if ndi is None:
+        raise ImportError("scipy is required for 3D connected components (install scipy)")
+    ndi_local = ndi
+    assert ndi_local is not None
+    mask = np.asarray(mask, dtype=bool)
+    if mask.ndim != 3:
+        raise ValueError("mask must be 3D")
+    if np.count_nonzero(mask) == 0:
+        return np.zeros_like(mask, dtype=bool)
+    structure = np.ones((3, 3, 3), dtype=bool)  # 26-connectivity
+    lbl, n = ndi_local.label(mask, structure=structure)
+    if n <= 1:
+        return mask
+    counts = np.bincount(lbl.ravel())
+    counts[0] = 0
+    lab = int(np.argmax(counts))
+    return lbl == lab
+
+
+def _skeleton_length_from_bool(skel: np.ndarray) -> float:
+    """Approximate skeleton length in lattice units using 26-neighbor edges."""
+    skel = np.asarray(skel, dtype=bool)
+    if skel.ndim != 3:
+        raise ValueError("skel must be 3D")
+    if np.count_nonzero(skel) == 0:
+        return 0.0
+
+    def _count_pairs(dx: int, dy: int, dz: int) -> int:
+        # Count (a & shifted a) without wrap-around.
+        xs0 = slice(max(0, dx), skel.shape[0] + min(0, dx))
+        ys0 = slice(max(0, dy), skel.shape[1] + min(0, dy))
+        zs0 = slice(max(0, dz), skel.shape[2] + min(0, dz))
+        xs1 = slice(max(0, -dx), skel.shape[0] + min(0, -dx))
+        ys1 = slice(max(0, -dy), skel.shape[1] + min(0, -dy))
+        zs1 = slice(max(0, -dz), skel.shape[2] + min(0, -dz))
+        a = skel[xs0, ys0, zs0]
+        b = skel[xs1, ys1, zs1]
+        return int(np.count_nonzero(a & b))
+
+    length = 0.0
+    # Use a half-neighborhood to avoid double counting.
+    for dx in (0, 1):
+        for dy in (-1, 0, 1):
+            for dz in (-1, 0, 1):
+                if dx == dy == dz == 0:
+                    continue
+                # half-space rule
+                if dx == 0 and dy < 0:
+                    continue
+                if dx == 0 and dy == 0 and dz < 0:
+                    continue
+                if dx == 0 and dy == 0 and dz == 0:
+                    continue
+                w = float(np.sqrt(dx * dx + dy * dy + dz * dz))
+                if w <= 0:
+                    continue
+                length += w * float(_count_pairs(dx, dy, dz))
+    return float(length)
+
+
+def defect_line_metrics_3d_from_field_file(
+    path: str,
+    *,
+    S_droplet: float = 0.1,
+    S_core: float = 0.05,
+    dilate_iters: int = 2,
+    fill_holes: bool = False,
+    core_erosion_iters: int = 0,
+    min_core_voxels: int = 30,
+    use_skeleton: bool = True,
+):
+    """Estimate 3D defect-line content from a field file.
+
+    Current implementation is a pragmatic LdG-style proxy:
+    - identify droplet as largest connected component of S > S_droplet
+    - dilate droplet a bit to include adjacent low-S core voxels
+    - define core candidates as (dilated droplet) & (S_mag < S_core)
+    - optionally skeletonize core voxels and estimate total line length
+
+    Works for:
+      - nematic_field_*.dat (uses S directly)
+      - Qtensor_output_*.dat (uses S_mag inferred from tr(Q^2))
+    """
+    if ndi is None:
+        raise ImportError("scipy is required for 3D defect-line metrics (install scipy)")
+    if use_skeleton and skeletonize_3d is None:
+        raise ImportError("scikit-image is required for 3D skeletonization (install scikit-image)")
+    ndi_local = ndi
+    assert ndi_local is not None
+    skel_fn = skeletonize_3d
+    if use_skeleton:
+        assert skel_fn is not None
+
+    Nx, Ny, Nz = infer_grid_dims_from_nematic_field_file(path)
+    ncol = int(_infer_num_columns_from_text_file(path))
+    if ncol >= 12:
+        Qxx, Qxy, Qxz, Qyy, Qyz, Qzz = load_qtensor_volume(path, Nx, Ny, Nz)
+        trQ2 = Qxx * Qxx + Qyy * Qyy + Qzz * Qzz + 2.0 * (Qxy * Qxy + Qxz * Qxz + Qyz * Qyz)
+        S_mag = np.sqrt(np.maximum(0.0, 1.5 * trQ2))
+        S_use = S_mag
+    elif ncol >= 7:
+        S, _, _, _ = load_nematic_field_volume(path, Nx, Ny, Nz)
+        S_use = S
+    else:
+        raise ValueError(f"Unsupported field file format in {path} (ncol={ncol})")
+
+    S_use = np.asarray(S_use, dtype=float)
+    finite = np.isfinite(S_use)
+
+    droplet_seed = finite & (S_use > float(S_droplet))
+    droplet = _largest_connected_component_3d(droplet_seed)
+    if bool(fill_holes):
+        # Important: defect cores (low-S) can appear as holes inside the droplet.
+        # Filling holes lets us detect cores *inside* the droplet without relying on dilation,
+        # and reduces the chance of capturing broad interface sheets.
+        droplet = ndi_local.binary_fill_holes(droplet)
+    droplet_vox = int(np.count_nonzero(droplet))
+    if droplet_vox == 0:
+        return {
+            'Nx': Nx,
+            'Ny': Ny,
+            'Nz': Nz,
+            'droplet_voxels': 0,
+            'core_voxels': 0,
+            'skeleton_voxels': 0,
+            'line_length_lattice': 0.0,
+            'line_density_per_voxel': float('nan'),
+            'core_density_per_voxel': float('nan'),
+        }
+
+    # Define a safe interior region to avoid counting low-S interface voxels.
+    interior = droplet
+    if int(core_erosion_iters) > 0:
+        structure = np.ones((3, 3, 3), dtype=bool)
+        interior = ndi_local.binary_erosion(droplet, structure=structure, iterations=int(core_erosion_iters))
+
+    # Optional dilation can help catch slightly offset cores, but large dilation tends to
+    # include interface sheets. Keep it small in batch use (0-1).
+    if int(dilate_iters) > 0:
+        structure = np.ones((3, 3, 3), dtype=bool)
+        region = ndi_local.binary_dilation(interior, structure=structure, iterations=int(dilate_iters))
+    else:
+        region = interior
+
+    core = region & finite & (S_use < float(S_core))
+    core_vox = int(np.count_nonzero(core))
+    if core_vox == 0:
+        return {
+            'Nx': Nx,
+            'Ny': Ny,
+            'Nz': Nz,
+            'droplet_voxels': droplet_vox,
+            'core_voxels': 0,
+            'skeleton_voxels': 0,
+            'line_length_lattice': 0.0,
+            'line_density_per_voxel': 0.0,
+            'core_density_per_voxel': 0.0,
+        }
+
+    # Remove tiny noisy components
+    structure = np.ones((3, 3, 3), dtype=bool)
+    lbl, n = ndi_local.label(core, structure=structure)
+    if n > 0:
+        counts = np.bincount(lbl.ravel())
+        counts[0] = 0
+        keep_labels = np.zeros(int(counts.size), dtype=bool)
+        keep_labels[counts >= int(min_core_voxels)] = True
+        lbl_i = lbl.astype(np.int32, copy=False)
+        core = keep_labels[lbl_i]
+        core_vox = int(np.count_nonzero(core))
+
+    if use_skeleton and core_vox > 0:
+        skel = skel_fn(core, method='lee')
+        skel = np.asarray(skel, dtype=bool)
+        skel_vox = int(np.count_nonzero(skel))
+        length = _skeleton_length_from_bool(skel)
+    else:
+        skel = np.zeros_like(core, dtype=bool)
+        skel_vox = 0
+        length = float('nan')
+
+    density = float(length) / float(droplet_vox) if np.isfinite(length) and droplet_vox > 0 else float('nan')
+    core_density = float(core_vox) / float(droplet_vox) if droplet_vox > 0 else float('nan')
+    return {
+        'Nx': Nx,
+        'Ny': Ny,
+        'Nz': Nz,
+        'droplet_voxels': droplet_vox,
+        'core_voxels': core_vox,
+        'skeleton_voxels': skel_vox,
+        'line_length_lattice': float(length) if np.isfinite(length) else float('nan'),
+        'line_density_per_voxel': density,
+        'core_density_per_voxel': core_density,
+        'S_droplet': float(S_droplet),
+        'S_core': float(S_core),
+        'dilate_iters': int(dilate_iters),
+        'min_core_voxels': int(min_core_voxels),
+    }
 
 
 def _nearest_from_log(iter_log: np.ndarray, values: np.ndarray, iter_target: int) -> float:
@@ -1972,6 +2468,338 @@ def aggregate_kz_scaling(
     return rows, out_path, csv_path
 
 
+def aggregate_kz_scaling_3d(
+    parent_dir: str = '.',
+    *,
+    run_dirs: list[str] | None = None,
+    pattern: str = 'output_quench*',
+    out_dir: str = 'pics',
+    x_axis: str = 't_ramp',
+    fit_x_min: float | None = None,
+    fit_x_max: float | None = None,
+    measure: str = 'after_Tc',
+    after_Tlow_s: float = 0.0,
+    Tc: float | None = 310.2,
+    after_Tc_s: float = 0.0,
+    after_Tc_mode: str = 'fixed',
+    after_Tc_frac_ramp: float = 0.1,
+    avgS_target: float = 0.1,
+    extra_after_target_s: float = 0.0,
+    S_threshold_xi: float = 0.1,
+    max_r: int | None = None,
+    S_droplet: float = 0.1,
+    S_core: float = 0.05,
+    dilate_iters: int = 2,
+    fill_holes: bool = False,
+    core_erosion_iters: int = 0,
+    min_core_voxels: int = 30,
+    defect_proxy: str = 'skeleton',
+    max_runs: int | None = None,
+    show: bool = True,
+    plot: bool = True,
+    write_files: bool = True,
+):
+    """Aggregate 3D KZ-style metrics across multiple quench runs.
+
+    Per run, selects a field snapshot (final / after_Tlow / after_Tc) and computes:
+      - xi_3D from 3D Q-tensor correlation (masked by S > S_threshold_xi)
+      - defect-line proxy as line length density from skeletonized low-S core
+
+    x_axis:
+      - 't_ramp' : seconds (tau_Q proxy)
+      - 'rate'   : |dT/dt| (K/s)
+    """
+    if not parent_dir:
+        parent_dir = '.'
+
+    parent_dir = os.path.abspath(parent_dir)
+    if run_dirs is None:
+        cand_dirs = [d for d in glob.glob(os.path.join(parent_dir, pattern)) if os.path.isdir(d)]
+        cand_dirs.sort()
+        run_dirs = [d for d in cand_dirs if os.path.exists(os.path.join(d, 'quench_log.dat'))]
+        if not run_dirs:
+            raise FileNotFoundError(f"No quench runs found in {parent_dir} matching {pattern} (missing quench_log.dat)")
+        if max_runs is not None and int(max_runs) > 0:
+            run_dirs = run_dirs[: int(max_runs)]
+    else:
+        resolved = []
+        for d in run_dirs:
+            d_abs = d if os.path.isabs(d) else os.path.join(parent_dir, d)
+            if not os.path.isdir(d_abs):
+                raise FileNotFoundError(f"Run directory not found: {d_abs}")
+            if not os.path.exists(os.path.join(d_abs, 'quench_log.dat')):
+                raise FileNotFoundError(f"Missing quench_log.dat in run directory: {d_abs}")
+            resolved.append(d_abs)
+        run_dirs = resolved
+
+    measure_norm = (measure or 'after_Tc').strip().lower()
+    mode_norm = (after_Tc_mode or 'fixed').strip().lower()
+    if measure_norm in ('after_tlow', 'after_t_low', 'tlow', 'after_final_t'):
+        offset = float(after_Tlow_s)
+        offset_label = f"{offset:g}s".replace('.', 'p').replace('-', 'm')
+        measure_label = f"after_Tlow_{offset_label}"
+    elif measure_norm in ('after_tc', 'after_t_c', 'tc', 'after_transition'):
+        Tc_use = float(Tc) if Tc is not None and np.isfinite(float(Tc)) else float('nan')
+        Tc_label = f"{Tc_use:g}K".replace('.', 'p').replace('-', 'm')
+        if mode_norm in ('frac', 'fraction', 'frac_ramp', 'ramp_frac'):
+            frac_label = f"{float(after_Tc_frac_ramp):g}".replace('.', 'p').replace('-', 'm')
+            measure_label = f"after_Tc_{Tc_label}_frac_{frac_label}"
+        elif mode_norm in ('avg_s', 'avgs', 's', 'order'):
+            s_label = f"{float(avgS_target):g}".replace('.', 'p').replace('-', 'm')
+            extra_label = f"{float(extra_after_target_s):g}s".replace('.', 'p').replace('-', 'm')
+            measure_label = f"after_Tc_{Tc_label}_avgS_{s_label}_plus_{extra_label}"
+        elif mode_norm in ('auto', 'best'):
+            frac_label = f"{float(after_Tc_frac_ramp):g}".replace('.', 'p').replace('-', 'm')
+            s_label = f"{float(avgS_target):g}".replace('.', 'p').replace('-', 'm')
+            extra_label = f"{float(extra_after_target_s):g}s".replace('.', 'p').replace('-', 'm')
+            measure_label = f"after_Tc_{Tc_label}_auto_frac_{frac_label}_avgS_{s_label}_plus_{extra_label}"
+        else:
+            offset = float(after_Tc_s)
+            offset_label = f"{offset:g}s".replace('.', 'p').replace('-', 'm')
+            measure_label = f"after_Tc_{Tc_label}_{offset_label}"
+    else:
+        measure_label = 'final'
+
+    def _iter_num(p: str) -> int:
+        m = re.search(r'(\d+)', os.path.basename(p))
+        return int(m.group(1)) if m else -1
+
+    defect_proxy_norm = (defect_proxy or 'skeleton').strip().lower()
+    if defect_proxy_norm in ('core', 'core_density', 'corefrac', 'core_fraction', 'volume', 'vox'):
+        use_skeleton = False
+        defect_col_name = 'core_density_per_voxel'
+        defect_label = 'core density proxy (core_vox/droplet_vox)'
+    else:
+        use_skeleton = True
+        defect_col_name = 'line_density_per_voxel'
+        defect_label = 'line density proxy (length/voxel)'
+
+    def _compute_3d_metrics_for_field(fp: str):
+        xi3, _, _, dims = correlation_length_3d_from_field_file(fp, S_threshold=float(S_threshold_xi), max_r=max_r)
+        if not (np.isfinite(xi3) and float(xi3) > 0):
+            raise ValueError(f"xi_3D is invalid for {os.path.basename(fp)} (xi_3D={xi3})")
+        defect = defect_line_metrics_3d_from_field_file(
+            fp,
+            S_droplet=float(S_droplet),
+            S_core=float(S_core),
+            dilate_iters=int(dilate_iters),
+            fill_holes=bool(fill_holes),
+            core_erosion_iters=int(core_erosion_iters),
+            min_core_voxels=int(min_core_voxels),
+            use_skeleton=bool(use_skeleton),
+        )
+        droplet_vox = int(defect.get('droplet_voxels', 0) or 0)
+        if droplet_vox <= 0:
+            raise ValueError(f"droplet mask is empty for {os.path.basename(fp)} (S_droplet={S_droplet})")
+        return float(xi3), defect, dims
+
+    rows = []
+    for run_dir in run_dirs:
+        data, log_path = load_quench_log(run_dir)
+        it = np.atleast_1d(data['iteration']).astype(float)
+        t = np.atleast_1d(data['time_s']).astype(float)
+        T = np.atleast_1d(data['T_K']).astype(float)
+        names = data.dtype.names or ()
+        avgS = np.atleast_1d(data['avg_S']).astype(float) if ('avg_S' in names) else np.full_like(t, np.nan)
+        t_ramp, rate_abs, protocol = _estimate_ramp_from_log(it, t, T, run_name=os.path.basename(run_dir))
+
+        # Choose which state to analyze
+        if measure_norm in ('after_tlow', 'after_t_low', 'tlow', 'after_final_t'):
+            Tmin = float(np.nanmin(T))
+            epsT = 1e-9
+            idxs = np.where(np.abs(T - Tmin) <= epsT)[0]
+            t_reach = float(t[int(idxs[0])]) if idxs.size else float(t[-1])
+            t_meas = t_reach + float(after_Tlow_s)
+            field_path = _select_snapshot_by_time(run_dir, t_meas, it, t)
+        elif measure_norm in ('after_tc', 'after_t_c', 'tc', 'after_transition'):
+            if Tc is None or not np.isfinite(float(Tc)):
+                raise ValueError("measure=after_Tc requires Tc to be set")
+            t_cross = _crossing_time_from_log(T, t, float(Tc))
+            # Choose offset using selected mode
+            off_fixed = float(after_Tc_s)
+            off_frac = float(after_Tc_frac_ramp) * float(t_ramp) if np.isfinite(float(t_ramp)) and float(t_ramp) > 0 else 0.0
+
+            off_avgS = 0.0
+            m = np.isfinite(t) & np.isfinite(avgS)
+            m &= (t >= float(t_cross))
+            idxs = np.where(m & (avgS >= float(avgS_target)))[0]
+            if idxs.size:
+                off_avgS = float(t[int(idxs[0])] - float(t_cross))
+
+            if mode_norm in ('frac', 'fraction', 'frac_ramp', 'ramp_frac'):
+                off = off_frac
+            elif mode_norm in ('avg_s', 'avgs', 's', 'order'):
+                off = off_avgS + float(extra_after_target_s)
+            elif mode_norm in ('auto', 'best'):
+                off = max(float(off_frac), float(off_avgS)) + float(extra_after_target_s)
+            else:
+                off = off_fixed
+
+            t_meas = float(t_cross) + float(off)
+            field_path = _select_snapshot_by_time(run_dir, t_meas, it, t)
+        else:
+            field_path = _choose_final_field_file(run_dir)
+
+        # Retry forward snapshots if the selected one is still too isotropic / empty-mask
+        max_retries = 12
+        tried = []
+        files_sorted = None
+        if measure_norm in ('after_tlow', 'after_t_low', 'tlow', 'after_final_t', 'after_tc', 'after_t_c', 'tc', 'after_transition'):
+            files_sorted = glob.glob(os.path.join(run_dir, 'nematic_field_iter_*.dat'))
+            files_sorted.sort(key=_iter_num)
+
+        fp_try = field_path
+        last_err: Exception | None = None
+        xi3 = float('nan')
+        defect = {}
+        dims = (0, 0, 0)
+        for _attempt in range(max_retries + 1):
+            try:
+                xi3, defect, dims = _compute_3d_metrics_for_field(fp_try)
+                field_path = fp_try
+                break
+            except Exception as e:
+                last_err = e
+                tried.append(os.path.basename(fp_try))
+                if not files_sorted:
+                    break
+                it_cur = _iter_num(fp_try)
+                idx = -1
+                for j, fp in enumerate(files_sorted):
+                    if _iter_num(fp) == it_cur:
+                        idx = j
+                        break
+                if idx < 0 or idx + 1 >= len(files_sorted):
+                    break
+                fp_try = files_sorted[idx + 1]
+
+        if not (np.isfinite(xi3) and xi3 > 0):
+            tried_s = ','.join(tried[:6]) + ('...' if len(tried) > 6 else '')
+            raise ValueError(
+                f"Failed 3D metrics for run {os.path.basename(run_dir)}: {last_err}. Tried snapshots: {tried_s}"
+            )
+
+        # Selection diagnostics (useful to verify consistency)
+        t_cross_row = float('nan')
+        t_sel_row = float('nan')
+        after_tc_actual = float('nan')
+        iter_sel = -1
+        if measure_norm in ('after_tc', 'after_t_c', 'tc', 'after_transition'):
+            Tc_row = float(Tc) if (Tc is not None and np.isfinite(float(Tc))) else float('nan')
+            t_cross_row = float(_crossing_time_from_log(T, t, Tc_row)) if np.isfinite(Tc_row) else float('nan')
+            m_it = re.search(r'(\d+)', os.path.basename(field_path))
+            iter_sel = int(m_it.group(1)) if m_it else -1
+            t_sel_row = float(_nearest_from_log(it, t, iter_sel)) if iter_sel >= 0 else float('nan')
+            after_tc_actual = float(t_sel_row - t_cross_row) if (np.isfinite(t_sel_row) and np.isfinite(t_cross_row)) else float('nan')
+
+        rows.append(
+            (
+                os.path.basename(run_dir),
+                protocol,
+                float(t_ramp),
+                float(rate_abs),
+                float(xi3),
+                float(defect.get('line_length_lattice', float('nan'))),
+                float(defect.get(defect_col_name, float('nan'))),
+                int(defect.get('Nx', dims[0])),
+                int(defect.get('Ny', dims[1])),
+                int(defect.get('Nz', dims[2])),
+                float(S_threshold_xi),
+                float(S_droplet),
+                float(S_core),
+                int(dilate_iters),
+                int(min_core_voxels),
+                os.path.basename(field_path),
+                float(t_cross_row),
+                float(t_sel_row),
+                float(after_tc_actual),
+                int(iter_sel),
+            )
+        )
+
+    out_path = None
+    csv_path = None
+    tag = os.path.basename(parent_dir) or 'runs'
+    tag_full = f"{tag}_{measure_label}"
+
+    if write_files:
+        os.makedirs(out_dir, exist_ok=True)
+        csv_path = os.path.join(out_dir, f'kz_scaling3d_{tag_full}.csv')
+        with open(csv_path, 'w', encoding='utf-8') as f:
+            f.write(
+                'run,protocol,t_ramp_s,rate_K_per_s,xi3d_lattice,line_length_lattice,line_density_per_voxel,'
+                'Nx,Ny,Nz,S_threshold_xi,S_droplet,S_core,dilate_iters,min_core_voxels,field_file,'
+                't_cross_s,t_selected_s,after_Tc_actual_s,iter_selected,defect_proxy\n'
+            )
+            for r in rows:
+                f.write(
+                    f"{r[0]},{r[1]},{r[2]:.8g},{r[3]:.8g},{r[4]:.8g},{r[5]:.8g},{r[6]:.8g},"
+                    f"{int(r[7])},{int(r[8])},{int(r[9])},{r[10]:.8g},{r[11]:.8g},{r[12]:.8g},"
+                    f"{int(r[13])},{int(r[14])},{r[15]},"
+                    f"{r[16]:.8g},{r[17]:.8g},{r[18]:.8g},{int(r[19])},{defect_proxy_norm}\n"
+                )
+
+    # Prepare arrays for plotting
+    arr = np.array([[r[2], r[3], r[4], r[6]] for r in rows], dtype=float)
+    t_ramp = arr[:, 0]
+    rate = arr[:, 1]
+    xi3d = arr[:, 2]
+    line_den = arr[:, 3]
+
+    if x_axis.strip().lower() == 'rate':
+        x = rate
+        x_label = r'$|dT/dt|$ [K/s]'
+        x_name = 'rate'
+    else:
+        x = t_ramp
+        x_label = r'$t_{ramp}$ [s]'
+        x_name = 't_ramp'
+
+    slope_xi, pref_xi = _fit_powerlaw_loglog(x, xi3d, x_min=fit_x_min, x_max=fit_x_max)
+    slope_ld, pref_ld = _fit_powerlaw_loglog(x, line_den, x_min=fit_x_min, x_max=fit_x_max)
+
+    if plot:
+        fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(10, 8), sharex=True)
+        ax1.loglog(x, xi3d, 'o', ms=7)
+        ax1.set_ylabel(r'$\xi_{3D}$ (lattice units)')
+        ax1.grid(True, which='both', alpha=0.3)
+        if np.isfinite(slope_xi) and np.isfinite(pref_xi):
+            xs = np.linspace(np.nanmin(x[x > 0]), np.nanmax(x[x > 0]), 200)
+            ax1.loglog(xs, pref_xi * xs ** slope_xi, '--', lw=1.5, label=f'fit: slope={slope_xi:.3g}')
+            ax1.legend()
+
+        ax2.loglog(x, line_den, 'o', ms=7, color='tab:purple')
+        ax2.set_xlabel(x_label)
+        ax2.set_ylabel(defect_label)
+        ax2.grid(True, which='both', alpha=0.3)
+        if np.isfinite(slope_ld) and np.isfinite(pref_ld):
+            xs = np.linspace(np.nanmin(x[x > 0]), np.nanmax(x[x > 0]), 200)
+            ax2.loglog(xs, pref_ld * xs ** slope_ld, '--', lw=1.5, color='tab:purple', label=f'fit: slope={slope_ld:.3g}')
+            ax2.legend()
+
+        fig.suptitle(
+            f'KZ scaling (3D metrics) across {len(rows)} runs | measure={measure_label} | x={x_name} | '
+            f'S_xi>{S_threshold_xi:g} | S_drop>{S_droplet:g} | S_core<{S_core:g}'
+        )
+        fig.tight_layout(rect=(0, 0, 1, 0.96))
+
+        if write_files:
+            out_path = os.path.join(out_dir, f'kz_scaling3d_{tag_full}_{x_name}.png')
+            fig.savefig(out_path, dpi=220)
+            print(f"Saved 3D KZ scaling plot -> {out_path}")
+            print(f"Saved 3D KZ scaling CSV  -> {csv_path}")
+
+        if np.isfinite(slope_xi) and np.isfinite(slope_ld) and x_name == 't_ramp':
+            print(f"[consistency] slope(line_density)={slope_ld:.4g}; expected ~{-2.0*slope_xi:.4g} for line defects")
+
+        if show:
+            plt.show()
+        else:
+            plt.close(fig)
+
+    return rows, out_path, csv_path
+
+
 def sweep_kz_slope_stability(
     parent_dir: str = '.',
     *,
@@ -2288,10 +3116,12 @@ if __name__ == '__main__':
               "8: Plot KZ metrics from quench (xi + defect density)\n"
               "9: Aggregate KZ scaling across runs (log-log fit)\n"
               "10: Sweep KZ slope stability vs offset after Tc\n"
-              "Enter your choice (0-10): ").strip()
-    while not i.isdigit() or int(i) < 0 or int(i) > 10:
-        print("Invalid input. Please enter a number between 0 and 10.")
-        i = input("Please enter a number between 0 and 10: ").strip()
+              "11: 3D metrics from a snapshot (xi_3D + defect-line proxy)\n"
+              "12: Aggregate KZ scaling using 3D metrics (xi_3D + defect-line proxy)\n"
+              "Enter your choice (0-12): ").strip()
+    while not i.isdigit() or int(i) < 0 or int(i) > 12:
+        print("Invalid input. Please enter a number between 0 and 12.")
+        i = input("Please enter a number between 0 and 12: ").strip()
     i = int(i)
     # ---------------------------------------------------------------------- PART 1 ----------------------------------------------------------------------------|
     if i == 0:
@@ -2674,16 +3504,352 @@ if __name__ == '__main__':
             )
         except Exception as e:
             print(f"Error sweeping slope stability: {e}")
+    elif i == 11:
+        print("\n3D metrics from a snapshot (xi_3D + defect-line proxy)...")
+        in_path = input("Path to field file OR run directory OR quench_log.dat [default: output_quench]: ").strip()
+        if not in_path:
+            in_path = 'output_quench'
+
+        run_dir = _resolve_run_dir_from_path(in_path)
+        field_fp = None
+
+        if os.path.isdir(run_dir):
+            # Choose a field file from the directory
+            final_fp = os.path.join(run_dir, 'nematic_field_final.dat')
+            snaps = _list_snapshot_files(run_dir)
+            have_final = os.path.exists(final_fp)
+            if have_final:
+                default_pick = 'f'
+            elif snaps:
+                default_pick = 'n'
+            else:
+                default_pick = 'q'
+
+            # Try to allow time-based selection if log exists
+            have_log = False
+            it_log = np.empty(0, dtype=float)
+            t_log = np.empty(0, dtype=float)
+            T_log = np.empty(0, dtype=float)
+            try:
+                data, log_path = load_quench_log(run_dir)
+                it_log = np.atleast_1d(data['iteration']).astype(float)
+                t_log = np.atleast_1d(data['time_s']).astype(float)
+                T_log = np.atleast_1d(data['T_K']).astype(float)
+                have_log = True
+                print(f"Detected quench log: {os.path.basename(str(log_path))}")
+            except Exception:
+                have_log = False
+
+            prompt = "Select field file: (f) final, (n) snapshot index"
+            if have_log and snaps:
+                prompt += ", (a) after Tc+offset"
+                if default_pick == 'n':
+                    default_pick = 'a'
+            prompt += f", (q) quit [default: {default_pick}]: "
+            pick = input(prompt).strip().lower() or default_pick
+            if pick == 'q':
+                field_fp = None
+            elif pick == 'f' and have_final:
+                field_fp = final_fp
+            elif pick == 'a':
+                if not (have_log and snaps):
+                    print("Tc-based selection requires a quench log and snapshots.")
+                    field_fp = None
+                else:
+                    tc_in = input("Tc [K] [default: 310.2]: ").strip()
+                    try:
+                        Tc = float(tc_in) if tc_in else 310.2
+                    except ValueError:
+                        Tc = 310.2
+                    off_in = input("Time offset after crossing Tc [s] [default: 0.0]: ").strip()
+                    try:
+                        after_Tc_s = float(off_in) if off_in else 0.0
+                    except ValueError:
+                        after_Tc_s = 0.0
+                    t_cross = _crossing_time_from_log(T_log, t_log, float(Tc))
+                    t_meas = float(t_cross) + float(after_Tc_s)
+                    field_fp = _select_snapshot_by_time(run_dir, t_meas, it_log, t_log)
+                    print(f"Selected snapshot closest to t_cross+offset={t_meas:.6g}s -> {os.path.basename(field_fp)}")
+            else:
+                if not snaps:
+                    print("No nematic_field_iter_*.dat snapshots found.")
+                    field_fp = final_fp if have_final else None
+                else:
+                    idx_in = input(f"Snapshot index [0..{len(snaps)-1}] [default: {len(snaps)-1}]: ").strip()
+                    try:
+                        idx = int(idx_in) if idx_in else (len(snaps) - 1)
+                    except ValueError:
+                        idx = len(snaps) - 1
+                    idx = max(0, min(len(snaps) - 1, idx))
+                    _, field_fp = snaps[idx]
+        else:
+            field_fp = in_path
+
+        if not field_fp or not os.path.exists(field_fp):
+            print("No valid field file selected.")
+        else:
+            base = os.path.splitext(os.path.basename(field_fp))[0]
+
+            do_xi3 = input("Compute 3D correlation length xi_3D (Q-tensor correlation)? (y/n) [default: y]: ").strip().lower()
+            if not do_xi3:
+                do_xi3 = 'y'
+            if do_xi3 == 'y':
+                sth_in = input("S threshold for droplet mask (used for masking correlation) [default: 0.1]: ").strip()
+                try:
+                    sthr = float(sth_in) if sth_in else 0.1
+                except ValueError:
+                    sthr = 0.1
+                mr_in = input("Max r to consider (blank=auto): ").strip()
+                try:
+                    max_r = int(float(mr_in)) if mr_in else None
+                except ValueError:
+                    max_r = None
+
+                try:
+                    xi3, r, C_r, dims = correlation_length_3d_from_field_file(field_fp, S_threshold=sthr, max_r=max_r)
+                    print(f"[xi_3D] {os.path.basename(field_fp)} dims={dims} -> xi_3D ≈ {xi3:.6g} (lattice units)")
+
+                    os.makedirs('pics', exist_ok=True)
+                    csv_path = os.path.join('pics', f'xi3d_corr_{base}.csv')
+                    with open(csv_path, 'w', encoding='utf-8') as f:
+                        f.write('r_lattice,C_r\n')
+                        for rr, cc in zip(r, C_r):
+                            if np.isfinite(rr) and np.isfinite(cc):
+                                f.write(f"{float(rr):.8g},{float(cc):.8g}\n")
+                    print(f"Saved 3D correlation CSV -> {csv_path}")
+
+                    fig, ax = plt.subplots(1, 1, figsize=(7.5, 4.6))
+                    ax.plot(r, C_r, 'o-', ms=3)
+                    ax.axhline(np.e ** (-1.0), color='k', lw=1, ls='--', alpha=0.6, label=r'$1/e$')
+                    if np.isfinite(xi3):
+                        ax.axvline(xi3, color='tab:red', lw=1.5, ls='--', alpha=0.8, label=fr'$\xi_{{3D}}\approx{xi3:.3g}$')
+                    ax.set_xlabel('r (lattice units)')
+                    ax.set_ylabel('C(r)')
+                    ax.set_title(f'3D Q-correlation | {base} | S>{sthr:g}')
+                    ax.grid(True, alpha=0.3)
+                    ax.legend()
+                    fig.tight_layout()
+                    out_png = os.path.join('pics', f'xi3d_corr_{base}.png')
+                    fig.savefig(out_png, dpi=220)
+                    plt.show()
+                except Exception as e:
+                    print(f"Error computing xi_3D: {e}")
+
+            do_def3 = input("Compute 3D defect-line proxy (skeletonized low-S core)? (y/n) [default: y]: ").strip().lower()
+            if not do_def3:
+                do_def3 = 'y'
+            if do_def3 == 'y':
+                sth_in = input("S threshold for droplet identification [default: 0.1]: ").strip()
+                try:
+                    S_d = float(sth_in) if sth_in else 0.1
+                except ValueError:
+                    S_d = 0.1
+                sc_in = input("S threshold for core voxels (S < S_core) [default: 0.05]: ").strip()
+                try:
+                    S_c = float(sc_in) if sc_in else 0.05
+                except ValueError:
+                    S_c = 0.05
+                di_in = input("Dilate droplet by N voxels to include nearby core [default: 2]: ").strip()
+                try:
+                    dil = int(float(di_in)) if di_in else 2
+                except ValueError:
+                    dil = 2
+                mv_in = input("Min core component size (voxels) [default: 30]: ").strip()
+                try:
+                    minv = int(float(mv_in)) if mv_in else 30
+                except ValueError:
+                    minv = 30
+
+                try:
+                    out = defect_line_metrics_3d_from_field_file(
+                        field_fp,
+                        S_droplet=S_d,
+                        S_core=S_c,
+                        dilate_iters=dil,
+                        min_core_voxels=minv,
+                        use_skeleton=True,
+                    )
+                    print(
+                        f"[defect_3D] droplet_vox={out.get('droplet_voxels')} core_vox={out.get('core_voxels')} "
+                        f"skel_vox={out.get('skeleton_voxels')} length≈{out.get('line_length_lattice'):.6g} "
+                        f"density≈{out.get('line_density_per_voxel'):.6g}"
+                    )
+
+                    os.makedirs('pics', exist_ok=True)
+                    csv_path = os.path.join('pics', f'defect3d_{base}.csv')
+                    with open(csv_path, 'w', encoding='utf-8') as f:
+                        for k, v in out.items():
+                            f.write(f"{k},{v}\n")
+                    print(f"Saved 3D defect-line CSV -> {csv_path}")
+                except Exception as e:
+                    print(f"Error computing 3D defect-line proxy: {e}")
+    elif i == 12:
+        print("\nAggregating KZ scaling using 3D metrics (xi_3D + defect-line proxy) across runs...")
+        parent = input("Parent directory to scan [default: .]: ").strip() or '.'
+        pattern = input("Folder pattern [default: output_quench*]: ").strip() or 'output_quench*'
+        x_axis = input("X-axis (t_ramp or rate) [default: t_ramp]: ").strip() or 't_ramp'
+        measure = input("Measure state (final / after_Tlow / after_Tc) [default: after_Tc]: ").strip() or 'after_Tc'
+
+        after_Tlow_s = 0.0
+        Tc = None
+        after_Tc_s = 0.0
+        after_Tc_mode = 'fixed'
+        after_Tc_frac_ramp = 0.1
+        avgS_target = 0.1
+        extra_after_target_s = 0.0
+        if measure.strip().lower() in ('after_tlow', 'after_t_low', 'tlow', 'after_final_t'):
+            off_in = input("Time offset after reaching T_low in seconds [default: 0.0]: ").strip()
+            try:
+                after_Tlow_s = float(off_in) if off_in else 0.0
+            except ValueError:
+                after_Tlow_s = 0.0
+        elif measure.strip().lower() in ('after_tc', 'after_t_c', 'tc', 'after_transition'):
+            tc_in = input("Transition temperature Tc in Kelvin [default: 310.2]: ").strip()
+            try:
+                Tc = float(tc_in) if tc_in else 310.2
+            except ValueError:
+                Tc = 310.2
+            mode_in = input("After-Tc selection mode: fixed / frac / avgS / auto [default: auto]: ").strip().lower()
+            after_Tc_mode = mode_in if mode_in else 'auto'
+            if after_Tc_mode in ('fixed', 'f'):
+                off_in = input("Time offset after crossing Tc in seconds [default: 0.0]: ").strip()
+                try:
+                    after_Tc_s = float(off_in) if off_in else 0.0
+                except ValueError:
+                    after_Tc_s = 0.0
+            elif after_Tc_mode in ('frac', 'fraction', 'frac_ramp', 'ramp_frac', 'r'):
+                fr_in = input("Offset after Tc as fraction of ramp time t_ramp [default: 0.1]: ").strip()
+                try:
+                    after_Tc_frac_ramp = float(fr_in) if fr_in else 0.1
+                except ValueError:
+                    after_Tc_frac_ramp = 0.1
+            elif after_Tc_mode in ('avg_s', 'avgs', 's', 'order'):
+                s_in = input("Measure when avg_S first exceeds threshold [default: 0.1]: ").strip()
+                try:
+                    avgS_target = float(s_in) if s_in else 0.1
+                except ValueError:
+                    avgS_target = 0.1
+                ex_in = input("Extra time after reaching avg_S threshold [s] [default: 0.0]: ").strip()
+                try:
+                    extra_after_target_s = float(ex_in) if ex_in else 0.0
+                except ValueError:
+                    extra_after_target_s = 0.0
+            else:
+                # auto: max(frac*t_ramp, time to reach avg_S threshold) + extra
+                fr_in = input("AUTO: fraction of ramp time t_ramp [default: 0.1]: ").strip()
+                try:
+                    after_Tc_frac_ramp = float(fr_in) if fr_in else 0.1
+                except ValueError:
+                    after_Tc_frac_ramp = 0.1
+                s_in = input("AUTO: avg_S threshold [default: 0.1]: ").strip()
+                try:
+                    avgS_target = float(s_in) if s_in else 0.1
+                except ValueError:
+                    avgS_target = 0.1
+                ex_in = input("AUTO: extra time after threshold [s] [default: 0.0]: ").strip()
+                try:
+                    extra_after_target_s = float(ex_in) if ex_in else 0.0
+                except ValueError:
+                    extra_after_target_s = 0.0
+
+        # xi_3D params
+        sth_in = input("S threshold for xi_3D masking (S > S_threshold_xi) [default: 0.1]: ").strip()
+        try:
+            S_threshold_xi = float(sth_in) if sth_in else 0.1
+        except ValueError:
+            S_threshold_xi = 0.1
+        mr_in = input("Max r for xi_3D correlation (blank=auto) [default: blank]: ").strip()
+        try:
+            max_r = int(float(mr_in)) if mr_in else None
+        except ValueError:
+            max_r = None
+
+        # defect proxy params
+        dp_in = input("Defect proxy (skeleton or core_density) [default: skeleton]: ").strip().lower()
+        defect_proxy = dp_in if dp_in else 'skeleton'
+
+        sd_in = input("S threshold for droplet identification (S > S_droplet) [default: 0.1]: ").strip()
+        try:
+            S_droplet = float(sd_in) if sd_in else 0.1
+        except ValueError:
+            S_droplet = 0.1
+        sc_in = input("S threshold for core voxels (S < S_core) [default: 0.05]: ").strip()
+        try:
+            S_core = float(sc_in) if sc_in else 0.05
+        except ValueError:
+            S_core = 0.05
+        di_in = input("Dilate droplet by N voxels [default: 2]: ").strip()
+        try:
+            dilate_iters = int(float(di_in)) if di_in else 2
+        except ValueError:
+            dilate_iters = 2
+
+        fh_in = input("Fill holes in droplet mask (helps include internal low-S cores) (y/n) [default: n]: ").strip().lower()
+        fill_holes = True if fh_in in ('y', 'yes', '1', 'true', 't') else False
+
+        ero_in = input("Erode droplet by N voxels before core detection (avoid interface sheets) [default: 0]: ").strip()
+        try:
+            core_erosion_iters = int(float(ero_in)) if ero_in else 0
+        except ValueError:
+            core_erosion_iters = 0
+        mv_in = input("Min core component size (voxels) [default: 30]: ").strip()
+        try:
+            min_core_voxels = int(float(mv_in)) if mv_in else 30
+        except ValueError:
+            min_core_voxels = 30
+
+        max_runs = None
+        mruns_in = input("Max number of runs to process (blank=all): ").strip()
+        try:
+            max_runs = int(float(mruns_in)) if mruns_in else None
+        except ValueError:
+            max_runs = None
+
+        fit_x_min = None
+        fit_x_max = None
+        if x_axis.strip().lower() == 'rate':
+            fx1 = input("Fit window min |dT/dt| [K/s] (blank=all): ").strip()
+            fx2 = input("Fit window max |dT/dt| [K/s] (blank=all): ").strip()
+        else:
+            fx1 = input("Fit window min t_ramp [s] (blank=all): ").strip()
+            fx2 = input("Fit window max t_ramp [s] (blank=all): ").strip()
+        try:
+            fit_x_min = float(fx1) if fx1 else None
+        except ValueError:
+            fit_x_min = None
+        try:
+            fit_x_max = float(fx2) if fx2 else None
+        except ValueError:
+            fit_x_max = None
+
+        try:
+            aggregate_kz_scaling_3d(
+                parent,
+                pattern=pattern,
+                out_dir='pics',
+                x_axis=x_axis,
+                fit_x_min=fit_x_min,
+                fit_x_max=fit_x_max,
+                measure=measure,
+                after_Tlow_s=after_Tlow_s,
+                Tc=Tc,
+                after_Tc_s=after_Tc_s,
+                after_Tc_mode=after_Tc_mode,
+                after_Tc_frac_ramp=after_Tc_frac_ramp,
+                avgS_target=avgS_target,
+                extra_after_target_s=extra_after_target_s,
+                S_threshold_xi=S_threshold_xi,
+                max_r=max_r,
+                S_droplet=S_droplet,
+                S_core=S_core,
+                dilate_iters=dilate_iters,
+                fill_holes=fill_holes,
+                core_erosion_iters=core_erosion_iters,
+                min_core_voxels=min_core_voxels,
+                defect_proxy=defect_proxy,
+                max_runs=max_runs,
+                show=True,
+            )
+        except Exception as e:
+            print(f"Error aggregating 3D KZ scaling: {e}")
     # ---------------------------------------------------------------------- FIN --------------------------------------------------------------------------------|
-
-# WHAT I NEED TO DO:
-# - Run simulation for different external field strengths (1e6-1e7)(conpare order parameter evolutions (energy minimization))
-# - combine final energy vs iteration for different external field strengths (to see the influence on energy minimization)
-# - plot energy contributions for one external energy strength (e.g. 1e7)
-# - Run temperature sweep simulations with different external field strengths
-
-# EXPLAIN TO COLLEAGUES:
-# - Parameters are set to immitate 5CB (semi-successfully)
-# - simulation allows for material prototyping and testing of different nematic field configurations
-# - due to time limitations, i couldn't run separate simualtions, testing all parameter changes, and is why i approximated 5CB.
-# - most important params: kappa, gamma, A, B, C, T, T*, alpha

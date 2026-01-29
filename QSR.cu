@@ -1,6 +1,7 @@
 #include "QSR.cuh"
 #include <cctype>
 #include <limits>
+#include <tuple>
 #include <type_traits>
 
 namespace fs = std::filesystem;
@@ -292,7 +293,8 @@ __global__ void computeChemicalPotentialKernel(const QTensor* Q, QTensor* mu, co
     mu[idx] = h;
 }
 
-__global__ void applyWeakAnchoringPenaltyKernel(QTensor* mu, const QTensor* Q, int Nx, int Ny, int Nz, const bool* is_shell, double S_shell, double W) {
+__global__ void applyWeakAnchoringPenaltyKernel(QTensor* mu, const QTensor* Q, int Nx, int Ny, int Nz,
+                                               const bool* is_shell, double S_shell, double W, double shell_thickness) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     int j = blockIdx.y * blockDim.y + threadIdx.y;
     int k = blockIdx.z * blockDim.z + threadIdx.z;
@@ -302,6 +304,7 @@ __global__ void applyWeakAnchoringPenaltyKernel(QTensor* mu, const QTensor* Q, i
 
     if (!is_shell[idx]) return;
     if (W == 0.0) return;
+    if (!(shell_thickness > 0.0)) return;
 
     double cx = Nx / 2.0, cy = Ny / 2.0, cz = Nz / 2.0;
     double x = i - cx, y = j - cy, z = k - cz;
@@ -318,11 +321,64 @@ __global__ void applyWeakAnchoringPenaltyKernel(QTensor* mu, const QTensor* Q, i
     
     const QTensor& q = Q[idx];
     QTensor& h = mu[idx];
-    h.Qxx += W * (q.Qxx - Q0.Qxx);
-    h.Qxy += W * (q.Qxy - Q0.Qxy);
-    h.Qxz += W * (q.Qxz - Q0.Qxz);
-    h.Qyy += W * (q.Qyy - Q0.Qyy);
-    h.Qyz += W * (q.Qyz - Q0.Qyz);
+
+    // Convert surface anchoring strength (J/m^2) to volumetric penalty (J/m^3): W_eff = W / δ.
+    const double W_eff = W / shell_thickness;
+
+    h.Qxx += W_eff * (q.Qxx - Q0.Qxx);
+    h.Qxy += W_eff * (q.Qxy - Q0.Qxy);
+    h.Qxz += W_eff * (q.Qxz - Q0.Qxz);
+    h.Qyy += W_eff * (q.Qyy - Q0.Qyy);
+    h.Qyz += W_eff * (q.Qyz - Q0.Qyz);
+}
+
+__global__ void computeAnchoringEnergyKernel(const QTensor* Q, const bool* is_shell, double* anch_energy,
+                                            int Nx, int Ny, int Nz, double dx, double dy, double dz,
+                                            double S_shell, double W, double shell_thickness) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    int j = blockIdx.y * blockDim.y + threadIdx.y;
+    int k = blockIdx.z * blockDim.z + threadIdx.z;
+
+    if (i >= Nx || j >= Ny || k >= Nz) return;
+    int idx = k + Nz * (j + Ny * i);
+
+    if (W == 0.0 || !is_shell[idx] || !(shell_thickness > 0.0)) {
+        anch_energy[idx] = 0.0;
+        return;
+    }
+
+    double cx = Nx / 2.0, cy = Ny / 2.0, cz = Nz / 2.0;
+    double x = i - cx, y = j - cy, z = k - cz;
+    double r = sqrt(x * x + y * y + z * z);
+    if (r < 1e-9) {
+        anch_energy[idx] = 0.0;
+        return;
+    }
+
+    double nx = x / r, ny = y / r, nz = z / r;
+
+    // Target Q0 = S_shell (n⊗n - I/3)
+    const double Q0_xx = S_shell * (nx * nx - 1.0 / 3.0);
+    const double Q0_xy = S_shell * (nx * ny);
+    const double Q0_xz = S_shell * (nx * nz);
+    const double Q0_yy = S_shell * (ny * ny - 1.0 / 3.0);
+    const double Q0_yz = S_shell * (ny * nz);
+    const double Q0_zz = -(Q0_xx + Q0_yy);
+
+    FullQTensor q(Q[idx]);
+    const double dxx = q.Qxx - Q0_xx;
+    const double dxy = q.Qxy - Q0_xy;
+    const double dxz = q.Qxz - Q0_xz;
+    const double dyy = q.Qyy - Q0_yy;
+    const double dyz = q.Qyz - Q0_yz;
+    const double dzz = q.Qzz - Q0_zz;
+
+    // Frobenius norm squared for symmetric tensor: dQij dQij
+    const double diff2 = dxx * dxx + dyy * dyy + dzz * dzz + 2.0 * (dxy * dxy + dxz * dxz + dyz * dyz);
+
+    // Consistent with applyWeakAnchoringPenaltyKernel (mu += (W/δ)*(Q-Q0)):
+    // use volumetric density f = (W/(2δ)) * ||Q - Q0||^2 so F approximates a surface integral.
+    anch_energy[idx] = 0.5 * (W / shell_thickness) * diff2 * (dx * dy * dz);
 }
 
 __global__ void updateQTensorKernel(QTensor* Q, const QTensor* mu, int Nx, int Ny, int Nz, double dt, const bool* is_shell, double gamma, double W) {
@@ -1018,6 +1074,7 @@ int main() {
         bool *d_is_shell;
         double *d_Dcol_x, *d_Dcol_y, *d_Dcol_z;
         double *d_bulk_energy, *d_elastic_energy;
+        double *d_anch_energy;
         double *d_radiality_vals;
         int *d_count_vals;
 
@@ -1030,6 +1087,7 @@ int main() {
         cudaMalloc(&d_Dcol_z, size_double);
         cudaMalloc(&d_bulk_energy, size_double);
         cudaMalloc(&d_elastic_energy, size_double);
+        cudaMalloc(&d_anch_energy, size_double);
         cudaMalloc(&d_radiality_vals, size_double);
         cudaMalloc(&d_count_vals, size_int);
 
@@ -1065,18 +1123,25 @@ int main() {
             return (count > 0) ? (total_S / count) : 0.0;
         };
 
-        auto reduce_energy = [&](DimensionalParams p) -> std::pair<double, double> {
+        auto reduce_energy = [&](DimensionalParams p, double S_shell) -> std::tuple<double, double, double> {
             computeEnergyKernel<<<numBlocks, threadsPerBlock>>>(d_Q, d_bulk_energy, d_elastic_energy, Nx, Ny, Nz, dx, dy, dz, p, kappa, modechoice);
-            std::vector<double> h_bulk(num_elements), h_elastic(num_elements);
+            const double shell_thickness = std::min({dx, dy, dz});
+            computeAnchoringEnergyKernel<<<numBlocks, threadsPerBlock>>>(d_Q, d_is_shell, d_anch_energy, Nx, Ny, Nz, dx, dy, dz, S_shell, p.W, shell_thickness);
+
+            std::vector<double> h_bulk(num_elements), h_elastic(num_elements), h_anch(num_elements);
             cudaMemcpy(h_bulk.data(), d_bulk_energy, size_double, cudaMemcpyDeviceToHost);
             cudaMemcpy(h_elastic.data(), d_elastic_energy, size_double, cudaMemcpyDeviceToHost);
+            cudaMemcpy(h_anch.data(), d_anch_energy, size_double, cudaMemcpyDeviceToHost);
+
             double bulk_sum = 0.0;
             double elastic_sum = 0.0;
+            double anch_sum = 0.0;
             for (size_t ii = 0; ii < num_elements; ++ii) {
                 bulk_sum += h_bulk[ii];
                 elastic_sum += h_elastic[ii];
+                anch_sum += h_anch[ii];
             }
-            return {bulk_sum, elastic_sum};
+            return {bulk_sum, elastic_sum, anch_sum};
         };
 
         if (sim_mode == 3) {
@@ -1193,7 +1258,7 @@ int main() {
             if (!user_choice_line.empty()) user_choice = user_choice_line[0];
 
             std::ofstream quench_log((out_dir / "quench_log.dat").string());
-            quench_log << "iteration,time_s,T_K,bulk,elastic,total,radiality,avg_S\n";
+            quench_log << "iteration,time_s,T_K,bulk,elastic,anchoring,total,radiality,avg_S\n";
 
             auto compute_T_current = [&](int iter) -> double {
                 if (iter < pre_equil_iters) return T_high;
@@ -1231,7 +1296,8 @@ int main() {
                 computeLaplacianKernel<<<numBlocks, threadsPerBlock>>>(d_Q, d_laplacianQ, Nx, Ny, Nz, dx, dy, dz);
                 if (L2 != 0.0) computeDivergenceKernel<<<numBlocks, threadsPerBlock>>>(d_Q, d_Dcol_x, d_Dcol_y, d_Dcol_z, Nx, Ny, Nz, dx, dy, dz);
                 computeChemicalPotentialKernel<<<numBlocks, threadsPerBlock>>>(d_Q, d_mu, d_laplacianQ, Nx, Ny, Nz, dx, dy, dz, params_q, kappa, modechoice, d_Dcol_x, d_Dcol_y, d_Dcol_z);
-                applyWeakAnchoringPenaltyKernel<<<numBlocks, threadsPerBlock>>>(d_mu, d_Q, Nx, Ny, Nz, d_is_shell, S_shell, W);
+                const double shell_thickness = std::min({dx, dy, dz});
+                applyWeakAnchoringPenaltyKernel<<<numBlocks, threadsPerBlock>>>(d_mu, d_Q, Nx, Ny, Nz, d_is_shell, S_shell, W, shell_thickness);
                 updateQTensorKernel<<<numBlocks, threadsPerBlock>>>(d_Q, d_mu, Nx, Ny, Nz, dt, d_is_shell, gamma, W);
                 applyBoundaryConditionsKernel<<<numBlocks, threadsPerBlock>>>(d_Q, Nx, Ny, Nz, d_is_shell, S_shell, W);
 
@@ -1269,8 +1335,8 @@ int main() {
 
                 if (do_log || do_snap) {
                     computeRadialityKernel<<<numBlocks, threadsPerBlock>>>(d_Q, d_radiality_vals, d_count_vals, Nx, Ny, Nz);
-                    auto [bulk_sum, elastic_sum] = reduce_energy(params_q);
-                    double total_F = bulk_sum + elastic_sum;
+                    auto [bulk_sum, elastic_sum, anch_sum] = reduce_energy(params_q, S_shell);
+                    double total_F = bulk_sum + elastic_sum + anch_sum;
 
                     std::vector<double> h_rad(num_elements);
                     std::vector<int> h_count(num_elements);
@@ -1294,11 +1360,12 @@ int main() {
 
                     if (do_log) {
                         quench_log << iter << "," << physical_time << "," << T_current << "," << bulk_sum << "," << elastic_sum
-                                  << "," << total_F << "," << avg_rad << "," << avg_S << "\n";
+                                  << "," << anch_sum << "," << total_F << "," << avg_rad << "," << avg_S << "\n";
                         quench_log.flush();
                         if (user_choice == 'y' || user_choice == 'Y') {
                             std::cout << "Iter " << iter << "  t=" << physical_time << " s  T=" << T_current
-                                      << " K  F=" << total_F << "  Rbar=" << avg_rad << "  <S>=" << avg_S << std::endl;
+                                      << " K  F=" << total_F << " (bulk=" << bulk_sum << ", el=" << elastic_sum
+                                      << ", anch=" << anch_sum << ")  Rbar=" << avg_rad << "  <S>=" << avg_S << std::endl;
                         }
 
                         if (enable_early_stop && has_reached_final_T(iter)) {
@@ -1374,7 +1441,7 @@ int main() {
             if (fs::exists("output_temp_sweep")) fs::remove_all("output_temp_sweep");
             fs::create_directory("output_temp_sweep");
             std::ofstream sweep_log("output_temp_sweep/summary.dat");
-            sweep_log << "temperature,final_energy,average_S\n";
+            sweep_log << "temperature,final_energy_including_anchoring,average_S\n";
 
             double T_start = prompt_with_default("Start T", 295.0);
             double T_end = prompt_with_default("End T", 315.0);
@@ -1453,15 +1520,16 @@ int main() {
                     computeLaplacianKernel<<<numBlocks, threadsPerBlock>>>(d_Q, d_laplacianQ, Nx, Ny, Nz, dx, dy, dz);
                     if (L2 != 0.0) computeDivergenceKernel<<<numBlocks, threadsPerBlock>>>(d_Q, d_Dcol_x, d_Dcol_y, d_Dcol_z, Nx, Ny, Nz, dx, dy, dz);
                     computeChemicalPotentialKernel<<<numBlocks, threadsPerBlock>>>(d_Q, d_mu, d_laplacianQ, Nx, Ny, Nz, dx, dy, dz, params_temp, kappa, modechoice, d_Dcol_x, d_Dcol_y, d_Dcol_z);
-                    applyWeakAnchoringPenaltyKernel<<<numBlocks, threadsPerBlock>>>(d_mu, d_Q, Nx, Ny, Nz, d_is_shell, S_shell, W);
+                    const double shell_thickness = std::min({dx, dy, dz});
+                    applyWeakAnchoringPenaltyKernel<<<numBlocks, threadsPerBlock>>>(d_mu, d_Q, Nx, Ny, Nz, d_is_shell, S_shell, W, shell_thickness);
                     updateQTensorKernel<<<numBlocks, threadsPerBlock>>>(d_Q, d_mu, Nx, Ny, Nz, dt, d_is_shell, gamma, W);
                     applyBoundaryConditionsKernel<<<numBlocks, threadsPerBlock>>>(d_Q, Nx, Ny, Nz, d_is_shell, S_shell, W);
 
                     physical_time += dt;
                     
                     if (iter > 0 && iter % printFreq == 0) {
-                        auto [bulk_sum, elastic_sum] = reduce_energy(params_temp);
-                        double total_F = bulk_sum + elastic_sum;
+                        auto [bulk_sum, elastic_sum, anch_sum] = reduce_energy(params_temp, S_shell);
+                        double total_F = bulk_sum + elastic_sum + anch_sum;
                         std::cout << "  Iter " << iter << ", Free Energy: " << total_F << std::endl;
                         if (physical_time >= min_alignment_time) {
                             if (prev_F != 0.0 && (std::abs((total_F - prev_F) / prev_F) < tolerance || total_F == 0.0)) {
@@ -1481,8 +1549,8 @@ int main() {
                 cudaMemcpy(finalNF.data(), d_nf, num_elements * sizeof(NematicField), cudaMemcpyDeviceToHost);
                 cudaFree(d_nf);
 
-                auto [bulk_final, elastic_final] = reduce_energy(params_temp);
-                double final_F = bulk_final + elastic_final;
+                auto [bulk_final, elastic_final, anch_final] = reduce_energy(params_temp, S_shell);
+                double final_F = bulk_final + elastic_final + anch_final;
                 double avg_S = compute_avg_S_droplet(finalNF);
                 sweep_log << T_current << "," << final_F << "," << avg_S << "\n";
                 sweep_log.flush();
@@ -1560,14 +1628,15 @@ int main() {
                     computeLaplacianKernel<<<numBlocks, threadsPerBlock>>>(d_Q, d_laplacianQ, Nx, Ny, Nz, dx, dy, dz);
                     if (L2 != 0.0) computeDivergenceKernel<<<numBlocks, threadsPerBlock>>>(d_Q, d_Dcol_x, d_Dcol_y, d_Dcol_z, Nx, Ny, Nz, dx, dy, dz);
                     computeChemicalPotentialKernel<<<numBlocks, threadsPerBlock>>>(d_Q, d_mu, d_laplacianQ, Nx, Ny, Nz, dx, dy, dz, params, kappa, modechoice, d_Dcol_x, d_Dcol_y, d_Dcol_z);
-                    applyWeakAnchoringPenaltyKernel<<<numBlocks, threadsPerBlock>>>(d_mu, d_Q, Nx, Ny, Nz, d_is_shell, S_shell_single, W);
+                    const double shell_thickness = std::min({dx, dy, dz});
+                    applyWeakAnchoringPenaltyKernel<<<numBlocks, threadsPerBlock>>>(d_mu, d_Q, Nx, Ny, Nz, d_is_shell, S_shell_single, W, shell_thickness);
                     updateQTensorKernel<<<numBlocks, threadsPerBlock>>>(d_Q, d_mu, Nx, Ny, Nz, dt, d_is_shell, gamma, W);
                     applyBoundaryConditionsKernel<<<numBlocks, threadsPerBlock>>>(d_Q, Nx, Ny, Nz, d_is_shell, S_shell_single, W);
 
                     if (iter % printFreq == 0) {
                         computeRadialityKernel<<<numBlocks, threadsPerBlock>>>(d_Q, d_radiality_vals, d_count_vals, Nx, Ny, Nz);
-                        auto [bulk_sum, elastic_sum] = reduce_energy(params);
-                        double total_F = bulk_sum + elastic_sum;
+                        auto [bulk_sum, elastic_sum, anch_sum] = reduce_energy(params, S_shell_single);
+                        double total_F = bulk_sum + elastic_sum + anch_sum;
 
                         std::vector<double> h_rad(num_elements);
                         std::vector<int> h_count(num_elements);
@@ -1583,7 +1652,9 @@ int main() {
 
                         energy_log << iter << "," << total_F << "," << avg_rad << "," << physical_time << "\n";
                         if (user_choice == 'y' || user_choice == 'Y') {
-                            std::cout << "Iter " << iter << "  t=" << physical_time << " s" << "  F=" << total_F << "  R̄=" << avg_rad << std::endl;
+                            std::cout << "Iter " << iter << "  t=" << physical_time << " s" << "  F=" << total_F
+                                      << " (bulk=" << bulk_sum << ", el=" << elastic_sum << ", anch=" << anch_sum
+                                      << ")  R̄=" << avg_rad << std::endl;
                         }
 
                         NematicField* d_nf;
@@ -1616,21 +1687,22 @@ int main() {
                 energy_log.close();
             } else {
                 std::ofstream energy_components_log("energy_components_vs_iteration.dat");
-                energy_components_log << "iteration,bulk,elastic,total,radiality,time\n";
+                energy_components_log << "iteration,bulk,elastic,anchoring,total,radiality,time\n";
 
                 for (int iter = 0; iter < maxIterations; ++iter) {
                     physical_time += dt;
                     computeLaplacianKernel<<<numBlocks, threadsPerBlock>>>(d_Q, d_laplacianQ, Nx, Ny, Nz, dx, dy, dz);
                     if (L2 != 0.0) computeDivergenceKernel<<<numBlocks, threadsPerBlock>>>(d_Q, d_Dcol_x, d_Dcol_y, d_Dcol_z, Nx, Ny, Nz, dx, dy, dz);
                     computeChemicalPotentialKernel<<<numBlocks, threadsPerBlock>>>(d_Q, d_mu, d_laplacianQ, Nx, Ny, Nz, dx, dy, dz, params, kappa, modechoice, d_Dcol_x, d_Dcol_y, d_Dcol_z);
-                    applyWeakAnchoringPenaltyKernel<<<numBlocks, threadsPerBlock>>>(d_mu, d_Q, Nx, Ny, Nz, d_is_shell, S_shell_single, W);
+                    const double shell_thickness = std::min({dx, dy, dz});
+                    applyWeakAnchoringPenaltyKernel<<<numBlocks, threadsPerBlock>>>(d_mu, d_Q, Nx, Ny, Nz, d_is_shell, S_shell_single, W, shell_thickness);
                     updateQTensorKernel<<<numBlocks, threadsPerBlock>>>(d_Q, d_mu, Nx, Ny, Nz, dt, d_is_shell, gamma, W);
                     applyBoundaryConditionsKernel<<<numBlocks, threadsPerBlock>>>(d_Q, Nx, Ny, Nz, d_is_shell, S_shell_single, W);
 
                     if (iter % printFreq == 0) {
                         computeRadialityKernel<<<numBlocks, threadsPerBlock>>>(d_Q, d_radiality_vals, d_count_vals, Nx, Ny, Nz);
-                        auto [bulk_sum, elastic_sum] = reduce_energy(params);
-                        double total_F = bulk_sum + elastic_sum;
+                        auto [bulk_sum, elastic_sum, anch_sum] = reduce_energy(params, S_shell_single);
+                        double total_F = bulk_sum + elastic_sum + anch_sum;
 
                         std::vector<double> h_rad(num_elements);
                         std::vector<int> h_count(num_elements);
@@ -1644,9 +1716,12 @@ int main() {
                         }
                         double avg_rad = (rad_count > 0) ? total_rad / rad_count : 0.0;
 
-                        energy_components_log << iter << "," << bulk_sum << "," << elastic_sum << "," << total_F << "," << avg_rad << "," << physical_time << "\n";
+                        energy_components_log << iter << "," << bulk_sum << "," << elastic_sum << "," << anch_sum
+                                             << "," << total_F << "," << avg_rad << "," << physical_time << "\n";
                         if (user_choice == 'y' || user_choice == 'Y') {
-                            std::cout << "Iter " << iter << "  t=" << physical_time << " s" << "  F=" << total_F << "  R̄=" << avg_rad << std::endl;
+                            std::cout << "Iter " << iter << "  t=" << physical_time << " s" << "  F=" << total_F
+                                      << " (bulk=" << bulk_sum << ", el=" << elastic_sum << ", anch=" << anch_sum
+                                      << ")  R̄=" << avg_rad << std::endl;
                         }
 
                         NematicField* d_nf;
@@ -1692,7 +1767,7 @@ int main() {
         // Cleanup
         cudaFree(d_Q); cudaFree(d_laplacianQ); cudaFree(d_mu); cudaFree(d_is_shell);
         cudaFree(d_Dcol_x); cudaFree(d_Dcol_y); cudaFree(d_Dcol_z);
-        cudaFree(d_bulk_energy); cudaFree(d_elastic_energy);
+        cudaFree(d_bulk_energy); cudaFree(d_elastic_energy); cudaFree(d_anch_energy);
         cudaFree(d_radiality_vals); cudaFree(d_count_vals);
 
         std::cout << "\nSimulation finished." << std::endl;
