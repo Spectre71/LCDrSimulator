@@ -43,6 +43,46 @@ def prompt_pick_folder(
         raise FileNotFoundError(f"Path not found: {chosen}")
     return chosen
 
+
+def _parse_iter_window(s: str) -> tuple[int | None, int | None]:
+    """Parse an iteration window string like '50000:70000', ':70000', '50000:' or '50000-70000'."""
+    s = (s or '').strip()
+    if not s:
+        return None, None
+
+    # Support '-' as a separator if ':' isn't used.
+    if ':' not in s and '-' in s:
+        parts = s.split('-', 1)
+        s = f"{parts[0]}:{parts[1]}"
+
+    if ':' in s:
+        a, b = s.split(':', 1)
+        a = a.strip()
+        b = b.strip()
+        it_min = int(float(a)) if a else None
+        it_max = int(float(b)) if b else None
+    else:
+        it_min = int(float(s))
+        it_max = None
+
+    if it_min is not None and it_max is not None and it_min > it_max:
+        it_min, it_max = it_max, it_min
+    return it_min, it_max
+
+
+def _apply_iter_window(it: np.ndarray, *arrays: np.ndarray, it_min: int | None, it_max: int | None):
+    """Apply an iteration window to it and any parallel arrays."""
+    it = np.asarray(it, dtype=float)
+    m = np.ones_like(it, dtype=bool)
+    if it_min is not None:
+        m &= it >= float(it_min)
+    if it_max is not None:
+        m &= it <= float(it_max)
+    out = [it[m]]
+    for a in arrays:
+        out.append(np.asarray(a)[m])
+    return tuple(out)
+
 # Optional deps for 3D analysis (installed in venv when needed).
 # Keep them as Any so type-checkers don't get confused by conditional imports.
 ndi: Any = None
@@ -588,37 +628,60 @@ def _resolve_data_file(path_or_dir: str, filename: str) -> str:
 
 
 def plot_energy_VS_iter(path: str = '.', out_dir: str = 'pics', show: bool = True):
-    """Plot free energy vs iteration from free_energy_vs_iteration.dat.
+    """Plot free energy vs iteration.
 
-    `path` may be a directory (containing the dat file) or a direct file path.
+    Primary source: `free_energy_vs_iteration.dat`.
+    Fallback (for quench runs): `quench_log.dat/.csv` where we use `total` as F.
+
+    `path` may be a directory or a direct file path.
     """
     data_path = _resolve_data_file(path, 'free_energy_vs_iteration.dat')
-    if not os.path.exists(data_path):
-        raise FileNotFoundError(f"Missing file: {data_path}")
 
-    # Format: iteration,free_energy,radiality,time
-    data = np.genfromtxt(data_path, delimiter=',', names=True)
+    use_quench_log = not os.path.exists(data_path)
+    if use_quench_log:
+        # Quench runs usually only have quench_log.*
+        q, log_path = load_quench_log(path)
+        it = np.atleast_1d(q['iteration']).astype(float)
+        F = np.atleast_1d(q['total']).astype(float)
+        radial = np.atleast_1d(q['radiality']).astype(float)
+        time_s = np.atleast_1d(q['time_s']).astype(float)
+
+        m = np.isfinite(it) & np.isfinite(F) & np.isfinite(radial) & np.isfinite(time_s)
+        if not np.any(m):
+            raise ValueError(f"Quench log contains no finite rows: {log_path}")
+        it, F, radial, time_s = it[m], F[m], radial[m], time_s[m]
+        tag = os.path.basename(os.path.normpath(os.path.dirname(log_path) or '.'))
+        source_note = f"(from quench log: total)"
+    else:
+        # Format: iteration,free_energy,radiality,time
+        data = np.genfromtxt(data_path, delimiter=',', names=True)
+        it = np.asarray(data['iteration'], dtype=float)
+        F = np.asarray(data['free_energy'], dtype=float)
+        radial = np.asarray(data['radiality'], dtype=float)
+        time_s = np.asarray(data['time'], dtype=float)
+        tag = os.path.basename(os.path.normpath(os.path.dirname(data_path) or '.'))
+        source_note = ""
 
     # Create subplots for energy, radiality, and time
     fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(10, 8))
     
     # Plot 1: Free Energy vs Iteration
-    ax1.plot(data['iteration'], data['free_energy'], marker='o', linestyle='-', color='blue')
+    ax1.plot(it, F, marker='o', linestyle='-', color='blue')
     ax1.set_xlabel('$i$')
     ax1.set_ylabel('$F$ [J]', color='blue')
-    ax1.set_title('$F(i)$')
+    ax1.set_title(f'$F(i)$ {source_note}'.strip())
     ax1.tick_params(axis='y', labelcolor='blue')
     ax1.grid(True, alpha=0.3)
     
     # Plot radiality on secondary y-axis
     ax1_twin = ax1.twinx()
-    ax1_twin.plot(data['iteration'], data['radiality'], marker='s', linestyle='--', color='red', alpha=0.7)
+    ax1_twin.plot(it, radial, marker='s', linestyle='--', color='red', alpha=0.7)
     ax1_twin.set_ylabel(r'Radialnost $\overline{R}$', color='red')
     ax1_twin.tick_params(axis='y', labelcolor='red')
     ax1_twin.set_ylim([0, 1.05])
     
     # Plot 2: Physical Time vs Iteration
-    ax2.plot(data['iteration'], data['time'], marker='^', linestyle='-', color='green')
+    ax2.plot(it, time_s, marker='^', linestyle='-', color='green')
     ax2.set_xlabel('$i$')
     ax2.set_ylabel('$t$ [s]', color='green')
     ax2.set_title('$t(i)$')
@@ -627,7 +690,6 @@ def plot_energy_VS_iter(path: str = '.', out_dir: str = 'pics', show: bool = Tru
     
     fig.tight_layout()
     os.makedirs(out_dir, exist_ok=True)
-    tag = os.path.basename(os.path.normpath(os.path.dirname(data_path) or '.'))
     out_path = os.path.join(out_dir, f'free_energy_vs_iteration_{tag}.png')
     plt.savefig(out_path, dpi=150)
     print(f"Saved plot -> {out_path}")
@@ -690,6 +752,7 @@ def create_nematic_field_animation(
     arrowColor=None,
     arrows_per_axis=None,
     consistent_scale=True,
+    output_c=None,
 ):
     """Create a GIF from nematic field snapshots in a directory.
 
@@ -754,7 +817,8 @@ def create_nematic_field_animation(
     frame_paths = []
     for i, file in enumerate(files):
         frame_path = os.path.join(frames_dir, f'frame_{i:04d}.png')
-        print(f"  - Plotting {file} -> {frame_path}")
+        if output_c is not None and i % output_c == 0:
+            print(f"Generating frame {i+1}/{len(files)}: {frame_path}")
         plot_nematic_field_slice(
             file,
             Nx,
@@ -794,11 +858,103 @@ def create_nematic_field_animation(
 def plotS_F(path: str = 'output_temp_sweep', out_dir: str = 'pics', show: bool = True):
     """Plot average S(T) and final free energy F(T) from a temperature sweep summary.
 
-    `path` may be a directory containing summary.dat or a direct summary.dat path.
+    Primary source: output_temp_sweep/summary.dat.
+
+    Fallback (for quench runs): one or more quench logs (output_quench*/quench_log.*).
+    In fallback mode, we extract the *final* values per run:
+      T_final = last finite T_K
+      S_final = last finite avg_S
+      F_final = last finite total
+
+    `path` may be a directory containing summary.dat, a direct summary.dat path, a single
+    quench run directory, or a directory containing multiple output_quench* runs.
     """
     summary_path = _resolve_data_file(path, 'summary.dat')
     if not os.path.exists(summary_path):
-        print(f"Missing file: {summary_path}")
+        # Quench fallback: build S(T) and F(T) from the full quench_log across steps.
+        run_dirs: list[str] = []
+        # If the user passed a glob pattern, expand it.
+        if any(ch in (path or '') for ch in ('*', '?', '[')):
+            run_dirs = [p for p in glob.glob(path) if os.path.isdir(p)]
+        elif os.path.isdir(path):
+            # Single run directory?
+            try:
+                lp = _resolve_quench_log_path(path)
+                if os.path.exists(lp):
+                    run_dirs = [path]
+            except Exception:
+                run_dirs = []
+            # Or a parent directory containing multiple runs
+            if not run_dirs:
+                run_dirs = [p for p in glob.glob(os.path.join(path, 'output_quench*')) if os.path.isdir(p)]
+        elif os.path.isfile(path):
+            # Direct log file path
+            run_dirs = [path]
+
+        runs: list[tuple[str, np.ndarray, np.ndarray, np.ndarray]] = []
+        for rd in sorted(run_dirs):
+            try:
+                q, log_path = load_quench_log(rd)
+                it = np.atleast_1d(q['iteration']).astype(float)
+                Tq = np.atleast_1d(q['T_K']).astype(float)
+                Sq = np.atleast_1d(q['avg_S']).astype(float)
+                Fq = np.atleast_1d(q['total']).astype(float)
+                m = np.isfinite(it) & np.isfinite(Tq) & np.isfinite(Sq) & np.isfinite(Fq)
+                if np.count_nonzero(m) < 2:
+                    continue
+
+                it, Tq, Sq, Fq = it[m], Tq[m], Sq[m], Fq[m]
+                order = np.argsort(it)
+                Tq, Sq, Fq = Tq[order], Sq[order], Fq[order]
+                label = os.path.basename(os.path.normpath(os.path.dirname(log_path) or rd))
+                runs.append((label, Tq, Sq, Fq))
+            except Exception:
+                continue
+
+        if not runs:
+            print(f"Missing file: {summary_path}")
+            print("Also no quench logs found for fallback (expected output_quench*/quench_log.*).")
+            return
+
+        os.makedirs(out_dir, exist_ok=True)
+        tag = os.path.basename(os.path.normpath(path or '.'))
+        show_legend = len(runs) <= 8
+
+        plt.figure(figsize=(8, 5))
+        for label, Tq, Sq, _ in runs:
+            plt.plot(Tq, Sq, '-', lw=1.5, marker='o', ms=2.5, alpha=0.85, label=label)
+        plt.xlabel('$T$ [K]')
+        plt.ylabel('$S$')
+        plt.title(r'$\langle S\rangle(T)$ from quench log')
+        plt.grid(True)
+        if show_legend:
+            plt.legend()
+        plt.tight_layout()
+        out1 = os.path.join(out_dir, f'average_S_vs_T_quenchlog_{tag}.png')
+        plt.savefig(out1)
+        print(f"Saved plot -> {out1}")
+        if show:
+            plt.show()
+        else:
+            plt.close()
+
+        plt.figure(figsize=(8, 5))
+        for label, Tq, _, Fq in runs:
+            plt.plot(Tq, Fq, '-', lw=1.5, marker='s', ms=2.5, alpha=0.85, label=label)
+        plt.xlabel('$T$ [K]')
+        plt.ylabel('$F$')
+        plt.title('$F(T)$ from quench log (total energy)')
+        plt.grid(True)
+        if show_legend:
+            plt.legend()
+        plt.tight_layout()
+        out2 = os.path.join(out_dir, f'free_energy_vs_T_quenchlog_{tag}.png')
+        plt.savefig(out2)
+        print(f"Saved plot -> {out2}")
+        if show:
+            plt.show()
+        else:
+            plt.close()
         return
 
     # Avoid numpy genfromtxt crashing on empty/header-only files (common if sweep is interrupted)
@@ -869,7 +1025,14 @@ def plotS_F(path: str = 'output_temp_sweep', out_dir: str = 'pics', show: bool =
         plt.close()
 
 
-def plot_quench_energy_vs_iteration(path: str = 'output_quench', out_dir: str = 'pics', show: bool = True):
+def plot_quench_energy_vs_iteration(
+    path: str = 'output_quench',
+    out_dir: str = 'pics',
+    show: bool = True,
+    *,
+    it_min: int | None = None,
+    it_max: int | None = None,
+):
     """Plot quench energy components vs iteration (separate, cleaner figure)."""
     data, log_path = load_quench_log(path)
     it = np.atleast_1d(data['iteration']).astype(float)
@@ -882,6 +1045,10 @@ def plot_quench_energy_vs_iteration(path: str = 'output_quench', out_dir: str = 
         raise ValueError(f"Quench log contains no finite energy rows: {log_path}")
     it, bulk, elastic, total = it[m], bulk[m], elastic[m], total[m]
 
+    it, bulk, elastic, total = _apply_iter_window(it, bulk, elastic, total, it_min=it_min, it_max=it_max)
+    if it.size < 2:
+        raise ValueError("Selected iteration window has <2 points to plot.")
+
     os.makedirs(out_dir, exist_ok=True)
     tag = os.path.basename(os.path.normpath(os.path.dirname(log_path) or '.'))
 
@@ -891,12 +1058,22 @@ def plot_quench_energy_vs_iteration(path: str = 'output_quench', out_dir: str = 
     ax.plot(it, elastic, '--', lw=1.5, label='elastic')
     ax.set_xlabel('iteration')
     ax.set_ylabel('Energy')
-    ax.set_title(f'Quench energies vs iteration ({tag})')
+    win = ''
+    if it_min is not None or it_max is not None:
+        a = str(it_min) if it_min is not None else ''
+        b = str(it_max) if it_max is not None else ''
+        win = f' [{a}:{b}]'
+    ax.set_title(f'Quench energies vs iteration ({tag}){win}')
     ax.grid(True, alpha=0.3)
     ax.legend()
     fig.tight_layout()
 
-    out_path = os.path.join(out_dir, f'quench_energies_vs_iteration_{tag}.png')
+    suffix = ''
+    if it_min is not None or it_max is not None:
+        a = str(it_min) if it_min is not None else ''
+        b = str(it_max) if it_max is not None else ''
+        suffix = f'_iter_{a}_{b}'
+    out_path = os.path.join(out_dir, f'quench_energies_vs_iteration_{tag}{suffix}.png')
     fig.savefig(out_path, dpi=200)
     print(f"Saved quench energy plot -> {out_path}")
     if show:
@@ -906,7 +1083,14 @@ def plot_quench_energy_vs_iteration(path: str = 'output_quench', out_dir: str = 
     return out_path
 
 
-def plot_quench_order_vs_iteration(path: str = 'output_quench', out_dir: str = 'pics', show: bool = True):
+def plot_quench_order_vs_iteration(
+    path: str = 'output_quench',
+    out_dir: str = 'pics',
+    show: bool = True,
+    *,
+    it_min: int | None = None,
+    it_max: int | None = None,
+):
     """Plot quench average order parameter <S> vs iteration (separate, cleaner figure)."""
     data, log_path = load_quench_log(path)
     it = np.atleast_1d(data['iteration']).astype(float)
@@ -917,6 +1101,10 @@ def plot_quench_order_vs_iteration(path: str = 'output_quench', out_dir: str = '
         raise ValueError(f"Quench log contains no finite avg_S rows: {log_path}")
     it, avgS = it[m], avgS[m]
 
+    it, avgS = _apply_iter_window(it, avgS, it_min=it_min, it_max=it_max)
+    if it.size < 2:
+        raise ValueError("Selected iteration window has <2 points to plot.")
+
     os.makedirs(out_dir, exist_ok=True)
     tag = os.path.basename(os.path.normpath(os.path.dirname(log_path) or '.'))
 
@@ -924,13 +1112,155 @@ def plot_quench_order_vs_iteration(path: str = 'output_quench', out_dir: str = '
     ax.plot(it, avgS, '-', lw=2)
     ax.set_xlabel('iteration')
     ax.set_ylabel('<S> (droplet)')
-    ax.set_title(f'Average order parameter vs iteration ({tag})')
+    win = ''
+    if it_min is not None or it_max is not None:
+        a = str(it_min) if it_min is not None else ''
+        b = str(it_max) if it_max is not None else ''
+        win = f' [{a}:{b}]'
+    ax.set_title(f'Average order parameter vs iteration ({tag}){win}')
     ax.grid(True, alpha=0.3)
     fig.tight_layout()
 
-    out_path = os.path.join(out_dir, f'quench_avgS_vs_iteration_{tag}.png')
+    suffix = ''
+    if it_min is not None or it_max is not None:
+        a = str(it_min) if it_min is not None else ''
+        b = str(it_max) if it_max is not None else ''
+        suffix = f'_iter_{a}_{b}'
+    out_path = os.path.join(out_dir, f'quench_avgS_vs_iteration_{tag}{suffix}.png')
     fig.savefig(out_path, dpi=200)
     print(f"Saved quench <S> plot -> {out_path}")
+    if show:
+        plt.show()
+    else:
+        plt.close(fig)
+    return out_path
+
+
+def plot_quench_energy_deltas(
+    path: str = 'output_quench',
+    out_dir: str = 'pics',
+    show: bool = True,
+    *,
+    it_min: int | None = None,
+    it_max: int | None = None,
+    top_k: int = 6,
+):
+    """Plot per-log-step energy changes to detect short energetic events.
+
+    Why useful:
+    - Defect annihilation can be highly localized/fast, so the *absolute* total energy
+      curve may look smooth while the *step-to-step change* (ΔE) shows sharp spikes.
+    - The signal typically appears strongest in the elastic part.
+
+    Produces a figure with:
+    - Signed ΔE (symlog) vs iteration
+    - |ΔE| (log) vs iteration (if possible)
+    """
+    data, log_path = load_quench_log(path)
+    it = np.atleast_1d(data['iteration']).astype(float)
+    bulk = np.atleast_1d(data['bulk']).astype(float)
+    elastic = np.atleast_1d(data['elastic']).astype(float)
+    total = np.atleast_1d(data['total']).astype(float)
+
+    m = np.isfinite(it) & np.isfinite(bulk) & np.isfinite(elastic) & np.isfinite(total)
+    if not np.any(m):
+        raise ValueError(f"Quench log contains no finite energy rows: {log_path}")
+    it, bulk, elastic, total = it[m], bulk[m], elastic[m], total[m]
+
+    it, bulk, elastic, total = _apply_iter_window(it, bulk, elastic, total, it_min=it_min, it_max=it_max)
+    if it.size < 3:
+        raise ValueError("Selected iteration window has <3 points; need at least 2 deltas.")
+
+    d_total = np.diff(total)
+    d_bulk = np.diff(bulk)
+    d_elastic = np.diff(elastic)
+    it_d = it[1:]
+
+    # Print candidate "events" (largest step-to-step changes) to help locate annihilation.
+    # These are good first guesses to inspect snapshots around (iter-Δ, iter).
+    def _print_top(label: str, itx: np.ndarray, dx: np.ndarray, k: int):
+        k = int(k)
+        if k <= 0:
+            return
+        a = np.abs(dx)
+        m2 = np.isfinite(itx) & np.isfinite(a)
+        if np.count_nonzero(m2) == 0:
+            return
+        itx2 = itx[m2]
+        dx2 = dx[m2]
+        a2 = a[m2]
+        k2 = min(k, a2.size)
+        idxs = np.argpartition(a2, -k2)[-k2:]
+        idxs = idxs[np.argsort(a2[idxs])[::-1]]
+        print(f"Top {k2} |Δ{label}| candidates (iteration, Δ{label}):")
+        for j in idxs:
+            print(f"  iter={int(itx2[j])}  Δ{label}={dx2[j]:.6g}")
+
+    print("[ΔE detector] Largest step changes are good candidates for fast/local events (e.g., defect annihilation).")
+    _print_top('elastic', it_d, d_elastic, top_k)
+    _print_top('total', it_d, d_total, max(3, int(top_k // 2)))
+
+    os.makedirs(out_dir, exist_ok=True)
+    tag = os.path.basename(os.path.normpath(os.path.dirname(log_path) or '.'))
+
+    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(11, 7), sharex=True)
+
+    # Signed deltas: symlog keeps sign while showing spikes
+    ax1.plot(it_d, d_total, '-', lw=1.8, label='Δ total')
+    ax1.plot(it_d, d_bulk, '--', lw=1.4, label='Δ bulk')
+    ax1.plot(it_d, d_elastic, '--', lw=1.4, label='Δ elastic')
+    ax1.axhline(0.0, color='k', lw=0.8, alpha=0.5)
+    ax1.set_ylabel('ΔE')
+    ax1.set_yscale('symlog', linthresh=max(1e-16, float(np.nanmedian(np.abs(d_total))) if np.isfinite(np.nanmedian(np.abs(d_total))) else 1e-12))
+    ax1.grid(True, alpha=0.25)
+    ax1.legend(loc='best')
+
+    # Absolute deltas: log scale if there are positive finite values
+    a_total = np.abs(d_total)
+    a_bulk = np.abs(d_bulk)
+    a_elastic = np.abs(d_elastic)
+    ax2.plot(it_d, a_total, '-', lw=1.8, label='|Δ total|')
+    ax2.plot(it_d, a_bulk, '--', lw=1.4, label='|Δ bulk|')
+    ax2.plot(it_d, a_elastic, '--', lw=1.4, label='|Δ elastic|')
+    ax2.set_xlabel('iteration')
+    ax2.set_ylabel('|ΔE|')
+    ax2.grid(True, alpha=0.25)
+
+    any_pos = np.any(np.isfinite(a_total) & (a_total > 0)) or np.any(np.isfinite(a_elastic) & (a_elastic > 0))
+    if any_pos:
+        ax2.set_yscale('log')
+        # Set safe limits to avoid ticker overflow
+        vals = np.concatenate([
+            a_total[np.isfinite(a_total) & (a_total > 0)],
+            a_bulk[np.isfinite(a_bulk) & (a_bulk > 0)],
+            a_elastic[np.isfinite(a_elastic) & (a_elastic > 0)],
+        ])
+        if vals.size:
+            vmin = float(np.nanmin(vals))
+            vmax = float(np.nanmax(vals))
+            if np.isfinite(vmin) and np.isfinite(vmax) and vmin > 0 and vmax > 0:
+                ax2.set_ylim(vmin * 0.8, vmax * 1.2)
+
+    win = ''
+    if it_min is not None or it_max is not None:
+        a = str(it_min) if it_min is not None else ''
+        b = str(it_max) if it_max is not None else ''
+        win = f' [{a}:{b}]'
+    fig.suptitle(
+        f"Defect fusion detection\n"
+        f"Run: {tag}{win}"
+    )
+    fig.tight_layout(rect=(0, 0, 1, 0.93))
+
+    suffix = ''
+    if it_min is not None or it_max is not None:
+        a = str(it_min) if it_min is not None else ''
+        b = str(it_max) if it_max is not None else ''
+        suffix = f'_iter_{a}_{b}'
+    out_path = os.path.join(out_dir, f'quench_energy_deltas_{tag}{suffix}.png')
+    fig.savefig(out_path, dpi=200)
+    print(f"Saved quench energy-deltas plot -> {out_path}")
+
     if show:
         plt.show()
     else:
@@ -974,7 +1304,14 @@ def load_quench_log(path: str = 'output_quench'):
     return data, log_path
 
 
-def plot_quench_log(path: str = 'output_quench', out_dir: str = 'pics', show: bool = True):
+def plot_quench_log(
+    path: str = 'output_quench',
+    out_dir: str = 'pics',
+    show: bool = True,
+    *,
+    it_min: int | None = None,
+    it_max: int | None = None,
+):
     """Plot quench diagnostics: T(t), energy components, total energy, radiality, and <S>.
 
     Saves a summary figure to pics/quench_summary.png (and also returns (fig, axes)).
@@ -1007,6 +1344,12 @@ def plot_quench_log(path: str = 'output_quench', out_dir: str = 'pics', show: bo
     it, t, T = it[m], t[m], T[m]
     bulk, elastic, total = bulk[m], elastic[m], total[m]
     radial, avgS = radial[m], avgS[m]
+
+    it, t, T, bulk, elastic, total, radial, avgS = _apply_iter_window(
+        it, t, T, bulk, elastic, total, radial, avgS, it_min=it_min, it_max=it_max
+    )
+    if it.size < 2:
+        raise ValueError("Selected iteration window has <2 points to plot.")
 
     # Relative energy change between consecutive log points
     rel_dF = np.full_like(total, np.nan)
@@ -1072,10 +1415,20 @@ def plot_quench_log(path: str = 'output_quench', out_dir: str = 'pics', show: bo
     axS.grid(True, alpha=0.3)
 
     base = os.path.basename(log_path)
-    fig.suptitle(f"Quench log: {base}")
+    win = ''
+    if it_min is not None or it_max is not None:
+        a = str(it_min) if it_min is not None else ''
+        b = str(it_max) if it_max is not None else ''
+        win = f"  [iter {a}:{b}]"
+    fig.suptitle(f"Quench log: {base}{win}")
     fig.tight_layout(rect=(0, 0, 1, 0.96))
 
-    out_path = os.path.join(out_dir, 'quench_summary.png')
+    suffix = ''
+    if it_min is not None or it_max is not None:
+        a = str(it_min) if it_min is not None else ''
+        b = str(it_max) if it_max is not None else ''
+        suffix = f'_iter_{a}_{b}'
+    out_path = os.path.join(out_dir, f'quench_summary{suffix}.png')
     fig.savefig(out_path, dpi=200)
     print(f"Saved quench summary plot -> {out_path}")
 
@@ -3340,7 +3693,7 @@ if __name__ == '__main__':
         print("\nPlotting Free Energy vs Iteration...")
         try:
             in_path = prompt_pick_folder(
-                prompt="Folder (or file) containing free_energy_vs_iteration.dat",
+                prompt="Folder/file for energy-vs-iteration (free_energy_vs_iteration.dat or output_quench*/quench_log.*)",
                 default='.',
                 pattern='*',
                 must_exist=True,
@@ -3359,9 +3712,9 @@ if __name__ == '__main__':
         print("\nPlotting Average S and Free Energy vs Temperature...")
         try:
             in_path = prompt_pick_folder(
-                prompt="Temperature sweep folder (or summary.dat path)",
+                prompt="Folder/file for S(T),F(T) (output_temp_sweep/summary.dat OR output_quench*/quench_log.*)",
                 default='output_temp_sweep',
-                pattern='output_temp_sweep*',
+                pattern='output_*',
                 must_exist=True,
             )
             plotS_F(in_path, out_dir='pics', show=True)
@@ -3389,7 +3742,12 @@ if __name__ == '__main__':
         print("\nPlotting quench log...")
         try:
             mode = input(
-                "Choose quench plot: (s) summary vs time, (2) energies vs iteration, (4) <S> vs iteration, (a) all "
+                "Choose quench plot:\n"
+                "  (s) summary vs time\n"
+                "  (2) energies vs iteration\n"
+                "  (4) <S> vs iteration\n"
+                "  (d) energy deltas (ΔE per log step) — useful for defect-annihilation analysis: spikes often show up in Δelastic even when total looks smooth\n"
+                "  (a) all\n"
                 "[default: s]: "
             ).strip().lower()
             if not mode:
@@ -3402,12 +3760,17 @@ if __name__ == '__main__':
                 must_exist=True,
             )
 
+            win_in = input("Iteration window min:max (blank=all, examples: 50000:70000, :70000, 50000:) [default: all]: ").strip()
+            it_min, it_max = _parse_iter_window(win_in)
+
             if mode in ('s', 'a'):
-                plot_quench_log(in_path, out_dir='pics', show=True)
+                plot_quench_log(in_path, out_dir='pics', show=True, it_min=it_min, it_max=it_max)
             if mode in ('2', 'a'):
-                plot_quench_energy_vs_iteration(in_path, out_dir='pics', show=True)
+                plot_quench_energy_vs_iteration(in_path, out_dir='pics', show=True, it_min=it_min, it_max=it_max)
             if mode in ('4', 'a'):
-                plot_quench_order_vs_iteration(in_path, out_dir='pics', show=True)
+                plot_quench_order_vs_iteration(in_path, out_dir='pics', show=True, it_min=it_min, it_max=it_max)
+            if mode in ('d', 'a'):
+                plot_quench_energy_deltas(in_path, out_dir='pics', show=True, it_min=it_min, it_max=it_max)
         except Exception as e:
             print(f"Error plotting quench log: {e}")
     elif i == 7:
@@ -3465,6 +3828,11 @@ if __name__ == '__main__':
             arrows_per_axis = 20
 
         try:
+            output_c=input("Per how many itterations do you want output in the console? (default: 10): ").strip()
+            if not output_c:
+                output_c = 10
+            else:
+                output_c = int(output_c)
             create_nematic_field_animation(
                 data_dir=data_dir,
                 output_gif=out_gif,
@@ -3478,6 +3846,7 @@ if __name__ == '__main__':
                 arrowColor='black',
                 arrows_per_axis=arrows_per_axis,
                 consistent_scale=True,
+                output_c=output_c,
             )
         except Exception as e:
             print(f"Error creating quench animation: {e}")
