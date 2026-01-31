@@ -306,7 +306,7 @@ double computeTotalFreeEnergy(const std::vector<QTensor>& Q, int Nx, int Ny, int
     }
 
     // Check if we are using anisotropic elastic constants
-    bool using_anisotropic = (params.L1 != 0.0 || params.L2 != 0.0);
+    bool using_anisotropic = (params.L1 != 0.0 || params.L2 != 0.0 || params.L3 != 0.0);
 
     #pragma omp parallel for collapse(3) reduction(+:total_energy)
     for (int i = 1; i < Nx-1; ++i) {
@@ -378,8 +378,28 @@ double computeTotalFreeEnergy(const std::vector<QTensor>& Q, int Nx, int Ny, int
                     double divQ_y = get_div(1);
                     double divQ_z = get_div(2);
                     double fel_L2 = 0.5 * params.L2 * (divQ_x*divQ_x + divQ_y*divQ_y + divQ_z*divQ_z);
-                    
-                    f_elastic = fel_L1 + fel_L2;
+
+                    double fel_L3 = 0.0;
+                    if (params.L3 != 0.0) {
+                        const double M_xx = dQxx[0]*dQxx[0] + dQyy[0]*dQyy[0] + dQzz[0]*dQzz[0]
+                                          + 2.0*(dQxy[0]*dQxy[0] + dQxz[0]*dQxz[0] + dQyz[0]*dQyz[0]);
+                        const double M_yy = dQxx[1]*dQxx[1] + dQyy[1]*dQyy[1] + dQzz[1]*dQzz[1]
+                                          + 2.0*(dQxy[1]*dQxy[1] + dQxz[1]*dQxz[1] + dQyz[1]*dQyz[1]);
+                        const double M_zz = dQxx[2]*dQxx[2] + dQyy[2]*dQyy[2] + dQzz[2]*dQzz[2]
+                                          + 2.0*(dQxy[2]*dQxy[2] + dQxz[2]*dQxz[2] + dQyz[2]*dQyz[2]);
+
+                        const double M_xy = dQxx[0]*dQxx[1] + dQyy[0]*dQyy[1] + dQzz[0]*dQzz[1]
+                                          + 2.0*(dQxy[0]*dQxy[1] + dQxz[0]*dQxz[1] + dQyz[0]*dQyz[1]);
+                        const double M_xz = dQxx[0]*dQxx[2] + dQyy[0]*dQyy[2] + dQzz[0]*dQzz[2]
+                                          + 2.0*(dQxy[0]*dQxy[2] + dQxz[0]*dQxz[2] + dQyz[0]*dQyz[2]);
+                        const double M_yz = dQxx[1]*dQxx[2] + dQyy[1]*dQyy[2] + dQzz[1]*dQzz[2]
+                                          + 2.0*(dQxy[1]*dQxy[2] + dQxz[1]*dQxz[2] + dQyz[1]*dQyz[2]);
+
+                        fel_L3 = 0.5 * params.L3 * (q.Qxx * M_xx + q.Qyy * M_yy + q.Qzz * M_zz
+                                                 + 2.0*(q.Qxy * M_xy + q.Qxz * M_xz + q.Qyz * M_yz));
+                    }
+
+                    f_elastic = fel_L1 + fel_L2 + fel_L3;
                 }
                 total_energy += (f_bulk + f_elastic) * (dx * dy * dz);
             }
@@ -418,7 +438,7 @@ EnergyComponents computeEnergyComponents(const std::vector<QTensor>& Q, int Nx, 
         modechoice = 1;
     }
     // Check if we are using anisotropic elastic constants
-    bool using_anisotropic = (params.L1 != 0.0 || params.L2 != 0.0);
+    bool using_anisotropic = (params.L1 != 0.0 || params.L2 != 0.0 || params.L3 != 0.0);
     
     // Pre-calculate inverse steps
     const double inv_2dx = 1.0 / (2.0 * dx);
@@ -501,8 +521,28 @@ EnergyComponents computeEnergyComponents(const std::vector<QTensor>& Q, int Nx, 
                     double divQ_z = get_div(2);
 
                     double fel_L2 = 0.5 * params.L2 * (divQ_x*divQ_x + divQ_y*divQ_y + divQ_z*divQ_z);
-                    
-                    f_elastic = fel_L1 + fel_L2;
+
+                    double fel_L3 = 0.0;
+                    if (params.L3 != 0.0) {
+                        const double M_xx = dQxx[0]*dQxx[0] + dQyy[0]*dQyy[0] + dQzz[0]*dQzz[0]
+                                          + 2.0*(dQxy[0]*dQxy[0] + dQxz[0]*dQxz[0] + dQyz[0]*dQyz[0]);
+                        const double M_yy = dQxx[1]*dQxx[1] + dQyy[1]*dQyy[1] + dQzz[1]*dQzz[1]
+                                          + 2.0*(dQxy[1]*dQxy[1] + dQxz[1]*dQxz[1] + dQyz[1]*dQyz[1]);
+                        const double M_zz = dQxx[2]*dQxx[2] + dQyy[2]*dQyy[2] + dQzz[2]*dQzz[2]
+                                          + 2.0*(dQxy[2]*dQxy[2] + dQxz[2]*dQxz[2] + dQyz[2]*dQyz[2]);
+
+                        const double M_xy = dQxx[0]*dQxx[1] + dQyy[0]*dQyy[1] + dQzz[0]*dQzz[1]
+                                          + 2.0*(dQxy[0]*dQxy[1] + dQxz[0]*dQxz[1] + dQyz[0]*dQyz[1]);
+                        const double M_xz = dQxx[0]*dQxx[2] + dQyy[0]*dQyy[2] + dQzz[0]*dQzz[2]
+                                          + 2.0*(dQxy[0]*dQxy[2] + dQxz[0]*dQxz[2] + dQyz[0]*dQyz[2]);
+                        const double M_yz = dQxx[1]*dQxx[2] + dQyy[1]*dQyy[2] + dQzz[1]*dQzz[2]
+                                          + 2.0*(dQxy[1]*dQxy[2] + dQxz[1]*dQxz[2] + dQyz[1]*dQyz[2]);
+
+                        fel_L3 = 0.5 * params.L3 * (q.Qxx * M_xx + q.Qyy * M_yy + q.Qzz * M_zz
+                                                 + 2.0*(q.Qxy * M_xy + q.Qxz * M_xz + q.Qyz * M_yz));
+                    }
+
+                    f_elastic = fel_L1 + fel_L2 + fel_L3;
                 }
 
                 // accumulate to scalar
@@ -540,8 +580,9 @@ void computeChemicalPotential(const std::vector<QTensor>& Q, std::vector<QTensor
         modechoice = 1;
     }
 
-    // Precompute divergence of columns D_j = ∂k Q_kj ONLY if L2 is active
-    bool use_L2 = (params.L2 != 0.0);
+    // Precompute divergence of columns D_j = ∂k Q_kj if needed (L2 or L3 term).
+    const bool use_L2 = (params.L2 != 0.0);
+    const bool need_Dcol = (params.L2 != 0.0 || params.L3 != 0.0);
     std::vector<double> Dcol_x, Dcol_y, Dcol_z;
     
     const double inv_2dx = 1.0 / (2.0 * dx);
@@ -551,7 +592,7 @@ void computeChemicalPotential(const std::vector<QTensor>& Q, std::vector<QTensor
     const double inv_dy = 1.0 / dy;
     const double inv_dz = 1.0 / dz;
 
-    if (use_L2) {
+    if (need_Dcol) {
         Dcol_x.resize(Nx*Ny*Nz); Dcol_y.resize(Nx*Ny*Nz); Dcol_z.resize(Nx*Ny*Nz);
         #pragma omp parallel for collapse(3)
         for (int i = 0; i < Nx; ++i) {
@@ -617,7 +658,7 @@ void computeChemicalPotential(const std::vector<QTensor>& Q, std::vector<QTensor
                 double h_yz = coeff_Q * q.Qyz - coeff_Q2 * q2.Qyz + coeff_Q3 * trQ2 * q.Qyz;
 
                 // Legacy Kappa Term (Only if L1==0 && L2==0)
-                if (params.L1 == 0.0 && params.L2 == 0.0) {
+                if (params.L1 == 0.0 && params.L2 == 0.0 && params.L3 == 0.0) {
                     h_xx -= kappa * lap_q.Qxx;
                     h_yy -= kappa * lap_q.Qyy;
                     h_zz -= kappa * (-lap_q.Qxx - lap_q.Qyy);
@@ -654,6 +695,121 @@ void computeChemicalPotential(const std::vector<QTensor>& Q, std::vector<QTensor
                     h_xy -= params.L2 * (dDy_dx + dDx_dy);
                     h_xz -= params.L2 * (dDz_dx + dDx_dz);
                     h_yz -= params.L2 * (dDz_dy + dDy_dz);
+                }
+
+                if (params.L3 != 0.0) {
+                    // L3 term:
+                    //   f3 = (L3/2) Qij (∂i Qkl)(∂j Qkl)
+                    // δF/δQmn = (L3/2) M_mn - L3 ∂i( Qij ∂j Qmn )
+                    // where M_ij = (∂i Qkl)(∂j Qkl).
+                    // We evaluate the second term with central differences in the interior.
+
+                    if (i > 0 && i < Nx - 1 && j > 0 && j < Ny - 1 && k > 0 && k < Nz - 1) {
+                        const double inv_dx2 = 1.0 / (dx * dx);
+                        const double inv_dy2 = 1.0 / (dy * dy);
+                        const double inv_dz2 = 1.0 / (dz * dz);
+                        const double inv_4dxdy = 1.0 / (4.0 * dx * dy);
+                        const double inv_4dxdz = 1.0 / (4.0 * dx * dz);
+                        const double inv_4dydz = 1.0 / (4.0 * dy * dz);
+
+                        auto get_comp = [&](int id2, int comp) -> double {
+                            const QTensor& qq = Q[id2];
+                            if (comp == 0) return qq.Qxx;
+                            if (comp == 1) return qq.Qxy;
+                            if (comp == 2) return qq.Qxz;
+                            if (comp == 3) return qq.Qyy;
+                            if (comp == 4) return qq.Qyz;
+                            return -(qq.Qxx + qq.Qyy); // Qzz
+                        };
+
+                        // First derivatives (central, since we are in the interior)
+                        const int id_xp = idx(i + 1, j, k);
+                        const int id_xm = idx(i - 1, j, k);
+                        const int id_yp = idx(i, j + 1, k);
+                        const int id_ym = idx(i, j - 1, k);
+                        const int id_zp = idx(i, j, k + 1);
+                        const int id_zm = idx(i, j, k - 1);
+
+                        const double dQxx_dx = (Q[id_xp].Qxx - Q[id_xm].Qxx) * inv_2dx;
+                        const double dQxx_dy = (Q[id_yp].Qxx - Q[id_ym].Qxx) * inv_2dy;
+                        const double dQxx_dz = (Q[id_zp].Qxx - Q[id_zm].Qxx) * inv_2dz;
+
+                        const double dQyy_dx = (Q[id_xp].Qyy - Q[id_xm].Qyy) * inv_2dx;
+                        const double dQyy_dy = (Q[id_yp].Qyy - Q[id_ym].Qyy) * inv_2dy;
+                        const double dQyy_dz = (Q[id_zp].Qyy - Q[id_zm].Qyy) * inv_2dz;
+
+                        const double dQxy_dx = (Q[id_xp].Qxy - Q[id_xm].Qxy) * inv_2dx;
+                        const double dQxy_dy = (Q[id_yp].Qxy - Q[id_ym].Qxy) * inv_2dy;
+                        const double dQxy_dz = (Q[id_zp].Qxy - Q[id_zm].Qxy) * inv_2dz;
+
+                        const double dQxz_dx = (Q[id_xp].Qxz - Q[id_xm].Qxz) * inv_2dx;
+                        const double dQxz_dy = (Q[id_yp].Qxz - Q[id_ym].Qxz) * inv_2dy;
+                        const double dQxz_dz = (Q[id_zp].Qxz - Q[id_zm].Qxz) * inv_2dz;
+
+                        const double dQyz_dx = (Q[id_xp].Qyz - Q[id_xm].Qyz) * inv_2dx;
+                        const double dQyz_dy = (Q[id_yp].Qyz - Q[id_ym].Qyz) * inv_2dy;
+                        const double dQyz_dz = (Q[id_zp].Qyz - Q[id_zm].Qyz) * inv_2dz;
+
+                        const double dQzz_dx = -(dQxx_dx + dQyy_dx);
+                        const double dQzz_dy = -(dQxx_dy + dQyy_dy);
+                        const double dQzz_dz = -(dQxx_dz + dQyy_dz);
+
+                        // M_ij = (∂i Qkl)(∂j Qkl)
+                        const double M_xx = dQxx_dx*dQxx_dx + dQyy_dx*dQyy_dx + dQzz_dx*dQzz_dx
+                                          + 2.0*(dQxy_dx*dQxy_dx + dQxz_dx*dQxz_dx + dQyz_dx*dQyz_dx);
+                        const double M_yy = dQxx_dy*dQxx_dy + dQyy_dy*dQyy_dy + dQzz_dy*dQzz_dy
+                                          + 2.0*(dQxy_dy*dQxy_dy + dQxz_dy*dQxz_dy + dQyz_dy*dQyz_dy);
+                        const double M_zz = dQxx_dz*dQxx_dz + dQyy_dz*dQyy_dz + dQzz_dz*dQzz_dz
+                                          + 2.0*(dQxy_dz*dQxy_dz + dQxz_dz*dQxz_dz + dQyz_dz*dQyz_dz);
+
+                        const double M_xy = dQxx_dx*dQxx_dy + dQyy_dx*dQyy_dy + dQzz_dx*dQzz_dy
+                                          + 2.0*(dQxy_dx*dQxy_dy + dQxz_dx*dQxz_dy + dQyz_dx*dQyz_dy);
+                        const double M_xz = dQxx_dx*dQxx_dz + dQyy_dx*dQyy_dz + dQzz_dx*dQzz_dz
+                                          + 2.0*(dQxy_dx*dQxy_dz + dQxz_dx*dQxz_dz + dQyz_dx*dQyz_dz);
+                        const double M_yz = dQxx_dy*dQxx_dz + dQyy_dy*dQyy_dz + dQzz_dy*dQzz_dz
+                                          + 2.0*(dQxy_dy*dQxy_dz + dQxz_dy*dQxz_dz + dQyz_dy*dQyz_dz);
+
+                        h_xx += 0.5 * params.L3 * M_xx;
+                        h_yy += 0.5 * params.L3 * M_yy;
+                        h_zz += 0.5 * params.L3 * M_zz;
+                        h_xy += 0.5 * params.L3 * M_xy;
+                        h_xz += 0.5 * params.L3 * M_xz;
+                        h_yz += 0.5 * params.L3 * M_yz;
+
+                        auto compute_B_for_comp = [&](int comp, double dQ_dx, double dQ_dy, double dQ_dz) -> double {
+                            const double Qc = get_comp(id, comp);
+
+                            const double d2_xx = (get_comp(id_xp, comp) - 2.0*Qc + get_comp(id_xm, comp)) * inv_dx2;
+                            const double d2_yy = (get_comp(id_yp, comp) - 2.0*Qc + get_comp(id_ym, comp)) * inv_dy2;
+                            const double d2_zz = (get_comp(id_zp, comp) - 2.0*Qc + get_comp(id_zm, comp)) * inv_dz2;
+
+                            const double d2_xy = (get_comp(idx(i + 1, j + 1, k), comp) - get_comp(idx(i + 1, j - 1, k), comp)
+                                                - get_comp(idx(i - 1, j + 1, k), comp) + get_comp(idx(i - 1, j - 1, k), comp)) * inv_4dxdy;
+                            const double d2_xz = (get_comp(idx(i + 1, j, k + 1), comp) - get_comp(idx(i + 1, j, k - 1), comp)
+                                                - get_comp(idx(i - 1, j, k + 1), comp) + get_comp(idx(i - 1, j, k - 1), comp)) * inv_4dxdz;
+                            const double d2_yz = (get_comp(idx(i, j + 1, k + 1), comp) - get_comp(idx(i, j + 1, k - 1), comp)
+                                                - get_comp(idx(i, j - 1, k + 1), comp) + get_comp(idx(i, j - 1, k - 1), comp)) * inv_4dydz;
+
+                            const double Q_contract = q.Qxx * d2_xx + q.Qyy * d2_yy + q.Qzz * d2_zz
+                                                    + 2.0 * (q.Qxy * d2_xy + q.Qxz * d2_xz + q.Qyz * d2_yz);
+
+                            return Dcol_x[id] * dQ_dx + Dcol_y[id] * dQ_dy + Dcol_z[id] * dQ_dz + Q_contract;
+                        };
+
+                        const double B_xx = compute_B_for_comp(0, dQxx_dx, dQxx_dy, dQxx_dz);
+                        const double B_yy = compute_B_for_comp(3, dQyy_dx, dQyy_dy, dQyy_dz);
+                        const double B_zz = -(B_xx + B_yy);
+                        const double B_xy = compute_B_for_comp(1, dQxy_dx, dQxy_dy, dQxy_dz);
+                        const double B_xz = compute_B_for_comp(2, dQxz_dx, dQxz_dy, dQxz_dz);
+                        const double B_yz = compute_B_for_comp(4, dQyz_dx, dQyz_dy, dQyz_dz);
+
+                        h_xx -= params.L3 * B_xx;
+                        h_yy -= params.L3 * B_yy;
+                        h_zz -= params.L3 * B_zz;
+                        h_xy -= params.L3 * B_xy;
+                        h_xz -= params.L3 * B_xz;
+                        h_yz -= params.L3 * B_yz;
+                    }
                 }
 
                 // Project onto traceless
@@ -884,30 +1040,40 @@ int main() {
         
         std::cout << "\n--- Elastic and Dynamic Parameters ---" << std::endl;
         double kappa = prompt_with_default("Enter elastic constant kappa (J/m)", kappa_default);
-        std::cout << "Use Frank-to-LdG mapping with K1=K3 ≠ K2? (y/n) [n]: ";
+        std::cout << "Use Frank-to-LdG mapping with K1, K2, K3? (y/n) [n]: ";
         std::string use_frank_map_in;
         std::getline(std::cin, use_frank_map_in);
         bool use_frank_map = (!use_frank_map_in.empty() && (use_frank_map_in[0]=='y' || use_frank_map_in[0]=='Y'));
         double L1 = 0.0, L2 = 0.0, L3 = 0.0;
         if (use_frank_map) {
-            double K1 = prompt_with_default("Enter K1 = K3 (J/m)", 6.5e-12);
+            double K1 = prompt_with_default("Enter K1 (J/m)", 6.5e-12);
             double K2 = prompt_with_default("Enter K2 (J/m)", 4.0e-12);
-            double S_ref = (S0 > 0 ? S0 : (b / (2.0 * c)));
-            if (S_ref <= 1e-12) S_ref = 0.5; 
-            
-            // Simple mapping used in literature:
-            L1 = (2.0 * K2) / (9.0 * S_ref * S_ref);
-            L2 = (2.0 * K1) / (9.0 * S_ref * S_ref) - L1; // derived from K1 = 9/2 S^2 (L1+L2)
-            
-            // PHYSICS FIX 1: If using L-constants, zero out isotropic kappa to prevent double counting
-            kappa = 0.0; 
-            L3 = 0.0; // PHYSICS FIX 2: Force L3 to 0 for stability
+            double K3 = prompt_with_default("Enter K3 (J/m)", K1);
+
+            // Mapping depends on the amplitude convention for Q via S_ref.
+            double S_ref_default = (S_eq > 0.0) ? S_eq : ((S0 > 0.0) ? S0 : (b / (2.0 * c)));
+            double S_ref = prompt_with_default("Enter S_ref for mapping", S_ref_default);
+            if (S_ref <= 1e-12) S_ref = 0.5;
+
+            // Frank -> LdG mapping for the elastic energy used in this code:
+            //   f_el = (L1/2) (∂k Qij)(∂k Qij)
+            //        + (L2/2) (∂j Qij)(∂k Qik)
+            //        + (L3/2) Qij (∂i Qkl)(∂j Qkl)
+            // with Q = S(nn - I/3).
+            const double S2 = S_ref * S_ref;
+            const double S3 = S2 * S_ref;
+            L2 = (K1 - K2) / S2;
+            L3 = (9.0 / 4.0) * (K3 - K1) / S3;
+            L1 = (K1 + K2 - K3) / (2.0 * S2);
+
+            // If using L-constants, zero out isotropic kappa to prevent double counting
+            kappa = 0.0;
             std::cout << "Mapped L1=" << L1 << ", L2=" << L2 << ", L3=" << L3 << " (Kappa set to 0)" << std::endl;
         } else {
             L1 = prompt_with_default("Enter L1 (J/m)", 0.0);
             L2 = prompt_with_default("Enter L2 (J/m)", 0.0);
             L3 = prompt_with_default("Enter L3 (J/m)", 0.0);
-            if (L1 != 0 || L2 != 0) kappa = 0.0; // Auto-disable kappa if user manually sets L terms
+            if (L1 != 0 || L2 != 0 || L3 != 0) kappa = 0.0; // Auto-disable kappa if user manually sets L terms
         }
         double W = prompt_with_default("Enter weak anchoring W (J/m^2)", 0.0);
         

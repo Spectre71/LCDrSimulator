@@ -1,10 +1,31 @@
 #include "QSR.cuh"
 #include <cctype>
+#include <cstdlib>
 #include <limits>
 #include <tuple>
 #include <type_traits>
 
 namespace fs = std::filesystem;
+
+static void cuda_check_or_die(const char* where) {
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        std::cerr << "[CUDA] Kernel launch error after " << where << ": " << cudaGetErrorString(err) << std::endl;
+        std::exit(1);
+    }
+    err = cudaDeviceSynchronize();
+    if (err != cudaSuccess) {
+        std::cerr << "[CUDA] Sync error after " << where << ": " << cudaGetErrorString(err) << std::endl;
+        std::exit(1);
+    }
+}
+
+static double qtensor_frobenius_norm(const QTensor& q5) {
+    FullQTensor q(q5);
+    const double trQ2 = q.Qxx*q.Qxx + q.Qyy*q.Qyy + q.Qzz*q.Qzz
+        + 2.0*(q.Qxy*q.Qxy + q.Qxz*q.Qxz + q.Qyz*q.Qyz);
+    return std::sqrt(std::max(0.0, trQ2));
+}
 
 // ------------------------------------------------------------------
 // Device Helper Functions
@@ -237,7 +258,7 @@ __global__ void computeChemicalPotentialKernel(const QTensor* Q, QTensor* mu, co
     double h_yz = coeff_Q * q.Qyz - coeff_Q2 * q2.Qyz + coeff_Q3 * trQ2 * q.Qyz;
 
     // Elastic
-    if (params.L1 == 0.0 && params.L2 == 0.0) {
+    if (params.L1 == 0.0 && params.L2 == 0.0 && params.L3 == 0.0) {
         h_xx -= kappa * lap_q.Qxx;
         h_yy -= kappa * lap_q.Qyy;
         h_zz -= kappa * (-lap_q.Qxx - lap_q.Qyy);
@@ -291,6 +312,155 @@ __global__ void computeChemicalPotentialKernel(const QTensor* Q, QTensor* mu, co
     h.Qyz = h_yz;
 
     mu[idx] = h;
+}
+
+__global__ void computeChemicalPotentialL3Kernel(const QTensor* Q, QTensor* mu, int Nx, int Ny, int Nz,
+                                                double dx, double dy, double dz, DimensionalParams params,
+                                                const double* Dcol_x, const double* Dcol_y, const double* Dcol_z) {
+    if (params.L3 == 0.0) return;
+
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    int j = blockIdx.y * blockDim.y + threadIdx.y;
+    int k = blockIdx.z * blockDim.z + threadIdx.z;
+
+    if (i >= Nx || j >= Ny || k >= Nz) return;
+    if (!(i > 0 && i < Nx - 1 && j > 0 && j < Ny - 1 && k > 0 && k < Nz - 1)) return;
+
+    const int idx = k + Nz * (j + Ny * i);
+    FullQTensor q(Q[idx]);
+
+    // Start from existing mu (already includes bulk + L1/L2/kappa and was projected traceless).
+    QTensor h0 = mu[idx];
+    double h_xx = h0.Qxx;
+    double h_yy = h0.Qyy;
+    double h_zz = -(h_xx + h_yy);
+    double h_xy = h0.Qxy;
+    double h_xz = h0.Qxz;
+    double h_yz = h0.Qyz;
+
+    const int sx = Ny * Nz;
+    const int sy = Nz;
+    const int sz = 1;
+
+    const double inv_2dx = 1.0 / (2.0 * dx);
+    const double inv_2dy = 1.0 / (2.0 * dy);
+    const double inv_2dz = 1.0 / (2.0 * dz);
+
+    const double inv_dx = 1.0 / dx;
+    const double inv_dy = 1.0 / dy;
+    const double inv_dz = 1.0 / dz;
+
+    const double inv_dx2 = 1.0 / (dx * dx);
+    const double inv_dy2 = 1.0 / (dy * dy);
+    const double inv_dz2 = 1.0 / (dz * dz);
+    const double inv_4dxdy = 1.0 / (4.0 * dx * dy);
+    const double inv_4dxdz = 1.0 / (4.0 * dx * dz);
+    const double inv_4dydz = 1.0 / (4.0 * dy * dz);
+
+    auto get_comp = [&](int id, int comp) -> double {
+        const QTensor& qq = Q[id];
+        if (comp == 0) return qq.Qxx;
+        if (comp == 1) return qq.Qxy;
+        if (comp == 2) return qq.Qxz;
+        if (comp == 3) return qq.Qyy;
+        if (comp == 4) return qq.Qyz;
+        return -(qq.Qxx + qq.Qyy); // Qzz
+    };
+
+    // First derivatives of the independent components
+    const double dQxx_dx = get_Q_deriv_device(Q, idx, sx, Nx, i, inv_2dx, inv_dx, 0);
+    const double dQxx_dy = get_Q_deriv_device(Q, idx, sy, Ny, j, inv_2dy, inv_dy, 0);
+    const double dQxx_dz = get_Q_deriv_device(Q, idx, sz, Nz, k, inv_2dz, inv_dz, 0);
+
+    const double dQyy_dx = get_Q_deriv_device(Q, idx, sx, Nx, i, inv_2dx, inv_dx, 3);
+    const double dQyy_dy = get_Q_deriv_device(Q, idx, sy, Ny, j, inv_2dy, inv_dy, 3);
+    const double dQyy_dz = get_Q_deriv_device(Q, idx, sz, Nz, k, inv_2dz, inv_dz, 3);
+
+    const double dQxy_dx = get_Q_deriv_device(Q, idx, sx, Nx, i, inv_2dx, inv_dx, 1);
+    const double dQxy_dy = get_Q_deriv_device(Q, idx, sy, Ny, j, inv_2dy, inv_dy, 1);
+    const double dQxy_dz = get_Q_deriv_device(Q, idx, sz, Nz, k, inv_2dz, inv_dz, 1);
+
+    const double dQxz_dx = get_Q_deriv_device(Q, idx, sx, Nx, i, inv_2dx, inv_dx, 2);
+    const double dQxz_dy = get_Q_deriv_device(Q, idx, sy, Ny, j, inv_2dy, inv_dy, 2);
+    const double dQxz_dz = get_Q_deriv_device(Q, idx, sz, Nz, k, inv_2dz, inv_dz, 2);
+
+    const double dQyz_dx = get_Q_deriv_device(Q, idx, sx, Nx, i, inv_2dx, inv_dx, 4);
+    const double dQyz_dy = get_Q_deriv_device(Q, idx, sy, Ny, j, inv_2dy, inv_dy, 4);
+    const double dQyz_dz = get_Q_deriv_device(Q, idx, sz, Nz, k, inv_2dz, inv_dz, 4);
+
+    const double dQzz_dx = -(dQxx_dx + dQyy_dx);
+    const double dQzz_dy = -(dQxx_dy + dQyy_dy);
+    const double dQzz_dz = -(dQxx_dz + dQyy_dz);
+
+    // M_ij = (∂i Qkl)(∂j Qkl)
+    const double M_xx = dQxx_dx*dQxx_dx + dQyy_dx*dQyy_dx + dQzz_dx*dQzz_dx
+                      + 2.0*(dQxy_dx*dQxy_dx + dQxz_dx*dQxz_dx + dQyz_dx*dQyz_dx);
+    const double M_yy = dQxx_dy*dQxx_dy + dQyy_dy*dQyy_dy + dQzz_dy*dQzz_dy
+                      + 2.0*(dQxy_dy*dQxy_dy + dQxz_dy*dQxz_dy + dQyz_dy*dQyz_dy);
+    const double M_zz = dQxx_dz*dQxx_dz + dQyy_dz*dQyy_dz + dQzz_dz*dQzz_dz
+                      + 2.0*(dQxy_dz*dQxy_dz + dQxz_dz*dQxz_dz + dQyz_dz*dQyz_dz);
+
+    const double M_xy = dQxx_dx*dQxx_dy + dQyy_dx*dQyy_dy + dQzz_dx*dQzz_dy
+                      + 2.0*(dQxy_dx*dQxy_dy + dQxz_dx*dQxz_dy + dQyz_dx*dQyz_dy);
+    const double M_xz = dQxx_dx*dQxx_dz + dQyy_dx*dQyy_dz + dQzz_dx*dQzz_dz
+                      + 2.0*(dQxy_dx*dQxy_dz + dQxz_dx*dQxz_dz + dQyz_dx*dQyz_dz);
+    const double M_yz = dQxx_dy*dQxx_dz + dQyy_dy*dQyy_dz + dQzz_dy*dQzz_dz
+                      + 2.0*(dQxy_dy*dQxy_dz + dQxz_dy*dQxz_dz + dQyz_dy*dQyz_dz);
+
+    // Add (L3/2) M term
+    h_xx += 0.5 * params.L3 * M_xx;
+    h_yy += 0.5 * params.L3 * M_yy;
+    h_zz += 0.5 * params.L3 * M_zz;
+    h_xy += 0.5 * params.L3 * M_xy;
+    h_xz += 0.5 * params.L3 * M_xz;
+    h_yz += 0.5 * params.L3 * M_yz;
+
+    // Helper: compute B(Qcomp) = ∂i( Qij ∂j Qcomp )
+    auto compute_B_for_comp = [&](int comp, double dQ_dx, double dQ_dy, double dQ_dz) -> double {
+        const double Qc = get_comp(idx, comp);
+
+        const double d2_xx = (get_comp(idx + sx, comp) - 2.0*Qc + get_comp(idx - sx, comp)) * inv_dx2;
+        const double d2_yy = (get_comp(idx + sy, comp) - 2.0*Qc + get_comp(idx - sy, comp)) * inv_dy2;
+        const double d2_zz = (get_comp(idx + sz, comp) - 2.0*Qc + get_comp(idx - sz, comp)) * inv_dz2;
+
+        const double d2_xy = (get_comp(idx + sx + sy, comp) - get_comp(idx + sx - sy, comp)
+                            - get_comp(idx - sx + sy, comp) + get_comp(idx - sx - sy, comp)) * inv_4dxdy;
+        const double d2_xz = (get_comp(idx + sx + sz, comp) - get_comp(idx + sx - sz, comp)
+                            - get_comp(idx - sx + sz, comp) + get_comp(idx - sx - sz, comp)) * inv_4dxdz;
+        const double d2_yz = (get_comp(idx + sy + sz, comp) - get_comp(idx + sy - sz, comp)
+                            - get_comp(idx - sy + sz, comp) + get_comp(idx - sy - sz, comp)) * inv_4dydz;
+
+        const double Q_contract = q.Qxx * d2_xx + q.Qyy * d2_yy + q.Qzz * d2_zz
+                                + 2.0 * (q.Qxy * d2_xy + q.Qxz * d2_xz + q.Qyz * d2_yz);
+
+        return Dcol_x[idx] * dQ_dx + Dcol_y[idx] * dQ_dy + Dcol_z[idx] * dQ_dz + Q_contract;
+    };
+
+    const double B_xx = compute_B_for_comp(0, dQxx_dx, dQxx_dy, dQxx_dz);
+    const double B_yy = compute_B_for_comp(3, dQyy_dx, dQyy_dy, dQyy_dz);
+    const double B_zz = -(B_xx + B_yy);
+    const double B_xy = compute_B_for_comp(1, dQxy_dx, dQxy_dy, dQxy_dz);
+    const double B_xz = compute_B_for_comp(2, dQxz_dx, dQxz_dy, dQxz_dz);
+    const double B_yz = compute_B_for_comp(4, dQyz_dx, dQyz_dy, dQyz_dz);
+
+    // Subtract L3 * B term
+    h_xx -= params.L3 * B_xx;
+    h_yy -= params.L3 * B_yy;
+    h_zz -= params.L3 * B_zz;
+    h_xy -= params.L3 * B_xy;
+    h_xz -= params.L3 * B_xz;
+    h_yz -= params.L3 * B_yz;
+
+    // Project onto traceless
+    const double trace_h = h_xx + h_yy + h_zz;
+    const double corr = trace_h / 3.0;
+    QTensor hout;
+    hout.Qxx = h_xx - corr;
+    hout.Qyy = h_yy - corr;
+    hout.Qxy = h_xy;
+    hout.Qxz = h_xz;
+    hout.Qyz = h_yz;
+    mu[idx] = hout;
 }
 
 __global__ void applyWeakAnchoringPenaltyKernel(QTensor* mu, const QTensor* Q, int Nx, int Ny, int Nz,
@@ -521,7 +691,7 @@ __global__ void computeEnergyKernel(const QTensor* Q, double* bulk_energy, doubl
     double grad_Q_sq = sq(dQ[0][0], dQ[0][1], dQ[0][2]) + sq(dQ[3][0], dQ[3][1], dQ[3][2]) + sq(dQzz[0], dQzz[1], dQzz[2])
                      + 2.0*(sq(dQ[1][0], dQ[1][1], dQ[1][2]) + sq(dQ[2][0], dQ[2][1], dQ[2][2]) + sq(dQ[4][0], dQ[4][1], dQ[4][2]));
 
-    if (params.L1 == 0.0 && params.L2 == 0.0) {
+    if (params.L1 == 0.0 && params.L2 == 0.0 && params.L3 == 0.0) {
         f_elastic = 0.5 * kappa * grad_Q_sq;
     } else {
         double fel_L1 = 0.5 * params.L1 * grad_Q_sq;
@@ -533,7 +703,30 @@ __global__ void computeEnergyKernel(const QTensor* Q, double* bulk_energy, doubl
         double divQ_z = dQ[2][0] + dQ[4][1] + dQzz[2];  // dQzx/dx + dQzy/dy + dQzz/dz
         
         double fel_L2 = 0.5 * params.L2 * (divQ_x*divQ_x + divQ_y*divQ_y + divQ_z*divQ_z);
-        f_elastic = fel_L1 + fel_L2;
+
+        double fel_L3 = 0.0;
+        if (params.L3 != 0.0) {
+            // L3 term: (L3/2) Qij (∂i Qkl)(∂j Qkl)
+            // First build the symmetric matrix M_ij = (∂i Qkl)(∂j Qkl).
+            const double M_xx = dQ[0][0]*dQ[0][0] + dQ[3][0]*dQ[3][0] + dQzz[0]*dQzz[0]
+                              + 2.0*(dQ[1][0]*dQ[1][0] + dQ[2][0]*dQ[2][0] + dQ[4][0]*dQ[4][0]);
+            const double M_yy = dQ[0][1]*dQ[0][1] + dQ[3][1]*dQ[3][1] + dQzz[1]*dQzz[1]
+                              + 2.0*(dQ[1][1]*dQ[1][1] + dQ[2][1]*dQ[2][1] + dQ[4][1]*dQ[4][1]);
+            const double M_zz = dQ[0][2]*dQ[0][2] + dQ[3][2]*dQ[3][2] + dQzz[2]*dQzz[2]
+                              + 2.0*(dQ[1][2]*dQ[1][2] + dQ[2][2]*dQ[2][2] + dQ[4][2]*dQ[4][2]);
+
+            const double M_xy = dQ[0][0]*dQ[0][1] + dQ[3][0]*dQ[3][1] + dQzz[0]*dQzz[1]
+                              + 2.0*(dQ[1][0]*dQ[1][1] + dQ[2][0]*dQ[2][1] + dQ[4][0]*dQ[4][1]);
+            const double M_xz = dQ[0][0]*dQ[0][2] + dQ[3][0]*dQ[3][2] + dQzz[0]*dQzz[2]
+                              + 2.0*(dQ[1][0]*dQ[1][2] + dQ[2][0]*dQ[2][2] + dQ[4][0]*dQ[4][2]);
+            const double M_yz = dQ[0][1]*dQ[0][2] + dQ[3][1]*dQ[3][2] + dQzz[1]*dQzz[2]
+                              + 2.0*(dQ[1][1]*dQ[1][2] + dQ[2][1]*dQ[2][2] + dQ[4][1]*dQ[4][2]);
+
+            fel_L3 = 0.5 * params.L3 * (q.Qxx * M_xx + q.Qyy * M_yy + q.Qzz * M_zz
+                                     + 2.0*(q.Qxy * M_xy + q.Qxz * M_xz + q.Qyz * M_yz));
+        }
+
+        f_elastic = fel_L1 + fel_L2 + fel_L3;
     }
 
     elastic_energy[idx] = f_elastic * (dx * dy * dz);
@@ -959,46 +1152,68 @@ int main() {
         // color yellow text: \033[1;33m
         std::cout << "Generally: \033[1;33m Twist (K2) < Splay (K1) < Bend (K3)\033[0m" << std::endl;
         double kappa = prompt_with_default("Enter kappa (J/m)", kappa_default);
-        std::cout << "Use Frank-to-LdG mapping with K1=K3 ≠ K2? (y/n) [n]: ";
+        std::cout << "Use Frank-to-LdG mapping with K1, K2, K3? (y/n) [n]: ";
         std::string use_frank_map_in; std::getline(std::cin, use_frank_map_in);
         bool use_frank_map = (!use_frank_map_in.empty() && (use_frank_map_in[0]=='y' || use_frank_map_in[0]=='Y'));
         double L1 = 0.0, L2 = 0.0, L3 = 0.0;
+        double S_ref_used = std::numeric_limits<double>::quiet_NaN();
         if (use_frank_map) {
-            double K1 = prompt_with_default("Enter K1=K3", 6.5e-12);
+            double K1 = prompt_with_default("Enter K1", 6.5e-12);
             double K2 = prompt_with_default("Enter K2", 4.0e-12);
+            double K3 = prompt_with_default("Enter K3", K1);
             // IMPORTANT: mapping depends on the amplitude convention for Q via S_ref.
             // Default to S_eq(T) computed from the selected bulk convention (std/ravnik),
             // since that keeps Frank->LdG consistent when switching conventions.
             double S_ref_default = (S_eq > 0.0) ? S_eq : ((S0 > 0.0) ? S0 : (b / (2.0 * c)));
             double S_ref = prompt_with_default("Enter S_ref for mapping (default: S_eq(T))", S_ref_default);
             if (S_ref <= 1e-12) S_ref = 0.5;
+            S_ref_used = S_ref;
 
-            // Frank -> LdG mapping for the 2-constant elastic energy used in this code:
-            //   f_el = (L1/2) (∂k Qij)(∂k Qij) + (L2/2) (∂j Qij)(∂k Qik)
+            // Frank -> LdG mapping for the elastic energy used in this code:
+            //   f_el = (L1/2) (∂k Qij)(∂k Qij)
+            //        + (L2/2) (∂j Qij)(∂k Qik)
+            //        + (L3/2) Qij (∂i Qkl)(∂j Qkl)
             // and the uniaxial, constant-S ansatz used throughout this codebase:
             //   Q = S (n⊗n - I/3)
-            // Under these conventions (and L3=0), matching to Frank gives:
-            //   K2 = 2 L1 S^2
-            //   K1 = K3 = S^2 (2 L1 + L2)
-            L1 = K2 / (2.0 * S_ref * S_ref);
-            L2 = (K1 - K2) / (S_ref * S_ref);
+            // Under these conventions, matching to Frank (K1,K2,K3) gives:
+            //   L2 = (K1 - K2) / S^2
+            //   L3 = (9/4) (K3 - K1) / S^3
+            //   L1 = (K1 + K2 - K3) / (2 S^2)
+            const double S2 = S_ref * S_ref;
+            const double S3 = S2 * S_ref;
+            L2 = (K1 - K2) / S2;
+            L3 = (9.0 / 4.0) * (K3 - K1) / S3;
+            L1 = (K1 + K2 - K3) / (2.0 * S2);
             kappa = 0.0;
             std::cout << "Mapped L1=" << L1 << ", L2=" << L2 << ", L3=" << L3
                       << " (Q=S(nn-I/3), S_ref=" << S_ref << ", Kappa set to 0)" << std::endl;
 
-            // Stability check for the truncated (L1,L2,L3=0) elastic model used here.
-            // For f_el = (L1/2)|∇Q|^2 + (L2/2)|div Q|^2, a necessary condition for boundedness is:
-            //   L1 > 0 and (L1 + L2) > 0
-            // If violated, the elastic energy becomes indefinite and the simulation can run away
-            // to unphysical large |Q| (e.g. S >> 1) even with small dt.
+            // Self-check: reconstruct Frank constants implied by (L1,L2,L3) at the same S_ref.
+            // Inverting the mapping yields:
+            //   K1 = 2 S^2 L1 + S^2 L2 + (4/9) S^3 L3
+            //   K2 = 2 S^2 L1           + (4/9) S^3 L3
+            //   K3 = 2 S^2 L1 + S^2 L2 + (8/9) S^3 L3
+            const double K1_back = 2.0 * S2 * L1 + S2 * L2 + (4.0 / 9.0) * S3 * L3;
+            const double K2_back = 2.0 * S2 * L1 + (4.0 / 9.0) * S3 * L3;
+            const double K3_back = 2.0 * S2 * L1 + S2 * L2 + (8.0 / 9.0) * S3 * L3;
+            std::cout << "  Check K1_back=" << K1_back << ", K2_back=" << K2_back << ", K3_back=" << K3_back << std::endl;
+            std::cout << "  ΔK: (K1_back-K1)=" << (K1_back - K1)
+                      << ", (K2_back-K2)=" << (K2_back - K2)
+                      << ", (K3_back-K3)=" << (K3_back - K3) << std::endl;
+
+            // Stability notes:
+            // - For L3=0, a necessary boundedness condition is L1>0 and (L1+L2)>0.
+            // - For L3!=0, boundedness becomes Q-dependent (since the term is cubic in Q and gradients).
+            //   We still warn if the L3=0 necessary condition is violated, since it is a strong indicator
+            //   of pathological parameter choices.
             if (!(L1 > 0.0) || !((L1 + L2) > 0.0)) {
-                std::cout << "\n[ERROR] Unstable elastic parameters for this model (L1=" << L1
+                std::cout << "\n[WARNING] Potentially unstable elastic parameters (L1=" << L1
                           << ", L2=" << L2 << ", L1+L2=" << (L1 + L2) << ").\n"
-                          << "        This typically happens when K2 is too large compared to K1 for an L3=0 mapping.\n"
-                          << "        Condition implied: K1 > K2/2 (for this 2-constant Q-elastic form).\n";
+                          << "          For L3=0, require L1>0 and L1+L2>0. With L3!=0 this check is not sufficient\n"
+                          << "          but violations often lead to blow-up (unphysical |Q| growth).\n";
                 bool proceed = prompt_yes_no("Proceed anyway?", false);
                 if (!proceed) {
-                    std::cout << "Aborting this run; choose different K1/K2 or do not use Frank mapping." << std::endl;
+                    std::cout << "Aborting this run; choose different K1/K2/K3 or do not use Frank mapping." << std::endl;
                     std::cout << "Would you like to run another simulation? (y/n): ";
                     std::string again; std::getline(std::cin, again);
                     run_again = (!again.empty() && (again[0] == 'y' || again[0] == 'Y'));
@@ -1009,7 +1224,7 @@ int main() {
             L1 = prompt_with_default("Enter L1", 0.0);
             L2 = prompt_with_default("Enter L2", 0.0);
             L3 = prompt_with_default("Enter L3", 0.0);
-            if (L1 != 0 || L2 != 0) kappa = 0.0;
+            if (L1 != 0 || L2 != 0 || L3 != 0) kappa = 0.0;
 
             if ((L1 != 0.0 || L2 != 0.0) && (!(L1 > 0.0) || !((L1 + L2) > 0.0))) {
                 std::cout << "\n[ERROR] Unstable elastic parameters for this model (L1=" << L1
@@ -1045,6 +1260,16 @@ int main() {
         // Example: 1e-2 means "< 1% change".
         double RbEps = prompt_with_default("Enter radiality convergence eps RbEps (relative ΔR̄)", 1e-2);
 
+        // Debugging aids (off by default because they can slow down runs).
+        const bool debug_cuda_checks = prompt_yes_no(
+            "Debug: enable CUDA error checks at log points? (syncs GPU; slower)",
+            false
+        );
+        const bool debug_dynamics = prompt_yes_no(
+            "Debug: print max|mu| and max|ΔQ| at log points? (copies arrays; slower)",
+            false
+        );
+
         // Host Memory
         size_t num_elements = Nx * Ny * Nz;
         size_t size_Q = num_elements * sizeof(QTensor);
@@ -1054,6 +1279,9 @@ int main() {
 
         std::vector<QTensor> h_Q(num_elements);
         std::vector<unsigned char> h_is_shell(num_elements, 0);
+
+        std::vector<QTensor> prev_Q_debug;
+        bool have_prev_Q_debug = false;
         
         // Initialize Shell
         double R_geom = std::min({ (double)Nx, (double)Ny, (double)Nz }) / 2.0;
@@ -1233,9 +1461,37 @@ int main() {
             cudaMemcpy(d_Q, h_Q.data(), size_Q, cudaMemcpyHostToDevice);
 
             double min_dx = std::min({ dx, dy, dz });
-            double D = (L1 > 0 ? L1 : kappa) / gamma; if (D == 0) D = 1e-12;
-            double dt_max = 0.5 * (min_dx * min_dx) / (6.0 * D);
-            std::cout << "\nMaximum stable dt = " << dt_max << " s" << std::endl;
+            // dt_max estimate: use an effective elastic scale even if L1<=0 or L3 dominates.
+            double S_scale = std::isfinite(S_ref_used) ? std::abs(S_ref_used) : std::max({std::abs(S0), std::abs(S_eq), 0.5});
+            if (!(S_scale > 0.0)) S_scale = 0.5;
+            double L_eff = 0.0;
+            if (L1 != 0.0 || L2 != 0.0 || L3 != 0.0) {
+                L_eff = std::max({std::abs(L1), std::abs(L1 + L2), std::abs(L3) * S_scale});
+            } else {
+                L_eff = std::abs(kappa);
+            }
+            if (!(L_eff > 0.0)) L_eff = 1e-12;
+            double D = L_eff / gamma; if (D == 0) D = 1e-12;
+            const double dt_diff = 0.5 * (min_dx * min_dx) / (6.0 * D);
+
+            // Bulk stiffness can be much larger than elastic diffusion (especially deep in nematic),
+            // so explicit Euler typically needs a dt cap based on |A|,|B|,|C|.
+            auto bulk_rate_at_T = [&](double Tval) -> double {
+                double A_t = 0.0, B_t = 0.0, C_t = 0.0;
+                bulk_ABC_from_convention(a, b, c, Tval, T_star, modechoice, A_t, B_t, C_t);
+                const double S2 = S_scale * S_scale;
+                return std::abs(A_t) + std::abs(B_t) * S_scale + std::abs(C_t) * S2;
+            };
+            const double bulk_rate = std::max(bulk_rate_at_T(T_high), bulk_rate_at_T(T_low));
+            const double dt_bulk = (bulk_rate > 0.0) ? (0.1 * gamma / bulk_rate) : std::numeric_limits<double>::infinity();
+
+            double dt_max = std::min(dt_diff, dt_bulk);
+            if (!(dt_max > 0.0) || !std::isfinite(dt_max)) dt_max = dt_diff;
+
+            std::cout << "\nMaximum stable dt estimates:\n"
+                      << "  dt_diff (elastic) ≈ " << dt_diff << " s\n"
+                      << "  dt_bulk (bulk)    ≈ " << dt_bulk << " s\n"
+                      << "  dt_max            = " << dt_max << " s" << std::endl;
             double dt = prompt_with_default("Enter time step dt (s)", dt_max);
             if (dt > dt_max) dt = dt_max;
 
@@ -1294,8 +1550,11 @@ int main() {
                 const double S_shell = compute_S_shell(T_current);
 
                 computeLaplacianKernel<<<numBlocks, threadsPerBlock>>>(d_Q, d_laplacianQ, Nx, Ny, Nz, dx, dy, dz);
-                if (L2 != 0.0) computeDivergenceKernel<<<numBlocks, threadsPerBlock>>>(d_Q, d_Dcol_x, d_Dcol_y, d_Dcol_z, Nx, Ny, Nz, dx, dy, dz);
+                if (L2 != 0.0 || L3 != 0.0) computeDivergenceKernel<<<numBlocks, threadsPerBlock>>>(d_Q, d_Dcol_x, d_Dcol_y, d_Dcol_z, Nx, Ny, Nz, dx, dy, dz);
                 computeChemicalPotentialKernel<<<numBlocks, threadsPerBlock>>>(d_Q, d_mu, d_laplacianQ, Nx, Ny, Nz, dx, dy, dz, params_q, kappa, modechoice, d_Dcol_x, d_Dcol_y, d_Dcol_z);
+                if (L3 != 0.0) {
+                    computeChemicalPotentialL3Kernel<<<numBlocks, threadsPerBlock>>>(d_Q, d_mu, Nx, Ny, Nz, dx, dy, dz, params_q, d_Dcol_x, d_Dcol_y, d_Dcol_z);
+                }
                 const double shell_thickness = std::min({dx, dy, dz});
                 applyWeakAnchoringPenaltyKernel<<<numBlocks, threadsPerBlock>>>(d_mu, d_Q, Nx, Ny, Nz, d_is_shell, S_shell, W, shell_thickness);
                 updateQTensorKernel<<<numBlocks, threadsPerBlock>>>(d_Q, d_mu, Nx, Ny, Nz, dt, d_is_shell, gamma, W);
@@ -1484,9 +1743,36 @@ int main() {
             cudaMemcpy(d_Q, h_Q.data(), size_Q, cudaMemcpyHostToDevice);
 
             double min_dx = std::min({ dx, dy, dz });
-            double D = (L1 > 0 ? L1 : kappa) / gamma; if(D==0) D=1e-12;
-            double dt_max = 0.5 * (min_dx * min_dx) / (6.0 * D);
-            std::cout << "\nMaximum stable dt ≈ " << dt_max << " s" << std::endl;
+            // dt_max estimate: use an effective elastic scale even if L1<=0 or L3 dominates.
+            double S_scale = std::isfinite(S_ref_used) ? std::abs(S_ref_used) : std::max({std::abs(S0), std::abs(S_eq), 0.5});
+            if (!(S_scale > 0.0)) S_scale = 0.5;
+            double L_eff = 0.0;
+            if (L1 != 0.0 || L2 != 0.0 || L3 != 0.0) {
+                L_eff = std::max({std::abs(L1), std::abs(L1 + L2), std::abs(L3) * S_scale});
+            } else {
+                L_eff = std::abs(kappa);
+            }
+            if (!(L_eff > 0.0)) L_eff = 1e-12;
+            double D = L_eff / gamma; if(D==0) D=1e-12;
+            const double dt_diff = 0.5 * (min_dx * min_dx) / (6.0 * D);
+
+            auto bulk_rate_at_T = [&](double Tval) -> double {
+                double A_dt = 0.0, B_dt = 0.0, C_dt = 0.0;
+                bulk_ABC_from_convention(a, b, c, Tval, T_star, modechoice, A_dt, B_dt, C_dt);
+                return std::abs(A_dt) + std::abs(B_dt) * S_scale + std::abs(C_dt) * S_scale * S_scale;
+            };
+            const double bulk_rate = std::max(bulk_rate_at_T(T_start), bulk_rate_at_T(T_end));
+            const double dt_bulk = (bulk_rate > 0.0)
+                ? (0.1 * gamma / bulk_rate)
+                : std::numeric_limits<double>::infinity();
+
+            double dt_max = std::min(dt_diff, dt_bulk);
+            if (!(dt_max > 0.0) || !std::isfinite(dt_max)) dt_max = dt_diff;
+
+            std::cout << "\nMaximum stable dt estimates:\n"
+                      << "  dt_diff (elastic) ≈ " << dt_diff << " s\n"
+                      << "  dt_bulk (bulk)    ≈ " << dt_bulk << " s\n"
+                      << "  dt_max            = " << dt_max << " s" << std::endl;
             double dt = prompt_with_default("Enter time step dt (s)", dt_max);
             if (dt > dt_max) dt = dt_max;
 
@@ -1518,8 +1804,11 @@ int main() {
                 double physical_time = 0.0;
                 for (int iter = 0; iter < maxIterations; ++iter) {
                     computeLaplacianKernel<<<numBlocks, threadsPerBlock>>>(d_Q, d_laplacianQ, Nx, Ny, Nz, dx, dy, dz);
-                    if (L2 != 0.0) computeDivergenceKernel<<<numBlocks, threadsPerBlock>>>(d_Q, d_Dcol_x, d_Dcol_y, d_Dcol_z, Nx, Ny, Nz, dx, dy, dz);
+                    if (L2 != 0.0 || L3 != 0.0) computeDivergenceKernel<<<numBlocks, threadsPerBlock>>>(d_Q, d_Dcol_x, d_Dcol_y, d_Dcol_z, Nx, Ny, Nz, dx, dy, dz);
                     computeChemicalPotentialKernel<<<numBlocks, threadsPerBlock>>>(d_Q, d_mu, d_laplacianQ, Nx, Ny, Nz, dx, dy, dz, params_temp, kappa, modechoice, d_Dcol_x, d_Dcol_y, d_Dcol_z);
+                    if (L3 != 0.0) {
+                        computeChemicalPotentialL3Kernel<<<numBlocks, threadsPerBlock>>>(d_Q, d_mu, Nx, Ny, Nz, dx, dy, dz, params_temp, d_Dcol_x, d_Dcol_y, d_Dcol_z);
+                    }
                     const double shell_thickness = std::min({dx, dy, dz});
                     applyWeakAnchoringPenaltyKernel<<<numBlocks, threadsPerBlock>>>(d_mu, d_Q, Nx, Ny, Nz, d_is_shell, S_shell, W, shell_thickness);
                     updateQTensorKernel<<<numBlocks, threadsPerBlock>>>(d_Q, d_mu, Nx, Ny, Nz, dt, d_is_shell, gamma, W);
@@ -1580,8 +1869,27 @@ int main() {
 
             DimensionalParams params = {a, b, c, T, T_star, L1, L2, L3, W};
             double min_dx = std::min({ dx, dy, dz });
-            double D = (L1 > 0 ? L1 : kappa) / gamma; if(D==0) D=1e-12;
-            double dt_max = 0.5 * (min_dx * min_dx) / (6.0 * D);
+            // dt_max estimate: use an effective elastic scale even if L1<=0 or L3 dominates.
+            double S_scale = std::isfinite(S_ref_used) ? std::abs(S_ref_used) : std::max({std::abs(S0), std::abs(S_eq), 0.5});
+            if (!(S_scale > 0.0)) S_scale = 0.5;
+            double L_eff = 0.0;
+            if (L1 != 0.0 || L2 != 0.0 || L3 != 0.0) {
+                L_eff = std::max({std::abs(L1), std::abs(L1 + L2), std::abs(L3) * S_scale});
+            } else {
+                L_eff = std::abs(kappa);
+            }
+            if (!(L_eff > 0.0)) L_eff = 1e-12;
+            double D = L_eff / gamma; if(D==0) D=1e-12;
+            const double dt_diff = 0.5 * (min_dx * min_dx) / (6.0 * D);
+
+            // Bulk-driven dt cap (single temperature)
+            double A_dt = 0.0, B_dt = 0.0, C_dt = 0.0;
+            bulk_ABC_from_convention(a, b, c, T, T_star, modechoice, A_dt, B_dt, C_dt);
+            const double bulk_rate = std::abs(A_dt) + std::abs(B_dt) * S_scale + std::abs(C_dt) * S_scale * S_scale;
+            const double dt_bulk = (bulk_rate > 0.0) ? (0.1 * gamma / bulk_rate) : std::numeric_limits<double>::infinity();
+
+            double dt_max = std::min(dt_diff, dt_bulk);
+            if (!(dt_max > 0.0) || !std::isfinite(dt_max)) dt_max = dt_diff;
 
             double R_phys = (std::min({(double)Nx, (double)Ny, (double)Nz}) / 2.0) * min_dx;
             double tau_align = (R_phys * R_phys) / D;
@@ -1589,7 +1897,10 @@ int main() {
             std::cout << "Diffusion coefficient D = " << D << " m²/s" << std::endl;
             std::cout << "Droplet radius R ≈ " << R_phys << " m" << std::endl;
             std::cout << "Estimated alignment time τ_align ≈ " << tau_align << " s" << std::endl;
-            std::cout << "Maximum stable dt ≈ " << dt_max << " s" << std::endl;
+            std::cout << "Maximum stable dt estimates:" << std::endl;
+            std::cout << "  dt_diff (elastic) ≈ " << dt_diff << " s" << std::endl;
+            std::cout << "  dt_bulk (bulk)    ≈ " << dt_bulk << " s" << std::endl;
+            std::cout << "  dt_max            = " << dt_max << " s" << std::endl;
 
             double dt = prompt_with_default("Enter time step dt (s)", dt_max);
             if (dt > dt_max) dt = dt_max;
@@ -1625,16 +1936,28 @@ int main() {
 
                 for (int iter = 0; iter < maxIterations; ++iter) {
                     physical_time += dt;
+                    const bool check_now = debug_cuda_checks && (iter == 0 || (iter % printFreq) == 0);
                     computeLaplacianKernel<<<numBlocks, threadsPerBlock>>>(d_Q, d_laplacianQ, Nx, Ny, Nz, dx, dy, dz);
-                    if (L2 != 0.0) computeDivergenceKernel<<<numBlocks, threadsPerBlock>>>(d_Q, d_Dcol_x, d_Dcol_y, d_Dcol_z, Nx, Ny, Nz, dx, dy, dz);
+                    if (check_now) cuda_check_or_die("computeLaplacianKernel");
+                    if (L2 != 0.0 || L3 != 0.0) computeDivergenceKernel<<<numBlocks, threadsPerBlock>>>(d_Q, d_Dcol_x, d_Dcol_y, d_Dcol_z, Nx, Ny, Nz, dx, dy, dz);
+                    if (check_now && (L2 != 0.0 || L3 != 0.0)) cuda_check_or_die("computeDivergenceKernel");
                     computeChemicalPotentialKernel<<<numBlocks, threadsPerBlock>>>(d_Q, d_mu, d_laplacianQ, Nx, Ny, Nz, dx, dy, dz, params, kappa, modechoice, d_Dcol_x, d_Dcol_y, d_Dcol_z);
+                    if (check_now) cuda_check_or_die("computeChemicalPotentialKernel");
+                    if (L3 != 0.0) {
+                        computeChemicalPotentialL3Kernel<<<numBlocks, threadsPerBlock>>>(d_Q, d_mu, Nx, Ny, Nz, dx, dy, dz, params, d_Dcol_x, d_Dcol_y, d_Dcol_z);
+                        if (check_now) cuda_check_or_die("computeChemicalPotentialL3Kernel");
+                    }
                     const double shell_thickness = std::min({dx, dy, dz});
                     applyWeakAnchoringPenaltyKernel<<<numBlocks, threadsPerBlock>>>(d_mu, d_Q, Nx, Ny, Nz, d_is_shell, S_shell_single, W, shell_thickness);
+                    if (check_now) cuda_check_or_die("applyWeakAnchoringPenaltyKernel");
                     updateQTensorKernel<<<numBlocks, threadsPerBlock>>>(d_Q, d_mu, Nx, Ny, Nz, dt, d_is_shell, gamma, W);
+                    if (check_now) cuda_check_or_die("updateQTensorKernel");
                     applyBoundaryConditionsKernel<<<numBlocks, threadsPerBlock>>>(d_Q, Nx, Ny, Nz, d_is_shell, S_shell_single, W);
+                    if (check_now) cuda_check_or_die("applyBoundaryConditionsKernel");
 
                     if (iter % printFreq == 0) {
                         computeRadialityKernel<<<numBlocks, threadsPerBlock>>>(d_Q, d_radiality_vals, d_count_vals, Nx, Ny, Nz);
+                        if (check_now) cuda_check_or_die("computeRadialityKernel");
                         auto [bulk_sum, elastic_sum, anch_sum] = reduce_energy(params, S_shell_single);
                         double total_F = bulk_sum + elastic_sum + anch_sum;
 
@@ -1657,9 +1980,43 @@ int main() {
                                       << ")  R̄=" << avg_rad << std::endl;
                         }
 
+                        if (debug_dynamics) {
+                            std::vector<QTensor> h_mu(num_elements);
+                            cudaError_t e1 = cudaMemcpy(h_mu.data(), d_mu, size_Q, cudaMemcpyDeviceToHost);
+                            cudaError_t e2 = cudaMemcpy(h_Q.data(), d_Q, size_Q, cudaMemcpyDeviceToHost);
+                            if (e1 != cudaSuccess || e2 != cudaSuccess) {
+                                std::cerr << "[CUDA] cudaMemcpy failed in debug_dynamics: "
+                                          << cudaGetErrorString(e1 != cudaSuccess ? e1 : e2) << std::endl;
+                                std::exit(1);
+                            }
+
+                            double max_mu = 0.0;
+                            double max_Q = 0.0;
+                            double max_dQ = 0.0;
+                            for (size_t ii = 0; ii < num_elements; ++ii) {
+                                max_mu = std::max(max_mu, qtensor_frobenius_norm(h_mu[ii]));
+                                max_Q = std::max(max_Q, qtensor_frobenius_norm(h_Q[ii]));
+                                if (have_prev_Q_debug) {
+                                    QTensor dq = h_Q[ii] - prev_Q_debug[ii];
+                                    max_dQ = std::max(max_dQ, qtensor_frobenius_norm(dq));
+                                }
+                            }
+                            if (!have_prev_Q_debug) {
+                                prev_Q_debug = h_Q;
+                                have_prev_Q_debug = true;
+                            } else {
+                                prev_Q_debug = h_Q;
+                            }
+
+                            std::cout << "  [debug] max|mu|=" << max_mu
+                                      << "  max|Q|=" << max_Q
+                                      << "  max|ΔQ|=" << max_dQ << std::endl;
+                        }
+
                         NematicField* d_nf;
                         cudaMalloc(&d_nf, num_elements * sizeof(NematicField));
                         computeNematicFieldKernel<<<numBlocks, threadsPerBlock>>>(d_Q, d_nf, Nx, Ny, Nz);
+                        if (check_now) cuda_check_or_die("computeNematicFieldKernel");
                         std::vector<NematicField> h_nf(num_elements);
                         cudaMemcpy(h_nf.data(), d_nf, num_elements * sizeof(NematicField), cudaMemcpyDeviceToHost);
                         cudaFree(d_nf);
@@ -1691,16 +2048,28 @@ int main() {
 
                 for (int iter = 0; iter < maxIterations; ++iter) {
                     physical_time += dt;
+                    const bool check_now = debug_cuda_checks && (iter == 0 || (iter % printFreq) == 0);
                     computeLaplacianKernel<<<numBlocks, threadsPerBlock>>>(d_Q, d_laplacianQ, Nx, Ny, Nz, dx, dy, dz);
-                    if (L2 != 0.0) computeDivergenceKernel<<<numBlocks, threadsPerBlock>>>(d_Q, d_Dcol_x, d_Dcol_y, d_Dcol_z, Nx, Ny, Nz, dx, dy, dz);
+                    if (check_now) cuda_check_or_die("computeLaplacianKernel");
+                    if (L2 != 0.0 || L3 != 0.0) computeDivergenceKernel<<<numBlocks, threadsPerBlock>>>(d_Q, d_Dcol_x, d_Dcol_y, d_Dcol_z, Nx, Ny, Nz, dx, dy, dz);
+                    if (check_now && (L2 != 0.0 || L3 != 0.0)) cuda_check_or_die("computeDivergenceKernel");
                     computeChemicalPotentialKernel<<<numBlocks, threadsPerBlock>>>(d_Q, d_mu, d_laplacianQ, Nx, Ny, Nz, dx, dy, dz, params, kappa, modechoice, d_Dcol_x, d_Dcol_y, d_Dcol_z);
+                    if (check_now) cuda_check_or_die("computeChemicalPotentialKernel");
+                    if (L3 != 0.0) {
+                        computeChemicalPotentialL3Kernel<<<numBlocks, threadsPerBlock>>>(d_Q, d_mu, Nx, Ny, Nz, dx, dy, dz, params, d_Dcol_x, d_Dcol_y, d_Dcol_z);
+                        if (check_now) cuda_check_or_die("computeChemicalPotentialL3Kernel");
+                    }
                     const double shell_thickness = std::min({dx, dy, dz});
                     applyWeakAnchoringPenaltyKernel<<<numBlocks, threadsPerBlock>>>(d_mu, d_Q, Nx, Ny, Nz, d_is_shell, S_shell_single, W, shell_thickness);
+                    if (check_now) cuda_check_or_die("applyWeakAnchoringPenaltyKernel");
                     updateQTensorKernel<<<numBlocks, threadsPerBlock>>>(d_Q, d_mu, Nx, Ny, Nz, dt, d_is_shell, gamma, W);
+                    if (check_now) cuda_check_or_die("updateQTensorKernel");
                     applyBoundaryConditionsKernel<<<numBlocks, threadsPerBlock>>>(d_Q, Nx, Ny, Nz, d_is_shell, S_shell_single, W);
+                    if (check_now) cuda_check_or_die("applyBoundaryConditionsKernel");
 
                     if (iter % printFreq == 0) {
                         computeRadialityKernel<<<numBlocks, threadsPerBlock>>>(d_Q, d_radiality_vals, d_count_vals, Nx, Ny, Nz);
+                        if (check_now) cuda_check_or_die("computeRadialityKernel");
                         auto [bulk_sum, elastic_sum, anch_sum] = reduce_energy(params, S_shell_single);
                         double total_F = bulk_sum + elastic_sum + anch_sum;
 
@@ -1724,9 +2093,43 @@ int main() {
                                       << ")  R̄=" << avg_rad << std::endl;
                         }
 
+                        if (debug_dynamics) {
+                            std::vector<QTensor> h_mu(num_elements);
+                            cudaError_t e1 = cudaMemcpy(h_mu.data(), d_mu, size_Q, cudaMemcpyDeviceToHost);
+                            cudaError_t e2 = cudaMemcpy(h_Q.data(), d_Q, size_Q, cudaMemcpyDeviceToHost);
+                            if (e1 != cudaSuccess || e2 != cudaSuccess) {
+                                std::cerr << "[CUDA] cudaMemcpy failed in debug_dynamics: "
+                                          << cudaGetErrorString(e1 != cudaSuccess ? e1 : e2) << std::endl;
+                                std::exit(1);
+                            }
+
+                            double max_mu = 0.0;
+                            double max_Q = 0.0;
+                            double max_dQ = 0.0;
+                            for (size_t ii = 0; ii < num_elements; ++ii) {
+                                max_mu = std::max(max_mu, qtensor_frobenius_norm(h_mu[ii]));
+                                max_Q = std::max(max_Q, qtensor_frobenius_norm(h_Q[ii]));
+                                if (have_prev_Q_debug) {
+                                    QTensor dq = h_Q[ii] - prev_Q_debug[ii];
+                                    max_dQ = std::max(max_dQ, qtensor_frobenius_norm(dq));
+                                }
+                            }
+                            if (!have_prev_Q_debug) {
+                                prev_Q_debug = h_Q;
+                                have_prev_Q_debug = true;
+                            } else {
+                                prev_Q_debug = h_Q;
+                            }
+
+                            std::cout << "  [debug] max|mu|=" << max_mu
+                                      << "  max|Q|=" << max_Q
+                                      << "  max|ΔQ|=" << max_dQ << std::endl;
+                        }
+
                         NematicField* d_nf;
                         cudaMalloc(&d_nf, num_elements * sizeof(NematicField));
                         computeNematicFieldKernel<<<numBlocks, threadsPerBlock>>>(d_Q, d_nf, Nx, Ny, Nz);
+                        if (check_now) cuda_check_or_die("computeNematicFieldKernel");
                         std::vector<NematicField> h_nf(num_elements);
                         cudaMemcpy(h_nf.data(), d_nf, num_elements * sizeof(NematicField), cudaMemcpyDeviceToHost);
                         cudaFree(d_nf);

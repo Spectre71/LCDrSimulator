@@ -98,6 +98,11 @@ struct DimensionalParams {
 // Kernel declarations
 __global__ void computeLaplacianKernel(const QTensor* Q, QTensor* laplacianQ, int Nx, int Ny, int Nz, double dx, double dy, double dz);
 __global__ void computeChemicalPotentialKernel(const QTensor* Q, QTensor* mu, const QTensor* laplacianQ, int Nx, int Ny, int Nz, double dx, double dy, double dz, DimensionalParams params, double kappa, int modechoice, double* Dcol_x, double* Dcol_y, double* Dcol_z);
+// L3-only contribution to the chemical potential (adds to mu in-place).
+// Split out from computeChemicalPotentialKernel to avoid excessive register pressure when L3 is unused.
+__global__ void computeChemicalPotentialL3Kernel(const QTensor* Q, QTensor* mu, int Nx, int Ny, int Nz,
+                                                double dx, double dy, double dz, DimensionalParams params,
+                                                const double* Dcol_x, const double* Dcol_y, const double* Dcol_z);
 // Weak anchoring W is interpreted as a surface energy density (J/m^2).
 // Internally we convert it to a volumetric penalty via W_eff = W / shell_thickness.
 __global__ void applyWeakAnchoringPenaltyKernel(QTensor* mu, const QTensor* Q, int Nx, int Ny, int Nz,
