@@ -767,6 +767,157 @@ __global__ void computeNematicFieldKernel(const QTensor* Q, NematicField* nf, in
     nf[idx] = calculateNematicFieldDevice(Q[idx]);
 }
 
+__device__ inline double wrap_to_pi_device(double x) {
+    // Wrap to (-pi, pi]
+    constexpr double kPi = 3.141592653589793238462643383279502884;
+    constexpr double kTwoPi = 2.0 * kPi;
+    x = x + kPi;
+    x -= floor(x / kTwoPi) * kTwoPi;
+    x = x - kPi;
+    return x;
+}
+
+// 2D correlation-length proxy on a z-slice using local gradients of psi=2*atan2(ny,nx).
+// We estimate a length scale from the mean-squared wrapped phase differences:
+//   mean_sq = < (dpsi)^2 > over nearest-neighbor edges (masked by S>S_threshold)
+//   xi_grad_proxy ~ 1/sqrt(mean_sq)
+// This is a cheap proxy for scaling; it does not equal the FFT-based xi used in QSRvis.py.
+__global__ void computeXiGradEdgesXKernel(
+    const QTensor* Q,
+    int Nx,
+    int Ny,
+    int Nz,
+    int z_slice,
+    double S_threshold,
+    double* sum_sq,
+    unsigned int* edges_used
+) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    int j = blockIdx.y * blockDim.y + threadIdx.y;
+    if (i >= Nx - 1 || j >= Ny) return;
+    if (z_slice < 0 || z_slice >= Nz) return;
+
+    const int k = z_slice;
+    const int id0 = k + Nz * (j + Ny * i);
+    const int id1 = k + Nz * (j + Ny * (i + 1));
+
+    NematicField nf0 = calculateNematicFieldDevice(Q[id0]);
+    NematicField nf1 = calculateNematicFieldDevice(Q[id1]);
+    const bool m0 = isfinite(nf0.S) && isfinite(nf0.nx) && isfinite(nf0.ny) && (nf0.S > S_threshold);
+    const bool m1 = isfinite(nf1.S) && isfinite(nf1.nx) && isfinite(nf1.ny) && (nf1.S > S_threshold);
+    if (!(m0 && m1)) return;
+
+    const double p0 = 2.0 * atan2(nf0.ny, nf0.nx);
+    const double p1 = 2.0 * atan2(nf1.ny, nf1.nx);
+    const double d = wrap_to_pi_device(p1 - p0);
+
+    atomicAdd(sum_sq, d * d);
+    atomicAdd(edges_used, 1u);
+}
+
+__global__ void computeXiGradEdgesYKernel(
+    const QTensor* Q,
+    int Nx,
+    int Ny,
+    int Nz,
+    int z_slice,
+    double S_threshold,
+    double* sum_sq,
+    unsigned int* edges_used
+) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    int j = blockIdx.y * blockDim.y + threadIdx.y;
+    if (i >= Nx || j >= Ny - 1) return;
+    if (z_slice < 0 || z_slice >= Nz) return;
+
+    const int k = z_slice;
+    const int id0 = k + Nz * (j + Ny * i);
+    const int id1 = k + Nz * ((j + 1) + Ny * i);
+
+    NematicField nf0 = calculateNematicFieldDevice(Q[id0]);
+    NematicField nf1 = calculateNematicFieldDevice(Q[id1]);
+    const bool m0 = isfinite(nf0.S) && isfinite(nf0.nx) && isfinite(nf0.ny) && (nf0.S > S_threshold);
+    const bool m1 = isfinite(nf1.S) && isfinite(nf1.nx) && isfinite(nf1.ny) && (nf1.S > S_threshold);
+    if (!(m0 && m1)) return;
+
+    const double p0 = 2.0 * atan2(nf0.ny, nf0.nx);
+    const double p1 = 2.0 * atan2(nf1.ny, nf1.nx);
+    const double d = wrap_to_pi_device(p1 - p0);
+
+    atomicAdd(sum_sq, d * d);
+    atomicAdd(edges_used, 1u);
+}
+
+// 2D nematic defect density proxy on a z-slice.
+// Matches QSRvis.py:defect_density_2d_from_slice:
+// - psi = 2*theta where theta=atan2(ny,nx)
+// - winding around plaquettes, s = 0.5*w
+// - count plaquettes with |s| > charge_cutoff
+// Returns counts: defects_count, plaq_used_count.
+__global__ void computeDefectDensity2DProxyKernel(
+    const QTensor* Q,
+    int Nx,
+    int Ny,
+    int Nz,
+    int z_slice,
+    double S_threshold,
+    double charge_cutoff,
+    unsigned int* defects_count,
+    unsigned int* plaq_used_count
+) {
+    constexpr double kPi = 3.141592653589793238462643383279502884;
+    constexpr double kInv2Pi = 1.0 / (2.0 * kPi);
+
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    int j = blockIdx.y * blockDim.y + threadIdx.y;
+    if (i >= Nx - 1 || j >= Ny - 1) return;
+    if (z_slice < 0 || z_slice >= Nz) return;
+
+    auto idx3 = [&](int ii, int jj, int kk) {
+        return kk + Nz * (jj + Ny * ii);
+    };
+
+    const int k = z_slice;
+
+    // corners: (i,j), (i+1,j), (i+1,j+1), (i,j+1)
+    const int id00 = idx3(i, j, k);
+    const int id10 = idx3(i + 1, j, k);
+    const int id11 = idx3(i + 1, j + 1, k);
+    const int id01 = idx3(i, j + 1, k);
+
+    NematicField nf00 = calculateNematicFieldDevice(Q[id00]);
+    NematicField nf10 = calculateNematicFieldDevice(Q[id10]);
+    NematicField nf11 = calculateNematicFieldDevice(Q[id11]);
+    NematicField nf01 = calculateNematicFieldDevice(Q[id01]);
+
+    const bool m00 = isfinite(nf00.S) && isfinite(nf00.nx) && isfinite(nf00.ny) && (nf00.S > S_threshold);
+    const bool m10 = isfinite(nf10.S) && isfinite(nf10.nx) && isfinite(nf10.ny) && (nf10.S > S_threshold);
+    const bool m11 = isfinite(nf11.S) && isfinite(nf11.nx) && isfinite(nf11.ny) && (nf11.S > S_threshold);
+    const bool m01 = isfinite(nf01.S) && isfinite(nf01.nx) && isfinite(nf01.ny) && (nf01.S > S_threshold);
+
+    if (!(m00 && m10 && m11 && m01)) return;
+
+    // psi = 2*theta with theta=atan2(ny,nx)
+    const double p00 = 2.0 * atan2(nf00.ny, nf00.nx);
+    const double p10 = 2.0 * atan2(nf10.ny, nf10.nx);
+    const double p11 = 2.0 * atan2(nf11.ny, nf11.nx);
+    const double p01 = 2.0 * atan2(nf01.ny, nf01.nx);
+
+    const double d1 = wrap_to_pi_device(p10 - p00);
+    const double d2 = wrap_to_pi_device(p11 - p10);
+    const double d3 = wrap_to_pi_device(p01 - p11);
+    const double d4 = wrap_to_pi_device(p00 - p01);
+    const double dsum = d1 + d2 + d3 + d4;
+
+    const double w = dsum * kInv2Pi;
+    const double s = 0.5 * w;
+
+    atomicAdd(plaq_used_count, 1u);
+    if (fabs(s) > charge_cutoff) {
+        atomicAdd(defects_count, 1u);
+    }
+}
+
 // ------------------------------------------------------------------
 // Host Helper Functions
 // ------------------------------------------------------------------
@@ -1160,7 +1311,7 @@ int main() {
         if (use_frank_map) {
             double K1 = prompt_with_default("Enter K1", 6.5e-12);
             double K2 = prompt_with_default("Enter K2", 4.0e-12);
-            double K3 = prompt_with_default("Enter K3", K1);
+            double K3 = prompt_with_default("Enter K3", 8e-12);
             // IMPORTANT: mapping depends on the amplitude convention for Q via S_ref.
             // Default to S_eq(T) computed from the selected bulk convention (std/ravnik),
             // since that keeps Frank->LdG consistent when switching conventions.
@@ -1305,6 +1456,10 @@ int main() {
         double *d_anch_energy;
         double *d_radiality_vals;
         int *d_count_vals;
+        unsigned int *d_defects_2d_count;
+        unsigned int *d_defects_2d_plaq_used;
+        double *d_xi_grad_sum;
+        unsigned int *d_xi_grad_edges_used;
 
         cudaMalloc(&d_Q, size_Q);
         cudaMalloc(&d_laplacianQ, size_Q);
@@ -1318,6 +1473,10 @@ int main() {
         cudaMalloc(&d_anch_energy, size_double);
         cudaMalloc(&d_radiality_vals, size_double);
         cudaMalloc(&d_count_vals, size_int);
+        cudaMalloc(&d_defects_2d_count, sizeof(unsigned int));
+        cudaMalloc(&d_defects_2d_plaq_used, sizeof(unsigned int));
+        cudaMalloc(&d_xi_grad_sum, sizeof(double));
+        cudaMalloc(&d_xi_grad_edges_used, sizeof(unsigned int));
 
         // Copy static data
         cudaMemcpy(d_is_shell, h_is_shell.data(), size_bool, cudaMemcpyHostToDevice);
@@ -1513,8 +1672,41 @@ int main() {
             std::getline(std::cin, user_choice_line);
             if (!user_choice_line.empty()) user_choice = user_choice_line[0];
 
+            const bool log_defects_2d = prompt_yes_no(
+                "Quench: log 2D KZ defect proxy to quench_log? (mid-plane winding)",
+                true
+            );
+            int defects_z_slice = Nz / 2;
+            double defects_S_threshold = 0.1;
+            double defects_charge_cutoff = 0.25;
+            if (log_defects_2d) {
+                defects_z_slice = prompt_with_default("Quench: z_slice for 2D proxy (0..Nz-1)", defects_z_slice);
+                if (defects_z_slice < 0) defects_z_slice = 0;
+                if (defects_z_slice >= Nz) defects_z_slice = Nz - 1;
+                defects_S_threshold = prompt_with_default("Quench: S_threshold for 2D proxy", defects_S_threshold);
+                defects_charge_cutoff = prompt_with_default("Quench: charge_cutoff |s|>", defects_charge_cutoff);
+            }
+
+            const bool log_xi_grad_2d = prompt_yes_no(
+                "Quench: log 2D xi gradient proxy to quench_log? (cheap, snapshot-free)",
+                true
+            );
+            int xi_z_slice = defects_z_slice;
+            double xi_S_threshold = defects_S_threshold;
+            if (log_xi_grad_2d) {
+                xi_z_slice = prompt_with_default("Quench: z_slice for xi proxy (0..Nz-1)", xi_z_slice);
+                if (xi_z_slice < 0) xi_z_slice = 0;
+                if (xi_z_slice >= Nz) xi_z_slice = Nz - 1;
+                xi_S_threshold = prompt_with_default("Quench: S_threshold for xi proxy", xi_S_threshold);
+            }
+
+            dim3 threads2D(16, 16, 1);
+            dim3 blocks2D((Nx - 1 + threads2D.x - 1) / threads2D.x, (Ny - 1 + threads2D.y - 1) / threads2D.y, 1);
+            dim3 blocksX((Nx - 1 + threads2D.x - 1) / threads2D.x, (Ny + threads2D.y - 1) / threads2D.y, 1);
+            dim3 blocksY((Nx + threads2D.x - 1) / threads2D.x, (Ny - 1 + threads2D.y - 1) / threads2D.y, 1);
+
             std::ofstream quench_log((out_dir / "quench_log.dat").string());
-            quench_log << "iteration,time_s,T_K,bulk,elastic,anchoring,total,radiality,avg_S\n";
+            quench_log << "iteration,time_s,T_K,bulk,elastic,anchoring,total,radiality,avg_S,defect_density_per_plaquette,defect_plaquettes_used,xi_grad_proxy,xi_grad_edges_used\n";
 
             auto compute_T_current = [&](int iter) -> double {
                 if (iter < pre_equil_iters) return T_high;
@@ -1609,6 +1801,65 @@ int main() {
                     }
                     double avg_rad = (rad_count > 0) ? total_rad / rad_count : 0.0;
 
+                    double defect_density_2d = std::numeric_limits<double>::quiet_NaN();
+                    unsigned int defect_plaq_used = 0u;
+                    if (do_log && log_defects_2d) {
+                        cudaMemset(d_defects_2d_count, 0, sizeof(unsigned int));
+                        cudaMemset(d_defects_2d_plaq_used, 0, sizeof(unsigned int));
+                        computeDefectDensity2DProxyKernel<<<blocks2D, threads2D>>>(
+                            d_Q,
+                            Nx,
+                            Ny,
+                            Nz,
+                            defects_z_slice,
+                            defects_S_threshold,
+                            defects_charge_cutoff,
+                            d_defects_2d_count,
+                            d_defects_2d_plaq_used
+                        );
+                        unsigned int defect_count = 0u;
+                        cudaMemcpy(&defect_count, d_defects_2d_count, sizeof(unsigned int), cudaMemcpyDeviceToHost);
+                        cudaMemcpy(&defect_plaq_used, d_defects_2d_plaq_used, sizeof(unsigned int), cudaMemcpyDeviceToHost);
+                        defect_density_2d = (defect_plaq_used > 0u) ? (double(defect_count) / double(defect_plaq_used)) : 0.0;
+                    }
+
+                    double xi_grad_proxy = std::numeric_limits<double>::quiet_NaN();
+                    unsigned int xi_grad_edges_used = 0u;
+                    if (do_log && log_xi_grad_2d) {
+                        cudaMemset(d_xi_grad_sum, 0, sizeof(double));
+                        cudaMemset(d_xi_grad_edges_used, 0, sizeof(unsigned int));
+                        computeXiGradEdgesXKernel<<<blocksX, threads2D>>>(
+                            d_Q,
+                            Nx,
+                            Ny,
+                            Nz,
+                            xi_z_slice,
+                            xi_S_threshold,
+                            d_xi_grad_sum,
+                            d_xi_grad_edges_used
+                        );
+                        computeXiGradEdgesYKernel<<<blocksY, threads2D>>>(
+                            d_Q,
+                            Nx,
+                            Ny,
+                            Nz,
+                            xi_z_slice,
+                            xi_S_threshold,
+                            d_xi_grad_sum,
+                            d_xi_grad_edges_used
+                        );
+                        double sum_sq = 0.0;
+                        cudaMemcpy(&sum_sq, d_xi_grad_sum, sizeof(double), cudaMemcpyDeviceToHost);
+                        cudaMemcpy(&xi_grad_edges_used, d_xi_grad_edges_used, sizeof(unsigned int), cudaMemcpyDeviceToHost);
+                        if (xi_grad_edges_used > 0u) {
+                            const double mean_sq = sum_sq / double(xi_grad_edges_used);
+                            const double eps = 1e-30;
+                            const double inv = (mean_sq > 0.0) ? (1.0 / sqrt(mean_sq + eps)) : (1.0 / sqrt(eps));
+                            const double xi_cap = 0.5 * double(std::min(Nx, Ny));
+                            xi_grad_proxy = std::min(inv, xi_cap);
+                        }
+                    }
+
                     NematicField* d_nf;
                     cudaMalloc(&d_nf, num_elements * sizeof(NematicField));
                     computeNematicFieldKernel<<<numBlocks, threadsPerBlock>>>(d_Q, d_nf, Nx, Ny, Nz);
@@ -1619,7 +1870,9 @@ int main() {
 
                     if (do_log) {
                         quench_log << iter << "," << physical_time << "," << T_current << "," << bulk_sum << "," << elastic_sum
-                                  << "," << anch_sum << "," << total_F << "," << avg_rad << "," << avg_S << "\n";
+                                  << "," << anch_sum << "," << total_F << "," << avg_rad << "," << avg_S
+                                  << "," << defect_density_2d << "," << defect_plaq_used
+                                  << "," << xi_grad_proxy << "," << xi_grad_edges_used << "\n";
                         quench_log.flush();
                         if (user_choice == 'y' || user_choice == 'Y') {
                             std::cout << "Iter " << iter << "  t=" << physical_time << " s  T=" << T_current
@@ -2172,6 +2425,8 @@ int main() {
         cudaFree(d_Dcol_x); cudaFree(d_Dcol_y); cudaFree(d_Dcol_z);
         cudaFree(d_bulk_energy); cudaFree(d_elastic_energy); cudaFree(d_anch_energy);
         cudaFree(d_radiality_vals); cudaFree(d_count_vals);
+        cudaFree(d_defects_2d_count); cudaFree(d_defects_2d_plaq_used);
+        cudaFree(d_xi_grad_sum); cudaFree(d_xi_grad_edges_used);
 
         std::cout << "\nSimulation finished." << std::endl;
         std::cout << "Would you like to run another simulation? (y/n): ";

@@ -2113,6 +2113,52 @@ def plot_quench_kz_metrics(
     data_dir = os.path.dirname(log_path) if os.path.isfile(log_path) else path
     files = glob.glob(os.path.join(data_dir, 'nematic_field_iter_*.dat'))
     if not files:
+        names = set(getattr(getattr(data, 'dtype', None), 'names', []) or [])
+        if 'defect_density_per_plaquette' in names:
+            print(
+                "[KZ metrics] No nematic_field_iter_*.dat snapshots found; using defect_density_per_plaquette from quench_log. "
+                "(xi will use xi_grad_proxy if available; otherwise NaN.)"
+            )
+            ndef = np.atleast_1d(data['defect_density_per_plaquette']).astype(float)
+            if 'xi_grad_proxy' in names:
+                xi = np.atleast_1d(data['xi_grad_proxy']).astype(float)
+            else:
+                xi = np.full_like(ndef, np.nan, dtype=float)
+            rows = np.column_stack((it_log, t_log, T_log, xi, ndef)).astype(float)
+
+            os.makedirs(out_dir, exist_ok=True)
+            tag = os.path.basename(os.path.normpath(data_dir)) or 'quench'
+            csv_path = os.path.join(out_dir, f'kz_metrics_{tag}.csv')
+            with open(csv_path, 'w', encoding='utf-8') as f:
+                f.write('iteration,time_s,T_K,xi_lattice,defect_density_per_plaquette\n')
+                for (ii, tt, TT, xii, nd) in rows:
+                    f.write(f"{int(ii)},{tt:.8g},{TT:.8g},{xii:.8g},{nd:.8g}\n")
+
+            fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(10, 7), sharex=True)
+            ax1.plot(t_log, xi, 'o-', lw=1.5)
+            ax1.set_ylabel(r'$\\xi$ (lattice units)')
+            ax1.grid(True, alpha=0.3)
+            ax1.set_title(f'KZ proxies from {tag} (log-only defect density)')
+            if 'xi_grad_proxy' in names:
+                ax1.text(0.02, 0.9, 'xi = xi_grad_proxy (gradient proxy)', transform=ax1.transAxes)
+            else:
+                ax1.text(0.02, 0.9, 'xi unavailable (no snapshots)', transform=ax1.transAxes)
+
+            ax2.plot(t_log, ndef, 'o-', color='tab:red', lw=1.5)
+            ax2.set_xlabel('time [s]')
+            ax2.set_ylabel('defect density (per plaquette)')
+            ax2.grid(True, alpha=0.3)
+
+            fig.tight_layout()
+            out_path = os.path.join(out_dir, f'kz_metrics_{tag}.png')
+            fig.savefig(out_path, dpi=200)
+            print(f"Saved KZ metrics -> {out_path}")
+            print(f"Saved KZ metrics CSV -> {csv_path}")
+            if show:
+                plt.show()
+            else:
+                plt.close(fig)
+            return rows, out_path, csv_path
         raise FileNotFoundError(f"No nematic_field_iter_*.dat snapshots found in {data_dir}")
 
     def _iter_num(p: str) -> int:
@@ -2711,6 +2757,9 @@ def aggregate_kz_scaling(
     z_avg: int = 1,
     z_margin_frac: float = 0.0,
     S_threshold: float = 0.1,
+    prefer_log_defects: bool = True,
+    allow_log_only: bool = False,
+    prefer_log_xi_proxy: bool = True,
     x_axis: str = 't_ramp',
     fit_x_min: float | None = None,
     fit_x_max: float | None = None,
@@ -2724,9 +2773,16 @@ def aggregate_kz_scaling(
 ):
     """Aggregate KZ proxies across multiple quench runs.
 
-    Scans subdirectories matching pattern that contain quench_log.dat, computes:
-      - t_ramp and |dT/dt| from log
-      - xi and defect density from final nematic field (2D mid-plane slice proxy)
+        Scans subdirectories matching pattern that contain quench_log.dat, computes:
+            - t_ramp and |dT/dt| from log
+            - defect density from quench_log.dat if present (preferred)
+            - xi from a field snapshot (2D mid-plane slice proxy)
+
+        Notes:
+            - If your runs were produced with on-the-fly defect logging enabled in QSR_cuda,
+                the log columns `defect_density_per_plaquette` / `defect_plaquettes_used` are used.
+            - Correlation length xi still requires snapshots unless you also log an xi proxy.
+            - If allow_log_only=True, missing snapshots are tolerated and xi becomes NaN.
 
     x_axis:
       - 't_ramp' : seconds
@@ -2767,7 +2823,67 @@ def aggregate_kz_scaling(
         T = np.atleast_1d(data['T_K']).astype(float)
         t_ramp, rate_abs, protocol = _estimate_ramp_from_log(it, t, T, run_name=os.path.basename(run_dir))
 
+        def _nearest_log_index(t_log: np.ndarray, t_target: float) -> int:
+            t_log = np.asarray(t_log, dtype=float)
+            if t_log.size == 0:
+                return 0
+            if not np.isfinite(float(t_target)):
+                return int(t_log.size - 1)
+            d = np.abs(t_log - float(t_target))
+            d[~np.isfinite(d)] = np.inf
+            if not np.any(np.isfinite(d)):
+                return int(t_log.size - 1)
+            return int(np.argmin(d))
+
+        def _try_defect_density_from_log(t_target: float) -> tuple[float, float, int] | None:
+            if not bool(prefer_log_defects):
+                return None
+            names = set(getattr(data.dtype, 'names', []) or [])
+            if 'defect_density_per_plaquette' not in names:
+                return None
+            dd = np.atleast_1d(data['defect_density_per_plaquette']).astype(float)
+            used = None
+            if 'defect_plaquettes_used' in names:
+                used = np.atleast_1d(data['defect_plaquettes_used']).astype(float)
+            idx = _nearest_log_index(t, float(t_target))
+            if idx < 0 or idx >= dd.size:
+                return None
+            v = float(dd[idx])
+            if not np.isfinite(v):
+                return None
+            used_i = 0
+            if used is not None and idx < used.size:
+                uu = float(used[idx])
+                used_i = int(uu) if np.isfinite(uu) else 0
+            # return (defect_density, time_at_row, used_plaquettes)
+            t_row = float(np.atleast_1d(t)[idx]) if t.size else float('nan')
+            return v, t_row, used_i
+
+        def _try_xi_proxy_from_log(t_target: float) -> tuple[float, float, int] | None:
+            if not bool(prefer_log_xi_proxy):
+                return None
+            names = set(getattr(data.dtype, 'names', []) or [])
+            if 'xi_grad_proxy' not in names:
+                return None
+            xv = np.atleast_1d(data['xi_grad_proxy']).astype(float)
+            used = None
+            if 'xi_grad_edges_used' in names:
+                used = np.atleast_1d(data['xi_grad_edges_used']).astype(float)
+            idx = _nearest_log_index(t, float(t_target))
+            if idx < 0 or idx >= xv.size:
+                return None
+            v = float(xv[idx])
+            if not np.isfinite(v):
+                return None
+            used_i = 0
+            if used is not None and idx < used.size:
+                uu = float(used[idx])
+                used_i = int(uu) if np.isfinite(uu) else 0
+            t_row = float(np.atleast_1d(t)[idx]) if t.size else float('nan')
+            return v, t_row, used_i
+
         # Choose which state to analyze
+        t_meas = float(t[-1])
         if measure_norm in ('after_tlow', 'after_t_low', 'tlow', 'after_final_t'):
             # time when we reach final temperature (heuristic: first time within eps of min(T))
             Tmin = float(np.nanmin(T))
@@ -2778,15 +2894,33 @@ def aggregate_kz_scaling(
             else:
                 t_reach = float(t[int(idxs[0])])
             t_meas = t_reach + float(after_Tlow_s)
-            field_path = _select_snapshot_by_time(run_dir, t_meas, it, t)
+            try:
+                field_path = _select_snapshot_by_time(run_dir, t_meas, it, t)
+            except FileNotFoundError:
+                if not bool(allow_log_only):
+                    raise
+                field_path = ''
         elif measure_norm in ('after_tc', 'after_t_c', 'tc', 'after_transition'):
             if Tc is None or not np.isfinite(float(Tc)):
                 raise ValueError("measure=after_Tc requires Tc to be set")
             t_cross = _crossing_time_from_log(T, t, float(Tc))
             t_meas = float(t_cross) + float(after_Tc_s)
-            field_path = _select_snapshot_by_time(run_dir, t_meas, it, t)
+            try:
+                field_path = _select_snapshot_by_time(run_dir, t_meas, it, t)
+            except FileNotFoundError:
+                if not bool(allow_log_only):
+                    raise
+                field_path = ''
         else:
-            field_path = _choose_final_field_file(run_dir)
+            try:
+                field_path = _choose_final_field_file(run_dir)
+            except FileNotFoundError:
+                if not bool(allow_log_only):
+                    raise
+                field_path = ''
+
+        log_def = _try_defect_density_from_log(t_meas)
+        log_xi = _try_xi_proxy_from_log(t_meas)
         def _iter_num(p: str) -> int:
             m = re.search(r'(\d+)', os.path.basename(p))
             return int(m.group(1)) if m else -1
@@ -2836,37 +2970,65 @@ def aggregate_kz_scaling(
         xi_std = float('nan')
         ndef_std = float('nan')
         z_use = 0
-        for _attempt in range(max_retries + 1):
-            try:
-                Nx, Ny, Nz, xi, n_def, n_used, xi_std, ndef_std, z_use = _compute_metrics_for_field(fp_try)
-                field_path = fp_try
-                break
-            except ValueError as e:
-                last_err = e
-                tried.append(os.path.basename(fp_try))
-                msg = str(e)
-                if ('No valid z-slices found for metrics' not in msg) or (not files_sorted):
-                    raise
-                it_cur = _iter_num(fp_try)
-                # Advance to the next snapshot file by iteration
-                idx = -1
-                for j, fp in enumerate(files_sorted):
-                    if _iter_num(fp) == it_cur:
-                        idx = j
-                        break
-                if idx < 0 or idx + 1 >= len(files_sorted):
+        if fp_try:
+            for _attempt in range(max_retries + 1):
+                try:
+                    Nx, Ny, Nz, xi, n_def, n_used, xi_std, ndef_std, z_use = _compute_metrics_for_field(fp_try)
+                    field_path = fp_try
                     break
-                fp_try = files_sorted[idx + 1]
-        else:
-            last_err = last_err or ValueError('No valid z-slices found for metrics')
+                except ValueError as e:
+                    last_err = e
+                    tried.append(os.path.basename(fp_try))
+                    msg = str(e)
+                    if ('No valid z-slices found for metrics' not in msg) or (not files_sorted):
+                        if not bool(allow_log_only):
+                            raise
+                        # In log-only mode, allow xi to be missing.
+                        xi = float('nan')
+                        n_def = float('nan')
+                        n_used = 0
+                        break
+                    it_cur = _iter_num(fp_try)
+                    # Advance to the next snapshot file by iteration
+                    idx = -1
+                    for j, fp in enumerate(files_sorted):
+                        if _iter_num(fp) == it_cur:
+                            idx = j
+                            break
+                    if idx < 0 or idx + 1 >= len(files_sorted):
+                        break
+                    fp_try = files_sorted[idx + 1]
+            else:
+                last_err = last_err or ValueError('No valid z-slices found for metrics')
 
-        if not (np.isfinite(xi) and np.isfinite(n_def) and int(n_used) > 0):
+        # Prefer defect density from quench_log if available (helps avoid huge snapshots).
+        if log_def is not None:
+            n_def = float(log_def[0])
+            ndef_std = float('nan')
+
+        # If snapshots are missing (or log-only is requested), use xi proxy from log if available.
+        if (not np.isfinite(xi) or int(n_used) <= 0) and (log_xi is not None):
+            xi = float(log_xi[0])
+            xi_std = float('nan')
+            n_used = max(int(n_used), 1)
+
+        have_xi = bool(np.isfinite(xi) and int(n_used) > 0)
+        have_def = bool(np.isfinite(n_def) and (n_def > 0.0 or n_def == 0.0))
+        if not have_def:
+            # Without defect density we can't do KZ scaling at all.
             if last_err is not None and 'No valid z-slices found for metrics' in str(last_err):
                 tried_s = ','.join(tried[:6]) + ('...' if len(tried) > 6 else '')
                 raise ValueError(f"{last_err} Tried snapshots: {tried_s}")
             if last_err is not None:
                 raise last_err
-            raise ValueError(f"Failed to compute KZ metrics for run {os.path.basename(run_dir)}")
+            raise ValueError(f"Failed to compute defect density for run {os.path.basename(run_dir)}")
+        if (not have_xi) and (not bool(allow_log_only)):
+            if last_err is not None and 'No valid z-slices found for metrics' in str(last_err):
+                tried_s = ','.join(tried[:6]) + ('...' if len(tried) > 6 else '')
+                raise ValueError(f"{last_err} Tried snapshots: {tried_s}")
+            if last_err is not None:
+                raise last_err
+            raise ValueError(f"Failed to compute xi for run {os.path.basename(run_dir)}")
         # A convenient "quench time" scale for ramp: tau_Q ~ t_ramp
         tau_Q = float(t_ramp)
         rows.append(
@@ -2883,7 +3045,7 @@ def aggregate_kz_scaling(
                 int(n_used),
                 xi_std,
                 ndef_std,
-                os.path.basename(field_path),
+                os.path.basename(field_path) if field_path else '',
             )
         )
 
