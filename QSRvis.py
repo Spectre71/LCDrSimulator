@@ -352,6 +352,10 @@ def plot_nematic_field_slice(
     vmax=None,
     print_stats=True,
     arrows_per_axis=None,
+    *,
+    show: bool | None = None,
+    close: bool = True,
+    return_fig: bool = False,
 ):
     """
     Loads pre-calculated nematic field data (S, n), plots a slice, and saves it.
@@ -611,12 +615,17 @@ def plot_nematic_field_slice(
     if output_path:
         # if dir doesnt exist, make one
         os.makedirs(os.path.dirname(output_path), exist_ok=True)
-        plt.savefig(output_path)
-    else:
-        # If no output path is given, show the plot interactively
+        fig.savefig(output_path)
+    # Default: show only when no output file is requested.
+    show_use = (output_path is None) if show is None else bool(show)
+    if show_use:
         plt.show()
-        
-    plt.close(fig)
+    if close and (not return_fig):
+        plt.close(fig)
+    if return_fig:
+        return fig
+
+    return None
 
 def _resolve_data_file(path_or_dir: str, filename: str) -> str:
     """Resolve a data file path from either a directory or a direct file path."""
@@ -627,7 +636,14 @@ def _resolve_data_file(path_or_dir: str, filename: str) -> str:
     return path_or_dir
 
 
-def plot_energy_VS_iter(path: str = '.', out_dir: str = 'pics', show: bool = True):
+def plot_energy_VS_iter(
+    path: str = '.',
+    out_dir: str = 'pics',
+    show: bool = True,
+    *,
+    close: bool = True,
+    return_fig: bool = False,
+):
     """Plot free energy vs iteration.
 
     Primary source: `free_energy_vs_iteration.dat`.
@@ -691,16 +707,36 @@ def plot_energy_VS_iter(path: str = '.', out_dir: str = 'pics', show: bool = Tru
     fig.tight_layout()
     os.makedirs(out_dir, exist_ok=True)
     out_path = os.path.join(out_dir, f'free_energy_vs_iteration_{tag}.png')
-    plt.savefig(out_path, dpi=150)
+    fig.savefig(out_path, dpi=150)
     print(f"Saved plot -> {out_path}")
     if show:
         plt.show()
-    else:
+    elif close and (not return_fig):
         plt.close(fig)
 
-def energy_components():
+    if return_fig:
+        return fig
+
+    return None
+
+def energy_components(
+    path: str = '.',
+    out_dir: str = 'pics',
+    show: bool = True,
+    *,
+    close: bool = True,
+    return_fig: bool = False,
+):
+    """Plot energy components vs iteration.
+
+    Primary source: energy_components_vs_iteration.dat.
+    `path` may be a directory or a direct file path.
+    """
+    data_path = _resolve_data_file(path, 'energy_components_vs_iteration.dat')
+    if not os.path.exists(data_path):
+        raise FileNotFoundError(f"Missing energy components file: {data_path}")
     # Format: iteration,bulk,elastic,total,radiality,time
-    data = np.genfromtxt('energy_components_vs_iteration.dat', delimiter=',', names=True)
+    data = np.genfromtxt(data_path, delimiter=',', names=True)
 
     # Create subplots for energy components, radiality, and time
     fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(10, 8))
@@ -731,10 +767,20 @@ def energy_components():
     ax2_right.tick_params(axis='y', labelcolor='green')
     
     fig.tight_layout()
-    if not os.path.exists('pics'):
-        os.makedirs('pics')
-    plt.savefig('pics/energy_components_vs_iteration.png', dpi=150)
-    plt.show()
+    os.makedirs(out_dir, exist_ok=True)
+    tag = os.path.basename(os.path.normpath(os.path.dirname(data_path) or '.'))
+    out_path = os.path.join(out_dir, f'energy_components_vs_iteration_{tag}.png')
+    fig.savefig(out_path, dpi=150)
+    print(f"Saved plot -> {out_path}")
+    if show:
+        plt.show()
+    elif close and (not return_fig):
+        plt.close(fig)
+
+    if return_fig:
+        return fig
+
+    return None
 
 def create_nematic_field_animation(
     data_dir,
@@ -908,7 +954,15 @@ def create_nematic_field_animation(
 
     print(f"\nAnimation saved to {output_gif}")
 
-def plotS_F(path: str = 'output_temp_sweep', out_dir: str = 'pics', show: bool = True):
+def plotS_F(
+    path: str = 'output_temp_sweep',
+    out_dir: str = 'pics',
+    show: bool = True,
+    *,
+    which: str = 'both',
+    close: bool = True,
+    return_figs: bool = False,
+):
     """Plot average S(T) and final free energy F(T) from a temperature sweep summary.
 
     Primary source: output_temp_sweep/summary.dat.
@@ -986,10 +1040,11 @@ def plotS_F(path: str = 'output_temp_sweep', out_dir: str = 'pics', show: bool =
         out1 = os.path.join(out_dir, f'average_S_vs_T_quenchlog_{tag}.png')
         plt.savefig(out1)
         print(f"Saved plot -> {out1}")
+        figS = plt.gcf()
         if show:
             plt.show()
-        else:
-            plt.close()
+        elif close and (not return_figs):
+            plt.close(figS)
 
         plt.figure(figsize=(8, 5))
         for label, Tq, _, Fq in runs:
@@ -1004,11 +1059,20 @@ def plotS_F(path: str = 'output_temp_sweep', out_dir: str = 'pics', show: bool =
         out2 = os.path.join(out_dir, f'free_energy_vs_T_quenchlog_{tag}.png')
         plt.savefig(out2)
         print(f"Saved plot -> {out2}")
+        figF = plt.gcf()
         if show:
             plt.show()
-        else:
-            plt.close()
-        return
+        elif close and (not return_figs):
+            plt.close(figF)
+
+        if return_figs:
+            wn = (which or 'both').strip().lower()
+            if wn in ('s', 'avg_s', 'avgs', 'order'):
+                return {'S': figS}
+            if wn in ('f', 'energy', 'free_energy'):
+                return {'F': figF}
+            return {'S': figS, 'F': figF}
+        return None
 
     # Avoid numpy genfromtxt crashing on empty/header-only files (common if sweep is interrupted)
     with open(summary_path, 'r', encoding='utf-8', errors='replace') as f:
@@ -1055,10 +1119,11 @@ def plotS_F(path: str = 'output_temp_sweep', out_dir: str = 'pics', show: bool =
     out1 = os.path.join(out_dir, f'average_S_vs_T_{tag}.png')
     plt.savefig(out1)
     print(f"Saved plot -> {out1}")
+    figS = plt.gcf()
     if show:
         plt.show()
-    else:
-        plt.close()
+    elif close and (not return_figs):
+        plt.close(figS)
 
     # Plot Free Energy vs Temperature
     plt.figure(figsize=(8, 5))
@@ -1072,10 +1137,21 @@ def plotS_F(path: str = 'output_temp_sweep', out_dir: str = 'pics', show: bool =
     out2 = os.path.join(out_dir, f'free_energy_vs_T_{tag}.png')
     plt.savefig(out2)
     print(f"Saved plot -> {out2}")
+    figF = plt.gcf()
     if show:
         plt.show()
-    else:
-        plt.close()
+    elif close and (not return_figs):
+        plt.close(figF)
+
+    if return_figs:
+        wn = (which or 'both').strip().lower()
+        if wn in ('s', 'avg_s', 'avgs', 'order'):
+            return {'S': figS}
+        if wn in ('f', 'energy', 'free_energy'):
+            return {'F': figF}
+        return {'S': figS, 'F': figF}
+
+    return None
 
 
 def plot_quench_energy_vs_iteration(
@@ -1370,6 +1446,7 @@ def plot_quench_log(
     *,
     it_min: int | None = None,
     it_max: int | None = None,
+    close: bool = True,
 ):
     """Plot quench diagnostics: T(t), energy components, total energy, radiality, and <S>.
 
@@ -1514,7 +1591,7 @@ def plot_quench_log(
 
     if show:
         plt.show()
-    else:
+    elif close:
         plt.close(fig)
     return fig, axes
 
@@ -2095,6 +2172,7 @@ def defect_line_metrics_3d_from_field_file(
     core_erosion_iters: int = 0,
     min_core_voxels: int = 30,
     use_skeleton: bool = True,
+    return_masks: bool = False,
 ):
     """Estimate 3D defect-line content from a field file.
 
@@ -2144,7 +2222,7 @@ def defect_line_metrics_3d_from_field_file(
     droplet_vox = int(np.count_nonzero(droplet))
     if droplet_vox == 0:
         sys_vox = int(Nx) * int(Ny) * int(Nz)
-        return {
+        out = {
             'Nx': Nx,
             'Ny': Ny,
             'Nz': Nz,
@@ -2158,6 +2236,11 @@ def defect_line_metrics_3d_from_field_file(
             'core_density_per_voxel': float('nan'),
             'core_density_per_system_voxel': float('nan'),
         }
+        if return_masks:
+            out['droplet_mask'] = droplet
+            out['core_mask'] = np.zeros_like(droplet, dtype=bool)
+            out['skeleton_mask'] = np.zeros_like(droplet, dtype=bool)
+        return out
 
     # Define a safe interior region to avoid counting low-S interface voxels.
     interior = droplet
@@ -2177,7 +2260,7 @@ def defect_line_metrics_3d_from_field_file(
     core_vox = int(np.count_nonzero(core))
     if core_vox == 0:
         sys_vox = int(Nx) * int(Ny) * int(Nz)
-        return {
+        out = {
             'Nx': Nx,
             'Ny': Ny,
             'Nz': Nz,
@@ -2191,6 +2274,11 @@ def defect_line_metrics_3d_from_field_file(
             'core_density_per_voxel': 0.0,
             'core_density_per_system_voxel': 0.0,
         }
+        if return_masks:
+            out['droplet_mask'] = droplet
+            out['core_mask'] = core
+            out['skeleton_mask'] = np.zeros_like(core, dtype=bool)
+        return out
 
     # Remove tiny noisy components
     structure = np.ones((3, 3, 3), dtype=bool)
@@ -2220,7 +2308,7 @@ def defect_line_metrics_3d_from_field_file(
     sys_vox = int(Nx) * int(Ny) * int(Nz)
     density_sys = float(length) / float(sys_vox) if np.isfinite(length) and sys_vox > 0 else float('nan')
     core_density_sys = float(core_vox) / float(sys_vox) if sys_vox > 0 else float('nan')
-    return {
+    out = {
         'Nx': Nx,
         'Ny': Ny,
         'Nz': Nz,
@@ -2238,6 +2326,11 @@ def defect_line_metrics_3d_from_field_file(
         'dilate_iters': int(dilate_iters),
         'min_core_voxels': int(min_core_voxels),
     }
+    if return_masks:
+        out['droplet_mask'] = droplet
+        out['core_mask'] = core
+        out['skeleton_mask'] = skel
+    return out
 
 
 def _nearest_from_log(iter_log: np.ndarray, values: np.ndarray, iter_target: int) -> float:
@@ -2266,6 +2359,8 @@ def plot_quench_kz_metrics(
     max_frames: int | None = 50,
     S_threshold: float = 0.1,
     show: bool = True,
+    close: bool = True,
+    return_figs: bool = False,
 ):
     """Reconstruct KZ-style metrics from quench snapshots: defect density and correlation length.
 
@@ -2327,8 +2422,10 @@ def plot_quench_kz_metrics(
             print(f"Saved KZ metrics CSV -> {csv_path}")
             if show:
                 plt.show()
-            else:
+            elif close and (not return_figs):
                 plt.close(fig)
+            if return_figs:
+                return rows, out_path, csv_path, {'metrics': fig}
             return rows, out_path, csv_path
         raise FileNotFoundError(f"No nematic_field_iter_*.dat snapshots found in {data_dir}")
 
@@ -2393,6 +2490,7 @@ def plot_quench_kz_metrics(
     # (useful for checking the expected n_def ~ xi^{-2} scaling in 2D proxies).
     m = np.isfinite(xi) & np.isfinite(ndef) & (xi > 0) & (ndef > 0)
     out_path_loglog = None
+    fig2 = None
     if np.count_nonzero(m) >= 2:
         fig2, ax = plt.subplots(1, 1, figsize=(7.2, 6))
         ax.loglog(xi[m], ndef[m], 'o', ms=7)
@@ -2411,12 +2509,17 @@ def plot_quench_kz_metrics(
         print(f"Saved KZ log-log (ndef vs xi) -> {out_path_loglog}")
         if show:
             plt.show()
-        else:
+        elif close and (not return_figs):
             plt.close(fig2)
     if show:
         plt.show()
-    else:
+    elif close and (not return_figs):
         plt.close(fig)
+    if return_figs:
+        figs = {'metrics': fig}
+        if out_path_loglog is not None and fig2 is not None:
+            figs['ndef_vs_xi'] = fig2
+        return rows, out_path, csv_path, figs
     return rows, out_path, csv_path
 
 
@@ -2966,6 +3069,8 @@ def aggregate_kz_scaling(
     show: bool = True,
     plot: bool = True,
     write_files: bool = True,
+    close: bool = True,
+    return_figs: bool = False,
 ):
     """Aggregate KZ proxies across multiple quench runs.
 
@@ -2984,6 +3089,10 @@ def aggregate_kz_scaling(
       - 't_ramp' : seconds
       - 'rate'   : |dT/dt| (K/s)
     """
+    fig = None
+    fig3 = None
+    m = np.array([], dtype=bool)
+
     if not parent_dir:
         parent_dir = '.'
 
@@ -3041,12 +3150,10 @@ def aggregate_kz_scaling(
             used = None
             if 'defect_plaquettes_used' in names:
                 used = np.atleast_1d(data['defect_plaquettes_used']).astype(float)
-            idx = _nearest_log_index(t, float(t_target))
+            idx = _nearest_log_index(t, t_target)
             if idx < 0 or idx >= dd.size:
                 return None
             v = float(dd[idx])
-            if not np.isfinite(v):
-                return None
             used_i = 0
             if used is not None and idx < used.size:
                 uu = float(used[idx])
@@ -3312,7 +3419,7 @@ def aggregate_kz_scaling(
 
         if show:
             plt.show()
-        else:
+        elif close and (not return_figs):
             plt.close(fig)
 
         # Additional KZ diagnostic: defect density vs correlation length (direct log-log relation).
@@ -3339,9 +3446,16 @@ def aggregate_kz_scaling(
                 print(f"Saved KZ ndef-vs-xi plot -> {out_path3}")
             if show:
                 plt.show()
-            else:
+            elif close and (not return_figs):
                 plt.close(fig3)
 
+    if return_figs:
+        figs = {}
+        if plot:
+            figs['kz_scaling'] = fig
+            if np.count_nonzero(m) >= 2:
+                figs['ndef_vs_xi'] = fig3
+        return rows, out_path, csv_path, figs
     return rows, out_path, csv_path
 
 
@@ -3375,6 +3489,8 @@ def aggregate_kz_scaling_3d(
     show: bool = True,
     plot: bool = True,
     write_files: bool = True,
+    close: bool = True,
+    return_fig: bool = False,
 ):
     """Aggregate 3D KZ-style metrics across multiple quench runs.
 
@@ -3386,6 +3502,7 @@ def aggregate_kz_scaling_3d(
       - 't_ramp' : seconds (tau_Q proxy)
       - 'rate'   : |dT/dt| (K/s)
     """
+    fig = None
     if not parent_dir:
         parent_dir = '.'
 
@@ -3677,9 +3794,13 @@ def aggregate_kz_scaling_3d(
 
         if show:
             plt.show()
-        else:
+        elif close and (not return_fig):
             plt.close(fig)
 
+    if return_fig and plot:
+        if fig is None:
+            raise RuntimeError("aggregate_kz_scaling_3d(plot=True, return_fig=True) did not create a figure")
+        return rows, out_path, csv_path, fig
     return rows, out_path, csv_path
 
 
@@ -3697,6 +3818,8 @@ def sweep_kz_slope_stability(
     snapshotFreq_iters: int = 10000,
     offsets_in_snaps: list[int] | None = None,
     show: bool = True,
+    close: bool = True,
+    return_fig: bool = False,
 ):
     """Sweep measurement offset after crossing Tc and report fitted slopes.
 
@@ -3735,7 +3858,7 @@ def sweep_kz_slope_stability(
     offsets_s = [int(k) * dt_snap for k in offsets_in_snaps]
     slopes = []
     for k, off_s in zip(offsets_in_snaps, offsets_s):
-        rows, _, _ = aggregate_kz_scaling(
+        res = aggregate_kz_scaling(
             parent_dir,
             pattern=pattern,
             out_dir=out_dir,
@@ -3751,6 +3874,7 @@ def sweep_kz_slope_stability(
             plot=False,
             write_files=False,
         )
+        rows = res[0]
 
         arr = np.array([[r[2], r[3], r[4], r[5]] for r in rows], dtype=float)
         t_ramp = arr[:, 0]
@@ -3791,25 +3915,60 @@ def sweep_kz_slope_stability(
     print(f"Saved slope stability CSV  -> {csv_path}")
     if show:
         plt.show()
-    else:
+    elif close and (not return_fig):
         plt.close(fig)
 
+    if return_fig:
+        return slopes, out_png, csv_path, fig
     return slopes, out_png, csv_path
 
-def animate_tempSweep(Vname=None, choice=None):
-    # Find all temperature directories (sorted numerically by T)
-    dirs = glob.glob('output_temp_sweep/T_*/')
-    if not dirs:
-        print("No directories found under output_temp_sweep/T_*/")
-        return
+def animate_tempSweep(
+    Vname=None,
+    choice: str | None = None,
+    *,
+    data_root: str = 'output_temp_sweep',
+    color_field: str | None = 'S',
+    selected: str = 'all',
+    out_dir: str = 'pics',
+    duration: float = 0.5,
+    show: bool = False,
+    close: bool = True,
+    return_gif_path: bool = False,
+):
+    """Animate a temperature sweep for embedding/automation.
 
-    # Sorting numerically is important (lexicographic sorting can misorder temperatures)
+    Parameters are designed so the original CLI can keep calling this, while
+    the GUI can call it without blocking on input().
+    """
+
+    # Find all temperature directories (sorted numerically by T)
+    dirs = glob.glob(os.path.join(data_root, 'T_*/'))
+    if not dirs:
+        print(f"No directories found under {os.path.join(data_root, 'T_*/')}")
+        return None
+
     dirs.sort(key=_parse_temperature_from_dir)
 
+    # Infer grid from first available nematic_field_final.dat
+    first_fp = None
+    for d in dirs:
+        fp = os.path.join(d, 'nematic_field_final.dat')
+        if os.path.exists(fp):
+            first_fp = fp
+            break
+    if first_fp is None:
+        print("No nematic_field_final.dat found in sweep directories")
+        return None
+    Nx, Ny, Nz = infer_grid_dims_from_nematic_field_file(first_fp)
     z_slice = Nz // 2
-    color_field = input("Choose color field for temp sweep (S, nz, n_perp) [default: S]: ").strip()
-    if not color_field:
-        color_field = 'S'
+
+    # Default choice: create a GIF
+    if not choice:
+        choice = 'g'
+
+    # Normalize color field (allow CLI prompting if color_field is None)
+    if color_field is None:
+        color_field = input("Choose color field for temp sweep (S, nz, n_perp) [default: S]: ").strip() or 'S'
     color_field_norm = color_field.strip().lower()
     if color_field_norm in ('s', 'scalar', 'order', 'orderparameter'):
         color_field_norm = 's'
@@ -3831,7 +3990,6 @@ def animate_tempSweep(Vname=None, choice=None):
             except Exception:
                 continue
             vals = S_arr[np.isfinite(S_arr)]
-            # Focus scaling on droplet interior (outside droplet tends to be zeros)
             vals = vals[vals > 0.1]
             if vals.size:
                 all_vals.append(vals)
@@ -3849,18 +4007,15 @@ def animate_tempSweep(Vname=None, choice=None):
         global_vmin, global_vmax = -1.0, 1.0
     else:
         global_vmin, global_vmax = 0.0, 1.0
-    
-    # If saving only selected frames, parse indices once.
-    # print thze number of possible indices
+
     print(f"Found {len(dirs)} temperature points (indices 0 to {len(dirs)-1}).")
-    selected_idxs = set()
+
+    selected_idxs: set[int] = set()
     if choice == 'f':
-        sel = input("Specify frame indices to save (e.g., 0,2,5-7 or 'all'): ").strip()
+        sel = selected
         if not sel:
             print("No indices specified; nothing will be saved.")
-            return
-
-        selected_idxs = set()
+            return None
         if sel.lower() == 'all':
             selected_idxs.update(range(len(dirs)))
         else:
@@ -3880,16 +4035,17 @@ def animate_tempSweep(Vname=None, choice=None):
                         selected_idxs.add(int(part))
                     except ValueError:
                         print(f"Invalid index '{part}', skipping.")
-
-        # Clamp to valid range
         selected_idxs = {i for i in selected_idxs if 0 <= i < len(dirs)}
         if not selected_idxs:
             print("No valid indices in selection; nothing will be saved.")
-            return
+            return None
 
-        os.makedirs('pics', exist_ok=True)
+    os.makedirs(out_dir, exist_ok=True)
+    tmp_dir = os.path.join(out_dir, "_temp_sweep_frames")
+    if choice == 'g':
+        os.makedirs(tmp_dir, exist_ok=True)
 
-    frame_paths = []
+    frame_paths: list[str] = []
     for idx, d in enumerate(dirs):
         S, nx, ny, nz = _load_nematic_slice_arrays(os.path.join(d, 'nematic_field_final.dat'), Nx, Ny, Nz, z_slice)
         if color_field_norm == 's':
@@ -3904,26 +4060,20 @@ def animate_tempSweep(Vname=None, choice=None):
             field = np.sqrt(nx * nx + ny * ny)
             cmap = 'magma'
             cbar_label = r'$|n_\perp|=\sqrt{n_x^2+n_y^2}$'
-        
+
         fig, ax = plt.subplots(figsize=(9, 8))
-        # Use field.T to match plot_nematic_field_slice orientation (x=i, y=j)
         im = ax.imshow(field.T, origin='lower', cmap=cmap, extent=(0, Nx, 0, Ny), vmin=global_vmin, vmax=global_vmax)
         fig.colorbar(im, ax=ax, label=cbar_label)
 
-        # Masking to hide directors in isotropic regions
         mask = S > 0.1
         step = max(Nx // 20, 1)
         x_grid, y_grid = np.meshgrid(np.arange(0, Nx, step), np.arange(0, Ny, step))
-        
-        # Apply the mask to the director components and coordinates
         x_coords = x_grid.T[mask[::step, ::step]]
         y_coords = y_grid.T[mask[::step, ::step]]
         nx_plot = nx[::step, ::step][mask[::step, ::step]]
         ny_plot = ny[::step, ::step][mask[::step, ::step]]
-
         if x_coords.size > 0:
-            ax.quiver(x_coords, y_coords, nx_plot, ny_plot,
-                    color='black', scale=30, headwidth=3, pivot='middle')
+            ax.quiver(x_coords, y_coords, nx_plot, ny_plot, color='black', scale=30, headwidth=3, pivot='middle')
 
         temp_val = _parse_temperature_from_dir(d)
         temp_str = f"{temp_val:g}" if np.isfinite(temp_val) else os.path.basename(os.path.normpath(d))
@@ -3935,28 +4085,33 @@ def animate_tempSweep(Vname=None, choice=None):
         ax.set_aspect('equal', adjustable='box')
 
         if choice == 'g':
-            frame_path = f'output_temp_sweep/frame_{idx:04d}.png'
+            frame_path = os.path.join(tmp_dir, f'frame_{idx:04d}.png')
             plt.savefig(frame_path)
-            plt.close(fig)
             frame_paths.append(frame_path)
+            if close:
+                plt.close(fig)
         elif choice == 'f':
             if idx not in selected_idxs:
-                plt.close(fig)
+                if close:
+                    plt.close(fig)
                 continue
-            # Include both index and temperature in the filename
-            out = f'pics/temp_sweep_frame_{idx:04d}_T_{temp_str}.png'
+            out = os.path.join(out_dir, f'temp_sweep_frame_{idx:04d}_T_{temp_str}.png')
             if Vname:
-                out = f'pics/temp_sweep_frame_{idx:04d}_T_{temp_str}_{Vname}.png'
+                out = os.path.join(out_dir, f'temp_sweep_frame_{idx:04d}_T_{temp_str}_{Vname}.png')
             plt.savefig(out)
-            plt.close(fig)
+            if close:
+                plt.close(fig)
             print(f"Saved frame {idx} -> {out}")
         else:
-            plt.close(fig)
+            if show:
+                plt.show()
+            elif close:
+                plt.close(fig)
 
+    gif_path = None
     if choice == 'g':
-        os.makedirs('pics', exist_ok=True)
-        gif_path = f'pics/temp_sweep_animation_{Vname}.gif' if Vname else 'pics/temp_sweep_animation.gif'
-        writer: Any = imageio.get_writer(gif_path, mode='I', duration=0.5)
+        gif_path = os.path.join(out_dir, f'temp_sweep_animation_{Vname}.gif' if Vname else 'temp_sweep_animation.gif')
+        writer: Any = imageio.get_writer(gif_path, mode='I', duration=float(duration))
         try:
             for fp in frame_paths:
                 image = imageio.imread(fp)
@@ -3964,14 +4119,21 @@ def animate_tempSweep(Vname=None, choice=None):
         finally:
             writer.close()
 
-        # Clean up temporary frames
         for fp in frame_paths:
             try:
                 os.remove(fp)
             except OSError:
                 pass
+        try:
+            os.rmdir(tmp_dir)
+        except OSError:
+            pass
 
         print(f"Animation saved to {gif_path}")
+
+    if return_gif_path:
+        return gif_path
+    return None
 
 # Use imageio or ffmpeg to make an animation from the frames
 # ----------------------------------------------------------------------- MAIN SCRIPT ---------------------------------------------------------------------------|

@@ -1,9 +1,12 @@
 #include "QSR.cuh"
 #include <cctype>
 #include <cstdlib>
+#include <fstream>
+#include <sstream>
 #include <limits>
 #include <tuple>
 #include <type_traits>
+#include <unordered_map>
 
 namespace fs = std::filesystem;
 
@@ -1055,6 +1058,132 @@ __global__ void computeDefectDensity2DProxyKernel(
 // Host Helper Functions
 // ------------------------------------------------------------------
 
+static inline std::string trim_copy(const std::string& s) {
+    size_t b = 0;
+    while (b < s.size() && std::isspace(static_cast<unsigned char>(s[b]))) ++b;
+    size_t e = s.size();
+    while (e > b && std::isspace(static_cast<unsigned char>(s[e - 1]))) --e;
+    return s.substr(b, e - b);
+}
+
+static std::unordered_map<std::string, std::string> parse_kv_config_file(const std::string& path) {
+    std::unordered_map<std::string, std::string> cfg;
+    if (path.empty()) return cfg;
+    std::ifstream f(path);
+    if (!f) {
+        std::cerr << "[Config] Could not open config file: " << path << std::endl;
+        return cfg;
+    }
+    std::string line;
+    while (std::getline(f, line)) {
+        // strip comments
+        const size_t hash = line.find('#');
+        if (hash != std::string::npos) line = line.substr(0, hash);
+        line = trim_copy(line);
+        if (line.empty()) continue;
+
+        const size_t eq = line.find('=');
+        if (eq == std::string::npos) continue;
+        std::string key = trim_copy(line.substr(0, eq));
+        std::string val = trim_copy(line.substr(eq + 1));
+        if (key.empty()) continue;
+        cfg[key] = val;
+    }
+    return cfg;
+}
+
+template<typename T>
+static T parse_value_or_default(const std::string& s, T default_value) {
+    if (s.empty()) return default_value;
+
+    if constexpr (std::is_same_v<T, bool>) {
+        std::string v;
+        v.reserve(s.size());
+        for (char c : s) v.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(c))));
+        v = trim_copy(v);
+        if (v == "1" || v == "true" || v == "yes" || v == "y" || v == "on") return true;
+        if (v == "0" || v == "false" || v == "no" || v == "n" || v == "off") return false;
+        return default_value;
+    } else if constexpr (std::is_integral_v<T> && !std::is_same_v<T, bool>) {
+        try {
+            size_t idx = 0;
+            long double v = std::stold(s, &idx);
+            while (idx < s.size() && std::isspace(static_cast<unsigned char>(s[idx]))) ++idx;
+            if (idx != s.size()) return default_value;
+            long double vr = std::llround(v);
+            const long double lo = static_cast<long double>(std::numeric_limits<T>::min());
+            const long double hi = static_cast<long double>(std::numeric_limits<T>::max());
+            if (vr < lo || vr > hi) return default_value;
+            return static_cast<T>(vr);
+        } catch (...) {
+            return default_value;
+        }
+    } else {
+        std::istringstream iss(s);
+        T out;
+        if (!(iss >> out)) return default_value;
+        return out;
+    }
+}
+
+static std::string cfg_get_string(
+    const std::unordered_map<std::string, std::string>& cfg,
+    const std::string& key,
+    const std::string& default_value
+) {
+    auto it = cfg.find(key);
+    if (it == cfg.end()) return default_value;
+    return it->second;
+}
+
+template<typename T>
+static T cfg_get_value(
+    const std::unordered_map<std::string, std::string>& cfg,
+    const std::string& key,
+    T default_value
+) {
+    auto it = cfg.find(key);
+    if (it == cfg.end()) return default_value;
+    return parse_value_or_default<T>(it->second, default_value);
+}
+
+// Forward declarations (needed because cfg_or_prompt* uses these)
+template<typename T>
+T prompt_with_default(const std::string& prompt, T default_value);
+
+static bool prompt_yes_no(const std::string& prompt, bool default_yes);
+
+template<typename T>
+static T cfg_or_prompt(
+    const std::unordered_map<std::string, std::string>& cfg,
+    const std::string& key,
+    const std::string& prompt,
+    T default_value,
+    bool interactive
+) {
+    if (!interactive) {
+        return cfg_get_value<T>(cfg, key, default_value);
+    }
+
+    // interactive: let config override the displayed default (handy for tweaking)
+    const T def = cfg_get_value<T>(cfg, key, default_value);
+    return prompt_with_default<T>(prompt, def);
+}
+
+static bool cfg_or_prompt_yes_no(
+    const std::unordered_map<std::string, std::string>& cfg,
+    const std::string& key,
+    const std::string& prompt,
+    bool default_yes,
+    bool interactive
+) {
+    if (!interactive) {
+        return cfg_get_value<bool>(cfg, key, default_yes);
+    }
+    const bool def = cfg_get_value<bool>(cfg, key, default_yes);
+    return prompt_yes_no(prompt, def);
+}
+
 template<typename T>
 T prompt_with_default(const std::string& prompt, T default_value) {
     std::string line;
@@ -1374,7 +1503,37 @@ static void initializeIsotropicWithNoise(std::vector<QTensor>& Q, int Nx, int Ny
 // Main
 // ------------------------------------------------------------------
 
-int main() {
+static void print_cli_help() {
+    std::cout
+        << "QSR_cuda options:\n"
+        << "  --config <path>       Run non-interactively using key=value config file\n"
+        << "  --interactive         When used with --config, still prompt (config values become defaults)\n"
+        << "  --help                Show this help\n";
+}
+
+int main(int argc, char** argv) {
+    std::string config_path;
+    bool interactive = true;
+    for (int i = 1; i < argc; ++i) {
+        const std::string arg = argv[i] ? argv[i] : "";
+        if (arg == "--help" || arg == "-h") {
+            print_cli_help();
+            return 0;
+        }
+        if (arg == "--config" && i + 1 < argc) {
+            config_path = argv[++i];
+            interactive = false;
+            continue;
+        }
+        if (arg == "--interactive") {
+            interactive = true;
+            continue;
+        }
+    }
+
+    const auto cfg = parse_kv_config_file(config_path);
+    const bool allow_run_again_loop = interactive; // if config is provided, default to a single run
+
     bool run_again = false;
     do {
         // Default values
@@ -1386,29 +1545,31 @@ int main() {
         int modechoice_default=1;      
 
         std::cout << "\033[1mQ-tensor evolution simulation (CUDA Accelerated)\033[0m\n" << std::endl;
-        std::cout << "Press {\033[1;33mEnter\033[0m} to use [\033[1;34mdefault\033[0m] values.\n" << std::endl;
+        if (interactive) {
+            std::cout << "Press {\033[1;33mEnter\033[0m} to use [\033[1;34mdefault\033[0m] values.\n" << std::endl;
+        } else {
+            std::cout << "[Config] Running non-interactively" << (config_path.empty() ? " (no config path?)" : (" with " + config_path)) << "\n";
+        }
 
-        std::cout << "Select initialization mode: [0] random, [1] radial, [2] isotropic+noise (default: 1): ";
-        std::string mode_input; std::getline(std::cin, mode_input);
-        int mode = 1;
-        if (mode_input == "0") mode = 0;
-        else if (mode_input == "2") mode = 2;
+        int mode = cfg_or_prompt<int>(cfg, "init_mode", "Select initialization mode: [0] random, [1] radial, [2] isotropic+noise", 1, interactive);
+        if (mode < 0) mode = 0;
+        if (mode > 2) mode = 2;
 
         std::cout << "\n--- Spatial Parameters ---" << std::endl;
-        int Nx = prompt_with_default("Enter grid size Nx", Nx_default);
-        int Ny = prompt_with_default("Enter grid size Ny", Ny_default);
-        int Nz = prompt_with_default("Enter grid size Nz", Nz_default);
-        double dx = prompt_with_default("Enter dx (m)", dx_default);
-        double dy = prompt_with_default("Enter dy (m)", dy_default);
-        double dz = prompt_with_default("Enter dz (m)", dz_default);
+        int Nx = cfg_or_prompt<int>(cfg, "Nx", "Enter grid size Nx", Nx_default, interactive);
+        int Ny = cfg_or_prompt<int>(cfg, "Ny", "Enter grid size Ny", Ny_default, interactive);
+        int Nz = cfg_or_prompt<int>(cfg, "Nz", "Enter grid size Nz", Nz_default, interactive);
+        double dx = cfg_or_prompt<double>(cfg, "dx", "Enter dx (m)", dx_default, interactive);
+        double dy = cfg_or_prompt<double>(cfg, "dy", "Enter dy (m)", dy_default, interactive);
+        double dz = cfg_or_prompt<double>(cfg, "dz", "Enter dz (m)", dz_default, interactive);
         
         std::cout << "\n--- Landau-de Gennes Material Parameters ---" << std::endl;
-        double a = prompt_with_default("Enter a (J/m^3/K)", a_default);
-        double b = prompt_with_default("Enter b (J/m^3)", b_default);
-        double c = prompt_with_default("Enter c (J/m^3)", c_default);
-        double T = prompt_with_default("Enter T (K)", T_default);
-        double T_star = prompt_with_default("Enter T* (K) [A=0, isotropic spinodal]", T_star_default);
-        int modechoice = prompt_with_default("Enter Bulk Energy convention (1=std, 2=ravnik)", modechoice_default);
+        double a = cfg_or_prompt<double>(cfg, "a", "Enter a (J/m^3/K)", a_default, interactive);
+        double b = cfg_or_prompt<double>(cfg, "b", "Enter b (J/m^3)", b_default, interactive);
+        double c = cfg_or_prompt<double>(cfg, "c", "Enter c (J/m^3)", c_default, interactive);
+        double T = cfg_or_prompt<double>(cfg, "T", "Enter T (K)", T_default, interactive);
+        double T_star = cfg_or_prompt<double>(cfg, "T_star", "Enter T* (K) [A=0, isotropic spinodal]", T_star_default, interactive);
+        int modechoice = cfg_or_prompt<int>(cfg, "bulk_modechoice", "Enter Bulk Energy convention (1=std, 2=ravnik)", modechoice_default, interactive);
 
         double A = 0.0, B = 0.0, C = 0.0;
         bulk_ABC_from_convention(a, b, c, T, T_star, modechoice, A, B, C);
@@ -1430,26 +1591,24 @@ int main() {
                     << "  T_NI (coexistence, global min) ≈ " << T_NI << " K\n"
                     << "  T_spin,N (nematic disappears)  ≈ " << T_spinN << " K\n";
           }
-        double S0 = prompt_with_default("Enter initial S0", S_eq > 0 ? S_eq : 0.5);
+        double S0 = cfg_or_prompt<double>(cfg, "S0", "Enter initial S0", S_eq > 0 ? S_eq : 0.5, interactive);
         
         std::cout << "\n--- Elastic and Dynamic Parameters ---" << std::endl;
         // color yellow text: \033[1;33m
         std::cout << "Generally: \033[1;33m Twist (K2) < Splay (K1) < Bend (K3)\033[0m" << std::endl;
-        double kappa = prompt_with_default("Enter kappa (J/m)", kappa_default);
-        std::cout << "Use Frank-to-LdG mapping with K1, K2, K3? (y/n) [n]: ";
-        std::string use_frank_map_in; std::getline(std::cin, use_frank_map_in);
-        bool use_frank_map = (!use_frank_map_in.empty() && (use_frank_map_in[0]=='y' || use_frank_map_in[0]=='Y'));
+        double kappa = cfg_or_prompt<double>(cfg, "kappa", "Enter kappa (J/m)", kappa_default, interactive);
+        bool use_frank_map = cfg_or_prompt_yes_no(cfg, "use_frank_map", "Use Frank-to-LdG mapping with K1, K2, K3?", false, interactive);
         double L1 = 0.0, L2 = 0.0, L3 = 0.0;
         double S_ref_used = std::numeric_limits<double>::quiet_NaN();
         if (use_frank_map) {
-            double K1 = prompt_with_default("Enter K1", 6.5e-12);
-            double K2 = prompt_with_default("Enter K2", 4.0e-12);
-            double K3 = prompt_with_default("Enter K3", 8e-12);
+            double K1 = cfg_or_prompt<double>(cfg, "K1", "Enter K1", 6.5e-12, interactive);
+            double K2 = cfg_or_prompt<double>(cfg, "K2", "Enter K2", 4.0e-12, interactive);
+            double K3 = cfg_or_prompt<double>(cfg, "K3", "Enter K3", 8e-12, interactive);
             // IMPORTANT: mapping depends on the amplitude convention for Q via S_ref.
             // Default to S_eq(T) computed from the selected bulk convention (std/ravnik),
             // since that keeps Frank->LdG consistent when switching conventions.
             double S_ref_default = (S_eq > 0.0) ? S_eq : ((S0 > 0.0) ? S0 : (b / (2.0 * c)));
-            double S_ref = prompt_with_default("Enter S_ref for mapping (default: S_eq(T))", S_ref_default);
+            double S_ref = cfg_or_prompt<double>(cfg, "S_ref", "Enter S_ref for mapping (default: S_eq(T))", S_ref_default, interactive);
             if (S_ref <= 1e-12) S_ref = 0.5;
             S_ref_used = S_ref;
 
@@ -1495,9 +1654,10 @@ int main() {
                           << ", L2=" << L2 << ", L1+L2=" << (L1 + L2) << ").\n"
                           << "          For L3=0, require L1>0 and L1+L2>0. With L3!=0 this check is not sufficient\n"
                           << "          but violations often lead to blow-up (unphysical |Q| growth).\n";
-                bool proceed = prompt_yes_no("Proceed anyway?", false);
+                bool proceed = cfg_or_prompt_yes_no(cfg, "proceed_unstable_elastic", "Proceed anyway?", false, interactive);
                 if (!proceed) {
                     std::cout << "Aborting this run; choose different K1/K2/K3 or do not use Frank mapping." << std::endl;
+                    if (!allow_run_again_loop) return 1;
                     std::cout << "Would you like to run another simulation? (y/n): ";
                     std::string again; std::getline(std::cin, again);
                     run_again = (!again.empty() && (again[0] == 'y' || again[0] == 'Y'));
@@ -1505,18 +1665,19 @@ int main() {
                 }
             }
         } else {
-            L1 = prompt_with_default("Enter L1", 0.0);
-            L2 = prompt_with_default("Enter L2", 0.0);
-            L3 = prompt_with_default("Enter L3", 0.0);
+            L1 = cfg_or_prompt<double>(cfg, "L1", "Enter L1", 0.0, interactive);
+            L2 = cfg_or_prompt<double>(cfg, "L2", "Enter L2", 0.0, interactive);
+            L3 = cfg_or_prompt<double>(cfg, "L3", "Enter L3", 0.0, interactive);
             if (L1 != 0 || L2 != 0 || L3 != 0) kappa = 0.0;
 
             if ((L1 != 0.0 || L2 != 0.0) && (!(L1 > 0.0) || !((L1 + L2) > 0.0))) {
                 std::cout << "\n[ERROR] Unstable elastic parameters for this model (L1=" << L1
                           << ", L2=" << L2 << ", L1+L2=" << (L1 + L2) << ").\n"
                           << "        For the implemented L1/L2 form with L3=0, require L1>0 and L1+L2>0.\n";
-                bool proceed = prompt_yes_no("Proceed anyway?", false);
+                bool proceed = cfg_or_prompt_yes_no(cfg, "proceed_unstable_elastic", "Proceed anyway?", false, interactive);
                 if (!proceed) {
                     std::cout << "Aborting this run; choose stable L1/L2 or use kappa instead." << std::endl;
+                    if (!allow_run_again_loop) return 1;
                     std::cout << "Would you like to run another simulation? (y/n): ";
                     std::string again; std::getline(std::cin, again);
                     run_again = (!again.empty() && (again[0] == 'y' || again[0] == 'Y'));
@@ -1525,34 +1686,39 @@ int main() {
             }
         }
 
-        bool xi_guard_enabled = prompt_yes_no("Enable correlation-length guard (abort if xi is under-resolved)?", true);
+        bool xi_guard_enabled = cfg_or_prompt_yes_no(cfg, "xi_guard_enabled", "Enable correlation-length guard (abort if xi is under-resolved)?", true, interactive);
         if (!correlation_length_guard(Nx, Ny, Nz, dx, dy, dz, a, b, c, T, T_star, modechoice, kappa, L1, L2, xi_guard_enabled)) {
             std::cout << "\nAborting this run due to correlation-length guard." << std::endl;
             std::cout << "Tip: decrease dx/dy/dz or move T closer to T* to increase xi." << std::endl;
+            if (!allow_run_again_loop) return 1;
             std::cout << "Would you like to run another simulation? (y/n): ";
             std::string again; std::getline(std::cin, again);
             run_again = (!again.empty() && (again[0] == 'y' || again[0] == 'Y'));
             continue;
         }
 
-        double W = prompt_with_default("Enter weak anchoring W (J/m^2)", 0.0);
-        double gamma = prompt_with_default("Enter gamma (Pa·s)", gamma_default);
-        int maxIterations = prompt_with_default("Enter iterations", maxIterations_default);
-        int printFreq = prompt_with_default("Enter print freq", 200);
-        double tolerance = prompt_with_default("Enter tolerance", 1e-2);
+        double W = cfg_or_prompt<double>(cfg, "W", "Enter weak anchoring W (J/m^2)", 0.0, interactive);
+        double gamma = cfg_or_prompt<double>(cfg, "gamma", "Enter gamma (Pa·s)", gamma_default, interactive);
+        int maxIterations = cfg_or_prompt<int>(cfg, "iterations", "Enter iterations", maxIterations_default, interactive);
+        int printFreq = cfg_or_prompt<int>(cfg, "print_freq", "Enter print freq", 200, interactive);
+        double tolerance = cfg_or_prompt<double>(cfg, "tolerance", "Enter tolerance", 1e-2, interactive);
         // Relative convergence threshold for radiality changes between consecutive samples.
         // Example: 1e-2 means "< 1% change".
-        double RbEps = prompt_with_default("Enter radiality convergence eps RbEps (relative ΔR̄)", 1e-2);
+        double RbEps = cfg_or_prompt<double>(cfg, "RbEps", "Enter radiality convergence eps RbEps (relative ΔR̄)", 1e-2, interactive);
 
         // Debugging aids (off by default because they can slow down runs).
-        const bool debug_cuda_checks = prompt_yes_no(
+        const bool debug_cuda_checks = cfg_or_prompt_yes_no(
+            cfg,
+            "debug_cuda_checks",
             "Debug: enable CUDA error checks at log points? (syncs GPU; slower)",
             false
-        );
-        const bool debug_dynamics = prompt_yes_no(
+        , interactive);
+        const bool debug_dynamics = cfg_or_prompt_yes_no(
+            cfg,
+            "debug_dynamics",
             "Debug: print max|mu| and max|ΔQ| at log points? (copies arrays; slower)",
             false
-        );
+        , interactive);
 
         // Host Memory
         size_t num_elements = Nx * Ny * Nz;
@@ -1621,7 +1787,7 @@ int main() {
         dim3 numBlocks((Nx + 7) / 8, (Ny + 7) / 8, (Nz + 7) / 8);
 
         std::cout << "\nSelect simulation mode: [1] Single Temp, [2] Temp Range, [3] Quench (time-dependent T): ";
-        int sim_mode = prompt_with_default("", 1);
+        int sim_mode = cfg_or_prompt<int>(cfg, "sim_mode", "", 1, interactive);
 
         auto compute_avg_S_droplet = [&](const std::vector<NematicField>& nf) -> double {
             double total_S = 0.0;
@@ -1667,16 +1833,23 @@ int main() {
         };
 
         if (sim_mode == 3) {
-            std::cout << "Output directory for quench results [default: output_quench]: ";
             std::string out_dir_name;
-            std::getline(std::cin, out_dir_name);
-            if (out_dir_name.empty()) out_dir_name = "output_quench";
+            if (!interactive) {
+                out_dir_name = cfg_get_string(cfg, "out_dir", "output_quench");
+            } else {
+                std::cout << "Output directory for quench results [default: output_quench]: ";
+                std::getline(std::cin, out_dir_name);
+                if (out_dir_name.empty()) out_dir_name = cfg_get_string(cfg, "out_dir", "output_quench");
+            }
 
             fs::path out_dir = out_dir_name;
             if (fs::exists(out_dir)) {
-                bool overwrite = prompt_yes_no(
+                bool overwrite = cfg_or_prompt_yes_no(
+                    cfg,
+                    "overwrite_out_dir",
                     ("Directory '" + out_dir.string() + "' exists. Delete it and start fresh?").c_str(),
-                    true
+                    true,
+                    interactive
                 );
                 if (overwrite) {
                     fs::remove_all(out_dir);
@@ -1684,29 +1857,29 @@ int main() {
             }
             fs::create_directories(out_dir);
 
-            int protocol = prompt_with_default("Quench protocol (1=step, 2=ramp)", 2);
-            double T_high = prompt_with_default("T_high (K)", T);
-            double T_low = prompt_with_default("T_low (K)", T_high - 5.0);
-            int pre_equil_iters = prompt_with_default("Pre-equilibration iterations at T_high", 0);
+            int protocol = cfg_or_prompt<int>(cfg, "protocol", "Quench protocol (1=step, 2=ramp)", 2, interactive);
+            double T_high = cfg_or_prompt<double>(cfg, "T_high", "T_high (K)", T, interactive);
+            double T_low = cfg_or_prompt<double>(cfg, "T_low", "T_low (K)", T_high - 5.0, interactive);
+            int pre_equil_iters = cfg_or_prompt<int>(cfg, "pre_equil_iters", "Pre-equilibration iterations at T_high", 0, interactive);
             int ramp_iters = 0;
             if (protocol == 2) {
-                ramp_iters = prompt_with_default("Ramp iterations (>=1)", 1000);
+                ramp_iters = cfg_or_prompt<int>(cfg, "ramp_iters", "Ramp iterations (>=1)", 1000, interactive);
                 if (ramp_iters < 1) ramp_iters = 1;
             }
-            int total_iters = prompt_with_default("Total iterations", maxIterations);
+            int total_iters = cfg_or_prompt<int>(cfg, "total_iters", "Total iterations", maxIterations, interactive);
             if (total_iters < 1) total_iters = 1;
-            int logFreq = prompt_with_default("Log/print freq", printFreq);
+            int logFreq = cfg_or_prompt<int>(cfg, "logFreq", "Log/print freq", printFreq, interactive);
             if (logFreq < 1) logFreq = 1;
 
             std::cout << "\nSnapshot intent: [0] Off (final only), [1] GIF (regular snapshots), [2] KZ (snapshots around Tc)" << std::endl;
-            int snapshot_mode = prompt_with_default("Select snapshot mode", 2);
+            int snapshot_mode = cfg_or_prompt<int>(cfg, "snapshot_mode", "Select snapshot mode", 2, interactive);
             if (snapshot_mode < 0) snapshot_mode = 0;
             if (snapshot_mode > 2) snapshot_mode = 2;
 
             // GIF mode: save every snapshotFreq iterations.
             int snapshotFreq = 0;
             if (snapshot_mode == 1) {
-                snapshotFreq = prompt_with_default("GIF snapshot frequency in iterations (0=off)", 10000);
+                snapshotFreq = cfg_or_prompt<int>(cfg, "snapshotFreq", "GIF snapshot frequency in iterations (0=off)", 10000, interactive);
                 if (snapshotFreq < 0) snapshotFreq = 0;
             }
 
@@ -1721,33 +1894,36 @@ int main() {
             if (snapshot_mode == 2) {
                 std::cout << "\n[KZ MODE] Snapshots will be saved around Tc so you can measure at a chosen offset." << std::endl;
                 std::cout << "         Use a relatively dense snapshot frequency for flexibility (e.g. 1k–10k iters)." << std::endl;
-                Tc_KZ = prompt_with_default("Tc for KZ snapshots (K)", 310.2);
+                Tc_KZ = cfg_or_prompt<double>(cfg, "Tc_KZ", "Tc for KZ snapshots (K)", 310.2, interactive);
                 if (protocol == 2) {
-                    Tc_window_K = prompt_with_default("Temperature window half-width around Tc (K)", 0.5);
+                    Tc_window_K = cfg_or_prompt<double>(cfg, "Tc_window_K", "Temperature window half-width around Tc (K)", 0.5, interactive);
                     if (Tc_window_K < 0.0) Tc_window_K = -Tc_window_K;
-                    kzSnapshotFreq = prompt_with_default("KZ snapshot frequency in iterations", 1000);
+                    kzSnapshotFreq = cfg_or_prompt<int>(cfg, "kzSnapshotFreq", "KZ snapshot frequency in iterations", 1000, interactive);
                     if (kzSnapshotFreq < 1) kzSnapshotFreq = 1;
                 } else {
                     std::cout << "\n[NOTE] Step quench has no Tc ramp. We'll snapshot for a fixed number of iterations after the step." << std::endl;
-                    kzItersAfterStep = prompt_with_default("Iterations after the step to record KZ snapshots", 200000);
+                    kzItersAfterStep = cfg_or_prompt<int>(cfg, "kzItersAfterStep", "Iterations after the step to record KZ snapshots", 200000, interactive);
                     if (kzItersAfterStep < 1) kzItersAfterStep = 1;
-                    kzSnapshotFreq = prompt_with_default("KZ snapshot frequency in iterations", 1000);
+                    kzSnapshotFreq = cfg_or_prompt<int>(cfg, "kzSnapshotFreq", "KZ snapshot frequency in iterations", 1000, interactive);
                     if (kzSnapshotFreq < 1) kzSnapshotFreq = 1;
                 }
 
-                kz_stop_early = prompt_yes_no(
+                kz_stop_early = cfg_or_prompt_yes_no(
+                    cfg,
+                    "kz_stop_early",
                     "In KZ mode, stop simulation once recording window is finished? (saves final state at stop)",
-                    true
+                    true,
+                    interactive
                 );
                 if (kz_stop_early) {
-                    kzExtraIters = prompt_with_default("Extra iterations after leaving window (for coarsening/offset flexibility)", 0);
+                    kzExtraIters = cfg_or_prompt<int>(cfg, "kzExtraIters", "Extra iterations after leaving window (for coarsening/offset flexibility)", 0, interactive);
                     if (kzExtraIters < 0) kzExtraIters = 0;
                 }
             }
 
             double noise_amplitude = 0.0;
             if (mode == 2) {
-                noise_amplitude = prompt_with_default("Noise amplitude for isotropic init", 1e-3);
+                noise_amplitude = cfg_or_prompt<double>(cfg, "noise_amplitude", "Noise amplitude for isotropic init", 1e-3, interactive);
                 initializeIsotropicWithNoise(h_Q, Nx, Ny, Nz, noise_amplitude);
             } else {
                 initializeQTensor(h_Q, Nx, Ny, Nz, S0, mode);
@@ -1793,9 +1969,12 @@ int main() {
             // Semi-implicit stabilization for stiff elastic Laplacian term:
             // backward-Euler on +L_stab*Laplace(Q)/gamma, explicit on everything else.
             // NOTE: this only stabilizes the isotropic Laplacian-like piece; L2/L3 contributions remain explicit.
-            const bool use_semi_implicit = prompt_yes_no(
+            const bool use_semi_implicit = cfg_or_prompt_yes_no(
+                cfg,
+                "use_semi_implicit",
                 "Quench: use semi-implicit elastic stabilizer? (Helmholtz solve via Jacobi)",
-                true
+                true,
+                interactive
             );
 
             // Choose the coefficient that multiplies the isotropic Laplacian in the chemical potential.
@@ -1809,14 +1988,14 @@ int main() {
             int jacobi_iters = 0;
             if (use_semi_implicit) {
                 const double L_stab_default = (L_base_abs > 0.0) ? L_base_abs : 0.0;
-                L_stab = prompt_with_default("Semi-implicit: L_stab (use |L1| or |kappa|)", L_stab_default);
+                L_stab = cfg_or_prompt<double>(cfg, "L_stab", "Semi-implicit: L_stab (use |L1| or |kappa|)", L_stab_default, interactive);
                 if (!std::isfinite(L_stab) || L_stab < 0.0) L_stab = 0.0;
                 if (L_base_abs > 0.0 && L_stab > L_base_abs) {
                     std::cout << "[SemiImplicit] Clamping L_stab from " << L_stab << " to |L_base|=" << L_base_abs
                               << " to avoid anti-diffusive explicit remainder." << std::endl;
                     L_stab = L_base_abs;
                 }
-                jacobi_iters = prompt_with_default("Semi-implicit: Jacobi iterations per step", 25);
+                jacobi_iters = cfg_or_prompt<int>(cfg, "jacobi_iters", "Semi-implicit: Jacobi iterations per step", 25, interactive);
                 if (jacobi_iters < 0) jacobi_iters = 0;
             }
 
@@ -1870,31 +2049,40 @@ int main() {
                       << "  dt_diff_total      ≈ " << dt_diff_total << " s" << (use_semi_implicit ? " (before semi-implicit)" : "") << "\n"
                       << "  dt_bulk (bulk)    ≈ " << dt_bulk << " s\n"
                       << "  dt_max            = " << dt_max << " s" << std::endl;
-            double dt = prompt_with_default("Enter time step dt (s)", dt_max);
+            double dt = cfg_or_prompt<double>(cfg, "dt", "Enter time step dt (s)", dt_max, interactive);
             if (dt > dt_max) dt = dt_max;
 
             // Optional numerical guards to detect (and optionally mitigate) the runaway-S / Nyquist checkerboard.
-            const bool enable_instability_guard = prompt_yes_no(
+            const bool enable_instability_guard = cfg_or_prompt_yes_no(
+                cfg,
+                "enable_instability_guard",
                 "Enable instability guard? (abort/adjust if S blows up or Nyquist checkerboard grows)",
-                true
+                true,
+                interactive
             );
-            const bool enable_adaptive_dt = enable_instability_guard && prompt_yes_no(
+            const bool enable_adaptive_dt = enable_instability_guard && cfg_or_prompt_yes_no(
+                cfg,
+                "enable_adaptive_dt",
                 "Guard: adapt dt downward when instability is detected? (no rollback)",
-                true
+                true,
+                interactive
             );
             const double S_abort = enable_instability_guard
-                ? prompt_with_default("Guard: abort if max S exceeds", 2.0)
+                ? cfg_or_prompt<double>(cfg, "S_abort", "Guard: abort if max S exceeds", 2.0, interactive)
                 : 0.0;
             const double checker_rel_abort = enable_instability_guard
-                ? prompt_with_default("Guard: abort if checkerboard rel-amplitude exceeds", 0.10)
+                ? cfg_or_prompt<double>(cfg, "checker_rel_abort", "Guard: abort if checkerboard rel-amplitude exceeds", 0.10, interactive)
                 : 0.0;
 
-            const bool enable_q_limiter = prompt_yes_no(
+            const bool enable_q_limiter = cfg_or_prompt_yes_no(
+                cfg,
+                "enable_q_limiter",
                 "Optional: clamp |Q| (caps S) to prevent blow-up? (numerical limiter)",
-                false
+                false,
+                interactive
             );
             const double S_cap = enable_q_limiter
-                ? prompt_with_default("Limiter: S_cap (approx physical max)", 1.2)
+                ? cfg_or_prompt<double>(cfg, "S_cap", "Limiter: S_cap (approx physical max)", 1.2, interactive)
                 : 0.0;
             const double q_norm_cap = (enable_q_limiter && S_cap > 0.0) ? (S_cap * std::sqrt(2.0 / 3.0)) : 0.0;
 
@@ -1902,46 +2090,59 @@ int main() {
             // For a quench/ramp, we only allow early-stop once the protocol has reached the final temperature.
             // Criterion: relative energy change + relative radiality change between consecutive samples,
             // optionally combined with an absolute radiality threshold.
-            const bool enable_early_stop = prompt_yes_no(
+            const bool enable_early_stop = cfg_or_prompt_yes_no(
+                cfg,
+                "enable_early_stop",
                 "Enable early-stop once converged at final T? (rel. ΔF/F + rel. ΔR̄/R̄)",
-                false
+                false,
+                interactive
             );
             const double radiality_threshold = enable_early_stop
-                ? prompt_with_default("Radiality threshold (Rbar, 0=disable)", 0.998)
+                ? cfg_or_prompt<double>(cfg, "radiality_threshold", "Radiality threshold (Rbar, 0=disable)", 0.998, interactive)
                 : 0.0;
 
-            char user_choice = 'y';
-            std::cout << "Do you want output in the console every " << logFreq << " iterations? (y/n): ";
-            std::string user_choice_line;
-            std::getline(std::cin, user_choice_line);
-            if (!user_choice_line.empty()) user_choice = user_choice_line[0];
+            const bool console_output = cfg_or_prompt_yes_no(
+                cfg,
+                "console_output",
+                ("Do you want output in the console every " + std::to_string(logFreq) + " iterations?").c_str(),
+                true,
+                interactive
+            );
 
-            const bool log_defects_2d = prompt_yes_no(
+            const char user_choice = console_output ? 'y' : 'n';
+
+            const bool log_defects_2d = cfg_or_prompt_yes_no(
+                cfg,
+                "log_defects_2d",
                 "Quench: log 2D KZ defect proxy to quench_log? (mid-plane winding)",
-                true
+                true,
+                interactive
             );
             int defects_z_slice = Nz / 2;
             double defects_S_threshold = 0.1;
             double defects_charge_cutoff = 0.25;
             if (log_defects_2d) {
-                defects_z_slice = prompt_with_default("Quench: z_slice for 2D proxy (0..Nz-1)", defects_z_slice);
+                defects_z_slice = cfg_or_prompt<int>(cfg, "defects_z_slice", "Quench: z_slice for 2D proxy (0..Nz-1)", defects_z_slice, interactive);
                 if (defects_z_slice < 0) defects_z_slice = 0;
                 if (defects_z_slice >= Nz) defects_z_slice = Nz - 1;
-                defects_S_threshold = prompt_with_default("Quench: S_threshold for 2D proxy", defects_S_threshold);
-                defects_charge_cutoff = prompt_with_default("Quench: charge_cutoff |s|>", defects_charge_cutoff);
+                defects_S_threshold = cfg_or_prompt<double>(cfg, "defects_S_threshold", "Quench: S_threshold for 2D proxy", defects_S_threshold, interactive);
+                defects_charge_cutoff = cfg_or_prompt<double>(cfg, "defects_charge_cutoff", "Quench: charge_cutoff |s|>", defects_charge_cutoff, interactive);
             }
 
-            const bool log_xi_grad_2d = prompt_yes_no(
+            const bool log_xi_grad_2d = cfg_or_prompt_yes_no(
+                cfg,
+                "log_xi_grad_2d",
                 "Quench: log 2D xi gradient proxy to quench_log? (cheap, snapshot-free)",
-                true
+                true,
+                interactive
             );
             int xi_z_slice = defects_z_slice;
             double xi_S_threshold = defects_S_threshold;
             if (log_xi_grad_2d) {
-                xi_z_slice = prompt_with_default("Quench: z_slice for xi proxy (0..Nz-1)", xi_z_slice);
+                xi_z_slice = cfg_or_prompt<int>(cfg, "xi_z_slice", "Quench: z_slice for xi proxy (0..Nz-1)", xi_z_slice, interactive);
                 if (xi_z_slice < 0) xi_z_slice = 0;
                 if (xi_z_slice >= Nz) xi_z_slice = Nz - 1;
-                xi_S_threshold = prompt_with_default("Quench: S_threshold for xi proxy", xi_S_threshold);
+                xi_S_threshold = cfg_or_prompt<double>(cfg, "xi_S_threshold", "Quench: S_threshold for xi proxy", xi_S_threshold, interactive);
             }
 
             dim3 threads2D(16, 16, 1);
@@ -2311,9 +2512,9 @@ int main() {
             std::ofstream sweep_log("output_temp_sweep/summary.dat");
             sweep_log << "temperature,final_energy_including_anchoring,average_S\n";
 
-            double T_start = prompt_with_default("Start T", 295.0);
-            double T_end = prompt_with_default("End T", 315.0);
-            double T_step = prompt_with_default("Step T", 1.0);
+            double T_start = cfg_or_prompt<double>(cfg, "T_start", "Start T", 295.0, interactive);
+            double T_end = cfg_or_prompt<double>(cfg, "T_end", "End T", 315.0, interactive);
+            double T_step = cfg_or_prompt<double>(cfg, "T_step", "Step T", 1.0, interactive);
 
             if (T_step == 0.0) {
                 std::cout << "Step T cannot be 0. Aborting sweep." << std::endl;
@@ -2344,7 +2545,7 @@ int main() {
             }
 
             if (mode == 2) {
-                double noise_amplitude = prompt_with_default("Noise amplitude for isotropic init", 1e-3);
+                double noise_amplitude = cfg_or_prompt<double>(cfg, "noise_amplitude", "Noise amplitude for isotropic init", 1e-3, interactive);
                 initializeIsotropicWithNoise(h_Q, Nx, Ny, Nz, noise_amplitude);
             } else {
                 initializeQTensor(h_Q, Nx, Ny, Nz, S0, mode);
@@ -2382,7 +2583,7 @@ int main() {
                       << "  dt_diff (elastic) ≈ " << dt_diff << " s\n"
                       << "  dt_bulk (bulk)    ≈ " << dt_bulk << " s\n"
                       << "  dt_max            = " << dt_max << " s" << std::endl;
-            double dt = prompt_with_default("Enter time step dt (s)", dt_max);
+            double dt = cfg_or_prompt<double>(cfg, "dt", "Enter time step dt (s)", dt_max, interactive);
             if (dt > dt_max) dt = dt_max;
 
             // Simple physical-time floor to reduce "premature convergence" in the sweep.
@@ -2461,16 +2662,8 @@ int main() {
 
         } else {
             // Single Temp Mode
-            int submode_default = 1;
-            std::cout << "Select submode: [1] full energy, [2] energy components (default: 1): ";
-            std::string submode_input;
-            std::getline(std::cin, submode_input);
-            int submode = submode_default;
-            if (!submode_input.empty()) {
-                try { submode = std::stoi(submode_input); }
-                catch (...) { submode = submode_default; }
-            }
-            if (submode != 1 && submode != 2) submode = submode_default;
+            int submode = cfg_or_prompt<int>(cfg, "submode", "Select submode: [1] full energy, [2] energy components", 1, interactive);
+            if (submode != 1 && submode != 2) submode = 1;
             std::cout << "Submode selected: " << (submode == 1 ? "full energy" : "energy components") << std::endl;
 
             if (fs::exists("output")) { for (const auto& entry : fs::directory_iterator("output")) fs::remove(entry.path()); }
@@ -2511,11 +2704,11 @@ int main() {
             std::cout << "  dt_bulk (bulk)    ≈ " << dt_bulk << " s" << std::endl;
             std::cout << "  dt_max            = " << dt_max << " s" << std::endl;
 
-            double dt = prompt_with_default("Enter time step dt (s)", dt_max);
+            double dt = cfg_or_prompt<double>(cfg, "dt", "Enter time step dt (s)", dt_max, interactive);
             if (dt > dt_max) dt = dt_max;
 
             if (mode == 2) {
-                double noise_amplitude = prompt_with_default("Noise amplitude for isotropic init", 1e-3);
+                double noise_amplitude = cfg_or_prompt<double>(cfg, "noise_amplitude", "Noise amplitude for isotropic init", 1e-3, interactive);
                 initializeIsotropicWithNoise(h_Q, Nx, Ny, Nz, noise_amplitude);
             } else {
                 initializeQTensor(h_Q, Nx, Ny, Nz, S0, mode);
@@ -2527,11 +2720,14 @@ int main() {
             // artificially enforce nematic order above the I-N transition.
             const double S_shell_single = (S_eq > 0.0) ? S0 : 0.0;
 
-            char user_choice = 'y';
-            std::cout << "Do you want output in the console every " << printFreq << " iterations? (y/n): ";
-            std::string user_choice_line;
-            std::getline(std::cin, user_choice_line);
-            if (!user_choice_line.empty()) user_choice = user_choice_line[0];
+            const bool console_output_single = cfg_or_prompt_yes_no(
+                cfg,
+                "console_output",
+                ("Do you want output in the console every " + std::to_string(printFreq) + " iterations?").c_str(),
+                true,
+                interactive
+            );
+            char user_choice = console_output_single ? 'y' : 'n';
 
             double prev_F = std::numeric_limits<double>::max();
             double prev_R = std::numeric_limits<double>::quiet_NaN();
@@ -2786,13 +2982,19 @@ int main() {
         cudaFree(d_xi_grad_sum); cudaFree(d_xi_grad_edges_used);
 
         std::cout << "\nSimulation finished." << std::endl;
-        std::cout << "Would you like to run another simulation? (y/n): ";
-        std::string again; std::getline(std::cin, again);
-        run_again = (!again.empty() && (again[0] == 'y' || again[0] == 'Y'));
+        if (allow_run_again_loop) {
+            std::cout << "Would you like to run another simulation? (y/n): ";
+            std::string again; std::getline(std::cin, again);
+            run_again = (!again.empty() && (again[0] == 'y' || again[0] == 'Y'));
+        } else {
+            run_again = false;
+        }
 
     } while (run_again);
 
-    std::cout << "Exiting. Press enter to close." << std::endl;
-    std::cin.get();
+    if (interactive) {
+        std::cout << "Exiting. Press enter to close." << std::endl;
+        std::cin.get();
+    }
     return 0;
 }

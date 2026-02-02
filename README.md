@@ -51,6 +51,31 @@ Run:
 ./QSR_cuda
 ```
 
+### Non-interactive runs (recommended for automation/GUI)
+
+The CUDA backend supports a simple `key=value` config file so it can run without interactive prompts:
+
+```bash
+./QSR_cuda --config configs/example_quench.cfg
+```
+
+- Config format: `key = value` with optional `#` comments.
+- Any omitted keys fall back to backend defaults.
+
+### Python GUI
+
+A minimal Tkinter GUI is provided to generate a config and launch the backend:
+
+```bash
+python3 GUI.py
+```
+
+If you want plotting from the GUI, install Python deps:
+
+```bash
+python3 -m pip install -r requirements.txt
+```
+
 ### Windows (Visual Studio)
 
 1. Open `QSR.sln` in Visual Studio.
@@ -63,6 +88,9 @@ Run:
 - **Core Source:**
   - `QSR.h`, `QSR.cpp`: Main C++ implementation (Host/CPU).
   - `QSR.cuh`, `QSR.cu`: CUDA implementation (Device/GPU).
+- **GUI / Analysis:**
+  - `GUI.py`: Tkinter GUI to generate config + run `QSR_cuda`.
+  - `QSRvis.py`: Postprocessing/plots for quench runs.
 - **Output:**
   - `output/`: Directory where `.dat` simulation results are saved.
   - `pics/`: Placeholder for generated visualizations.

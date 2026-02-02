@@ -1,6 +1,7 @@
 pics
 venv
 x64
+conf*
 out*
 frames*
 *.dat
