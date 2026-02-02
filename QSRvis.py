@@ -743,6 +743,8 @@ def create_nematic_field_animation(
     Ny,
     Nz,
     *,
+    slice_axis: str = 'z',
+    slice_index: int | None = None,
     frames_dir="frames",
     duration=0.1,
     frame_stride=1,
@@ -788,11 +790,26 @@ def create_nematic_field_animation(
     cf = (color_field or 'S').strip().lower()
     if consistent_scale:
         if cf in ('s', 'scalar', 'order', 'orderparameter'):
-            z_slice = Nz // 2
+            axis = (slice_axis or 'z').strip().lower()
+            axis = axis[0] if axis else 'z'
+            if axis not in ('x', 'y', 'z'):
+                axis = 'z'
+
+            if slice_index is None:
+                if axis == 'z':
+                    slice_index_use = int(Nz) // 2
+                elif axis == 'y':
+                    slice_index_use = int(Ny) // 2
+                else:
+                    slice_index_use = int(Nx) // 2
+            else:
+                slice_index_use = int(slice_index)
+
             vals = []
             for fp in files:
                 try:
-                    S_arr, _, _, _ = _load_nematic_slice_arrays(fp, Nx, Ny, Nz, z_slice)
+                    # Use the same plane as the animation for consistent scaling.
+                    S_arr, _, _, _ = _load_nematic_slice_arrays(fp, Nx, Ny, Nz, slice_index_use, slice_axis=axis)
                 except Exception:
                     continue
                 v = S_arr[np.isfinite(S_arr)]
@@ -824,6 +841,8 @@ def create_nematic_field_animation(
             Nx,
             Ny,
             Nz,
+            z_slice=slice_index,
+            slice_axis=slice_axis,
             output_path=frame_path,
             arrowColor=arrowColor,
             zoom_radius=zoom_radius,
@@ -839,13 +858,47 @@ def create_nematic_field_animation(
     # Create GIF from the generated frames
     print(f"\nStitching {len(frame_paths)} frames into {output_gif}...")
     os.makedirs(os.path.dirname(output_gif) or '.', exist_ok=True)
-    writer: Any = imageio.get_writer(output_gif, mode='I', duration=float(duration))
+
+    # IMPORTANT: imageio's newer (v3) plugin stack may ignore GIF metadata entirely,
+    # resulting in duration=0ms stored in the file (playback speed appears unchanged).
+    # Use Pillow directly for reliable per-frame duration.
     try:
-        for frame_path in frame_paths:
-            image = imageio.imread(frame_path)
-            writer.append_data(image)
+        duration_s = float(duration)
+    except Exception:
+        duration_s = 0.1
+    if not np.isfinite(duration_s) or duration_s <= 0:
+        duration_s = 0.1
+    duration_ms = int(max(20, round(1000.0 * duration_s)))
+
+    try:
+        from PIL import Image
+    except Exception as e:
+        raise ImportError("Pillow (PIL) is required to write GIFs with correct frame timing") from e
+
+    images: list[Any] = []
+    try:
+        for fp in frame_paths:
+            im = Image.open(fp)
+            # Ensure a consistent mode (Pillow will quantize to palette for GIF)
+            if im.mode not in ('RGB', 'RGBA', 'P'):
+                im = im.convert('RGBA')
+            images.append(im)
+        if not images:
+            raise ValueError("No frames were generated; cannot write GIF")
+        images[0].save(
+            output_gif,
+            save_all=True,
+            append_images=images[1:],
+            duration=duration_ms,
+            loop=0,
+            optimize=False,
+        )
     finally:
-        writer.close()
+        for im in images:
+            try:
+                im.close()
+            except Exception:
+                pass
 
     # Clean up temporary frames
     print("Cleaning up temporary frames...")
@@ -1291,8 +1344,14 @@ def _resolve_quench_log_path(path: str) -> str:
 def load_quench_log(path: str = 'output_quench'):
     """Load quench log produced by QSR_cuda/QSR_cpu.
 
-    Expected header columns (comma-separated):
-      iteration,time_s,T_K,bulk,elastic,total,radiality,avg_S
+        Header columns are comma-separated and may evolve over time.
+        Common fields include:
+            iteration,time_s,T_K,bulk,elastic,total,radiality,avg_S
+
+        Newer runs may also include:
+            dt_s, anchoring, max_S, checker_rel,
+            defect_density_per_plaquette, defect_plaquettes_used,
+            xi_grad_proxy, xi_grad_edges_used
     """
     log_path = _resolve_quench_log_path(path)
     if not os.path.exists(log_path):
@@ -1328,6 +1387,11 @@ def plot_quench_log(
     radial = np.atleast_1d(data['radiality']).astype(float)
     avgS = np.atleast_1d(data['avg_S']).astype(float)
 
+    names = set(data.dtype.names or ())
+    anch = np.atleast_1d(data['anchoring']).astype(float) if ('anchoring' in names) else None
+    maxS = np.atleast_1d(data['max_S']).astype(float) if ('max_S' in names) else None
+    checker = np.atleast_1d(data['checker_rel']).astype(float) if ('checker_rel' in names) else None
+
     # Drop invalid rows early to avoid matplotlib inf/nan axis limits
     m = (
         np.isfinite(it)
@@ -1344,6 +1408,12 @@ def plot_quench_log(
     it, t, T = it[m], t[m], T[m]
     bulk, elastic, total = bulk[m], elastic[m], total[m]
     radial, avgS = radial[m], avgS[m]
+    if anch is not None:
+        anch = anch[m]
+    if maxS is not None:
+        maxS = maxS[m]
+    if checker is not None:
+        checker = checker[m]
 
     it, t, T, bulk, elastic, total, radial, avgS = _apply_iter_window(
         it, t, T, bulk, elastic, total, radial, avgS, it_min=it_min, it_max=it_max
@@ -1376,6 +1446,8 @@ def plot_quench_log(
     axE.plot(t, total, '-', lw=2, label='total')
     axE.plot(t, bulk, '--', lw=1.5, label='bulk')
     axE.plot(t, elastic, '--', lw=1.5, label='elastic')
+    if anch is not None:
+        axE.plot(t, anch, '--', lw=1.5, label='anchoring')
     axE.set_xlabel('time [s]')
     axE.set_ylabel('Energy')
     axE.set_title('Energy vs time')
@@ -1408,11 +1480,19 @@ def plot_quench_log(
     axR2.grid(False)
 
     # Average S
-    axS.plot(t, avgS, '-', lw=2)
+    axS.plot(t, avgS, '-', lw=2, label='avg_S')
+    if maxS is not None:
+        axS.plot(t, maxS, '--', lw=1.5, label='max_S')
+    if checker is not None:
+        axS2 = axS.twinx()
+        axS2.plot(t, checker, ':', lw=1.5, color='k', alpha=0.8, label='checker_rel')
+        axS2.set_ylabel('checker_rel')
+        axS2.grid(False)
     axS.set_xlabel('time [s]')
     axS.set_ylabel('<S> (droplet)')
     axS.set_title('Average order parameter')
     axS.grid(True, alpha=0.3)
+    axS.legend(loc='best')
 
     base = os.path.basename(log_path)
     win = ''
@@ -1451,24 +1531,100 @@ def _parse_temperature_from_dir(d):
         return float('nan')
 
 
-def _load_nematic_slice_arrays(path, Nx, Ny, Nz, z_slice):
-    data = load_nematic_field_data(path, comments="#")
-    slice_data = data[data[:, 2] == z_slice]
-    if slice_data.shape[0] == 0:
-        raise ValueError(f"No data found for z_slice={z_slice} in {path}")
+def _load_nematic_slice_arrays(path, Nx, Ny, Nz, z_slice, *, slice_axis: str = 'z'):
+    """Load a 2D slice from a 3D nematic_field_*.dat dump.
 
-    S = np.zeros((Nx, Ny), dtype=float)
-    nx = np.zeros((Nx, Ny), dtype=float)
-    ny = np.zeros((Nx, Ny), dtype=float)
-    nz = np.zeros((Nx, Ny), dtype=float)
-    for row in slice_data:
-        i, j = int(row[0]), int(row[1])
-        if 0 <= i < Nx and 0 <= j < Ny:
-            S[i, j] = row[3]
-            nx[i, j] = row[4]
-            ny[i, j] = row[5]
-            nz[i, j] = row[6]
+    Backwards compatible with older callers that always assumed a z-slice.
 
+    slice_axis:
+      - 'z' -> XY plane at k=z_slice (arrays shape: Nx x Ny)
+      - 'y' -> XZ plane at j=z_slice (arrays shape: Nx x Nz)
+      - 'x' -> YZ plane at i=z_slice (arrays shape: Ny x Nz)
+    """
+    axis = (slice_axis or 'z').strip().lower()
+    axis = axis[0] if axis else 'z'
+    if axis not in ('x', 'y', 'z'):
+        axis = 'z'
+
+    # Performance note:
+    # nematic_field_iter_*.dat can be very large (Nx*Ny*Nz lines). For KZ metrics we only need a single
+    # 2D slice, so we stream-parse the file and keep only the requested plane.
+    if axis == 'z':
+        S = np.zeros((Nx, Ny), dtype=float)
+        nx = np.zeros((Nx, Ny), dtype=float)
+        ny = np.zeros((Nx, Ny), dtype=float)
+        nz = np.zeros((Nx, Ny), dtype=float)
+        hit = 0
+        with open(path, 'r', encoding='utf-8', errors='ignore') as f:
+            for line in f:
+                if not line or line[0] == '#':
+                    continue
+                parts = line.split()
+                if len(parts) < 7:
+                    continue
+                i = int(parts[0]); j = int(parts[1]); k = int(parts[2])
+                if k != int(z_slice):
+                    continue
+                if 0 <= i < Nx and 0 <= j < Ny:
+                    S[i, j] = float(parts[3])
+                    nx[i, j] = float(parts[4])
+                    ny[i, j] = float(parts[5])
+                    nz[i, j] = float(parts[6])
+                    hit += 1
+        if hit == 0:
+            raise ValueError(f"No data found for z_slice={z_slice} in {path}")
+        return S, nx, ny, nz
+
+    if axis == 'y':
+        S = np.zeros((Nx, Nz), dtype=float)
+        nx = np.zeros((Nx, Nz), dtype=float)
+        ny = np.zeros((Nx, Nz), dtype=float)
+        nz = np.zeros((Nx, Nz), dtype=float)
+        hit = 0
+        with open(path, 'r', encoding='utf-8', errors='ignore') as f:
+            for line in f:
+                if not line or line[0] == '#':
+                    continue
+                parts = line.split()
+                if len(parts) < 7:
+                    continue
+                i = int(parts[0]); j = int(parts[1]); k = int(parts[2])
+                if j != int(z_slice):
+                    continue
+                if 0 <= i < Nx and 0 <= k < Nz:
+                    S[i, k] = float(parts[3])
+                    nx[i, k] = float(parts[4])
+                    ny[i, k] = float(parts[5])
+                    nz[i, k] = float(parts[6])
+                    hit += 1
+        if hit == 0:
+            raise ValueError(f"No data found for y_slice={z_slice} in {path}")
+        return S, nx, ny, nz
+
+    # axis == 'x'
+    S = np.zeros((Ny, Nz), dtype=float)
+    nx = np.zeros((Ny, Nz), dtype=float)
+    ny = np.zeros((Ny, Nz), dtype=float)
+    nz = np.zeros((Ny, Nz), dtype=float)
+    hit = 0
+    with open(path, 'r', encoding='utf-8', errors='ignore') as f:
+        for line in f:
+            if not line or line[0] == '#':
+                continue
+            parts = line.split()
+            if len(parts) < 7:
+                continue
+            i = int(parts[0]); j = int(parts[1]); k = int(parts[2])
+            if i != int(z_slice):
+                continue
+            if 0 <= j < Ny and 0 <= k < Nz:
+                S[j, k] = float(parts[3])
+                nx[j, k] = float(parts[4])
+                ny[j, k] = float(parts[5])
+                nz[j, k] = float(parts[6])
+                hit += 1
+    if hit == 0:
+        raise ValueError(f"No data found for x_slice={z_slice} in {path}")
     return S, nx, ny, nz
 
 
@@ -1987,16 +2143,20 @@ def defect_line_metrics_3d_from_field_file(
         droplet = ndi_local.binary_fill_holes(droplet)
     droplet_vox = int(np.count_nonzero(droplet))
     if droplet_vox == 0:
+        sys_vox = int(Nx) * int(Ny) * int(Nz)
         return {
             'Nx': Nx,
             'Ny': Ny,
             'Nz': Nz,
+            'system_voxels': sys_vox,
             'droplet_voxels': 0,
             'core_voxels': 0,
             'skeleton_voxels': 0,
             'line_length_lattice': 0.0,
             'line_density_per_voxel': float('nan'),
+            'line_density_per_system_voxel': float('nan'),
             'core_density_per_voxel': float('nan'),
+            'core_density_per_system_voxel': float('nan'),
         }
 
     # Define a safe interior region to avoid counting low-S interface voxels.
@@ -2016,16 +2176,20 @@ def defect_line_metrics_3d_from_field_file(
     core = region & finite & (S_use < float(S_core))
     core_vox = int(np.count_nonzero(core))
     if core_vox == 0:
+        sys_vox = int(Nx) * int(Ny) * int(Nz)
         return {
             'Nx': Nx,
             'Ny': Ny,
             'Nz': Nz,
+            'system_voxels': sys_vox,
             'droplet_voxels': droplet_vox,
             'core_voxels': 0,
             'skeleton_voxels': 0,
             'line_length_lattice': 0.0,
             'line_density_per_voxel': 0.0,
+            'line_density_per_system_voxel': 0.0,
             'core_density_per_voxel': 0.0,
+            'core_density_per_system_voxel': 0.0,
         }
 
     # Remove tiny noisy components
@@ -2052,16 +2216,23 @@ def defect_line_metrics_3d_from_field_file(
 
     density = float(length) / float(droplet_vox) if np.isfinite(length) and droplet_vox > 0 else float('nan')
     core_density = float(core_vox) / float(droplet_vox) if droplet_vox > 0 else float('nan')
+
+    sys_vox = int(Nx) * int(Ny) * int(Nz)
+    density_sys = float(length) / float(sys_vox) if np.isfinite(length) and sys_vox > 0 else float('nan')
+    core_density_sys = float(core_vox) / float(sys_vox) if sys_vox > 0 else float('nan')
     return {
         'Nx': Nx,
         'Ny': Ny,
         'Nz': Nz,
+        'system_voxels': sys_vox,
         'droplet_voxels': droplet_vox,
         'core_voxels': core_vox,
         'skeleton_voxels': skel_vox,
         'line_length_lattice': float(length) if np.isfinite(length) else float('nan'),
         'line_density_per_voxel': density,
+        'line_density_per_system_voxel': density_sys,
         'core_density_per_voxel': core_density,
+        'core_density_per_system_voxel': core_density_sys,
         'S_droplet': float(S_droplet),
         'S_core': float(S_core),
         'dilate_iters': int(dilate_iters),
@@ -2217,6 +2388,31 @@ def plot_quench_kz_metrics(
     fig.savefig(out_path, dpi=200)
     print(f"Saved KZ metrics -> {out_path}")
     print(f"Saved KZ metrics CSV -> {csv_path}")
+
+    # Also save a log-log parametric plot: defect density vs xi
+    # (useful for checking the expected n_def ~ xi^{-2} scaling in 2D proxies).
+    m = np.isfinite(xi) & np.isfinite(ndef) & (xi > 0) & (ndef > 0)
+    out_path_loglog = None
+    if np.count_nonzero(m) >= 2:
+        fig2, ax = plt.subplots(1, 1, figsize=(7.2, 6))
+        ax.loglog(xi[m], ndef[m], 'o', ms=7)
+        ax.set_xlabel(r'$\xi$ (lattice units)')
+        ax.set_ylabel('defect density (per plaquette)')
+        ax.grid(True, which='both', alpha=0.3)
+        slope, pref = _fit_powerlaw_loglog(xi[m], ndef[m])
+        if np.isfinite(slope) and np.isfinite(pref):
+            xs = np.linspace(np.nanmin(xi[m]), np.nanmax(xi[m]), 200)
+            ax.loglog(xs, pref * xs ** slope, '--', lw=1.5, label=f'fit: slope={slope:.3g}')
+            ax.legend()
+        ax.set_title(f'KZ proxy: defect density vs xi ({tag})')
+        fig2.tight_layout()
+        out_path_loglog = os.path.join(out_dir, f'kz_metrics_{tag}_ndef_vs_xi.png')
+        fig2.savefig(out_path_loglog, dpi=220)
+        print(f"Saved KZ log-log (ndef vs xi) -> {out_path_loglog}")
+        if show:
+            plt.show()
+        else:
+            plt.close(fig2)
     if show:
         plt.show()
     else:
@@ -3119,6 +3315,33 @@ def aggregate_kz_scaling(
         else:
             plt.close(fig)
 
+        # Additional KZ diagnostic: defect density vs correlation length (direct log-log relation).
+        # For 2D proxies one expects roughly n_def ~ xi^{-2} (up to prefactors).
+        m = np.isfinite(xi) & np.isfinite(ndef) & (xi > 0) & (ndef > 0)
+        if np.count_nonzero(m) >= 2:
+            fig3, ax3 = plt.subplots(1, 1, figsize=(7.2, 6))
+            ax3.loglog(xi[m], ndef[m], 'o', ms=7)
+            ax3.set_xlabel(r'$\xi$ (lattice units)')
+            ax3.set_ylabel('defect density (per plaquette)')
+            ax3.grid(True, which='both', alpha=0.3)
+            slope_nx, pref_nx = _fit_powerlaw_loglog(xi[m], ndef[m])
+            if np.isfinite(slope_nx) and np.isfinite(pref_nx):
+                xs = np.linspace(np.nanmin(xi[m]), np.nanmax(xi[m]), 200)
+                ax3.loglog(xs, pref_nx * xs ** slope_nx, '--', lw=1.5, label=f'fit: slope={slope_nx:.3g}')
+                ax3.legend()
+            ax3.set_title(
+                f'KZ proxy relation across {len(rows)} runs | measure={measure_label} | S>{S_threshold} | z_avg={int(z_avg)}'
+            )
+            fig3.tight_layout()
+            if write_files:
+                out_path3 = os.path.join(out_dir, f'kz_scaling_{tag_full}_ndef_vs_xi.png')
+                fig3.savefig(out_path3, dpi=220)
+                print(f"Saved KZ ndef-vs-xi plot -> {out_path3}")
+            if show:
+                plt.show()
+            else:
+                plt.close(fig3)
+
     return rows, out_path, csv_path
 
 
@@ -3221,12 +3444,12 @@ def aggregate_kz_scaling_3d(
     defect_proxy_norm = (defect_proxy or 'skeleton').strip().lower()
     if defect_proxy_norm in ('core', 'core_density', 'corefrac', 'core_fraction', 'volume', 'vox'):
         use_skeleton = False
-        defect_col_name = 'core_density_per_voxel'
-        defect_label = 'core density proxy (core_vox/droplet_vox)'
+        defect_col_name = 'core_density_per_system_voxel'
+        defect_label = 'core density proxy (core_vox/system_vox)'
     else:
         use_skeleton = True
-        defect_col_name = 'line_density_per_voxel'
-        defect_label = 'line density proxy (length/voxel)'
+        defect_col_name = 'line_density_per_system_voxel'
+        defect_label = 'line density proxy (length/system_vox)'
 
     def _compute_3d_metrics_for_field(fp: str):
         xi3, _, _, dims = correlation_length_3d_from_field_file(fp, S_threshold=float(S_threshold_xi), max_r=max_r)
@@ -3355,6 +3578,10 @@ def aggregate_kz_scaling_3d(
                 float(xi3),
                 float(defect.get('line_length_lattice', float('nan'))),
                 float(defect.get(defect_col_name, float('nan'))),
+                int(defect.get('system_voxels', int(dims[0]) * int(dims[1]) * int(dims[2]))),
+                int(defect.get('droplet_voxels', 0)),
+                int(defect.get('core_voxels', 0)),
+                int(defect.get('skeleton_voxels', 0)),
                 int(defect.get('Nx', dims[0])),
                 int(defect.get('Ny', dims[1])),
                 int(defect.get('Nz', dims[2])),
@@ -3381,16 +3608,18 @@ def aggregate_kz_scaling_3d(
         csv_path = os.path.join(out_dir, f'kz_scaling3d_{tag_full}.csv')
         with open(csv_path, 'w', encoding='utf-8') as f:
             f.write(
-                'run,protocol,t_ramp_s,rate_K_per_s,xi3d_lattice,line_length_lattice,line_density_per_voxel,'
+                'run,protocol,t_ramp_s,rate_K_per_s,xi3d_lattice,line_length_lattice,defect_density_per_system_vox,'
+                'system_voxels,droplet_voxels,core_voxels,skeleton_voxels,'
                 'Nx,Ny,Nz,S_threshold_xi,S_droplet,S_core,dilate_iters,min_core_voxels,field_file,'
                 't_cross_s,t_selected_s,after_Tc_actual_s,iter_selected,defect_proxy\n'
             )
             for r in rows:
                 f.write(
                     f"{r[0]},{r[1]},{r[2]:.8g},{r[3]:.8g},{r[4]:.8g},{r[5]:.8g},{r[6]:.8g},"
-                    f"{int(r[7])},{int(r[8])},{int(r[9])},{r[10]:.8g},{r[11]:.8g},{r[12]:.8g},"
-                    f"{int(r[13])},{int(r[14])},{r[15]},"
-                    f"{r[16]:.8g},{r[17]:.8g},{r[18]:.8g},{int(r[19])},{defect_proxy_norm}\n"
+                    f"{int(r[7])},{int(r[8])},{int(r[9])},{int(r[10])},"
+                    f"{int(r[11])},{int(r[12])},{int(r[13])},{r[14]:.8g},{r[15]:.8g},{r[16]:.8g},"
+                    f"{int(r[17])},{int(r[18])},{r[19]},"
+                    f"{r[20]:.8g},{r[21]:.8g},{r[22]:.8g},{int(r[23])},{defect_proxy_norm}\n"
                 )
 
     # Prepare arrays for plotting
@@ -3782,6 +4011,49 @@ if __name__ == '__main__':
     if i == 0:
         # --- Plotting Individual Final States ---
         print("Plotting final state from pre-calculated Nematic Field data...")
+
+        # Allow pointing to a run directory (e.g. output_quench_1000/) or a direct file.
+        try:
+            in_path = prompt_pick_folder(
+                prompt="Final state source (run dir containing nematic_field_final.dat OR direct field file)",
+                default='output_quench',
+                pattern='output_*',
+                must_exist=True,
+            )
+        except Exception:
+            in_path = input("Path to run directory or nematic_field_final.dat [default: output_quench]: ").strip() or 'output_quench'
+
+        if os.path.isdir(in_path):
+            field_fp = os.path.join(in_path, 'nematic_field_final.dat')
+            if not os.path.exists(field_fp):
+                # Fallback: use the latest snapshot if a final file isn't present.
+                snaps = glob.glob(os.path.join(in_path, 'nematic_field_iter_*.dat'))
+                if snaps:
+                    def _iter_num(p: str) -> int:
+                        m = re.search(r'(\d+)', os.path.basename(p))
+                        return int(m.group(1)) if m else -1
+
+                    snaps.sort(key=_iter_num)
+                    field_fp = snaps[-1]
+                else:
+                    raise FileNotFoundError(
+                        f"No nematic_field_final.dat or nematic_field_iter_*.dat found inside: {in_path}"
+                    )
+            tag = os.path.basename(os.path.normpath(in_path)) or 'final'
+        else:
+            field_fp = in_path
+            tag = os.path.splitext(os.path.basename(in_path))[0] or 'final'
+
+        if not os.path.exists(field_fp):
+            raise FileNotFoundError(f"Field file not found: {field_fp}")
+
+        Nx_use, Ny_use, Nz_use = Nx, Ny, Nz
+        try:
+            Nx_use, Ny_use, Nz_use = infer_grid_dims_from_nematic_field_file(field_fp)
+            print(f"Detected grid: Nx={Nx_use}, Ny={Ny_use}, Nz={Nz_use} (from {os.path.basename(field_fp)})")
+        except Exception as e:
+            print(f"Warning: could not auto-detect grid dims ({e}); using defaults Nx={Nx}, Ny={Ny}, Nz={Nz}.")
+
         ax_in = input("View axis / look along (x/y/z) [default: z]: ").strip().lower()
         if not ax_in:
             ax_in = 'z'
@@ -3791,16 +4063,16 @@ if __name__ == '__main__':
             axis = 'z'
 
         if axis == 'z':
-            max_idx = Nz - 1
-            default_idx = Nz // 2
+            max_idx = Nz_use - 1
+            default_idx = Nz_use // 2
             axis_label = 'z'
         elif axis == 'y':
-            max_idx = Ny - 1
-            default_idx = Ny // 2
+            max_idx = Ny_use - 1
+            default_idx = Ny_use // 2
             axis_label = 'y'
         else:
-            max_idx = Nx - 1
-            default_idx = Nx // 2
+            max_idx = Nx_use - 1
+            default_idx = Nx_use // 2
             axis_label = 'x'
 
         sl_in = input(f"{axis_label}-slice index (0..{max_idx}) [default: {default_idx}]: ").strip()
@@ -3821,12 +4093,18 @@ if __name__ == '__main__':
         custom_name = input("Add custom name to append to file-name for multi-sumulation scenario: ").strip()
         if not custom_name:
             custom_name = ''
+
+        # Compose an informative output name
+        suffix = f"_{tag}" if tag else ''
+        if custom_name:
+            suffix += f"_{custom_name}"
+        suffix += f"_{axis_label}{int(slice_idx)}"
         plot_nematic_field_slice(
-            filename='nematic_field_final.dat',
-            Nx=Nx, Ny=Ny, Nz=Nz,
+            filename=field_fp,
+            Nx=Nx_use, Ny=Ny_use, Nz=Nz_use,
             z_slice=slice_idx,
             slice_axis=axis_label,
-            output_path=f'pics/{color_field}_final_state_{custom_name}.png',
+            output_path=f'pics/{color_field}_final_state{suffix}.png',
             arrowColor='black' if not do_zoom else 'black',
             zoom_radius=radius,
             interpol=interpol,
@@ -3956,13 +4234,57 @@ if __name__ == '__main__':
         except Exception as e:
             print(f"Warning: could not auto-detect grid dims ({e}); using defaults Nx={Nx}, Ny={Ny}, Nz={Nz}.")
 
-        inpt = input("Please specify filename for the quench animation gif [default: quench_evolution]: ").strip()
+        inpt = input("Please specify base filename for the quench animation gif(s) [default: quench_evolution]: ").strip()
         if not inpt:
             inpt = 'quench_evolution'
-        if not inpt.lower().endswith('.gif'):
-            out_gif = f'pics/{inpt}.gif'
+
+        # View selection: choose plane(s)
+        # z -> XY slice at k
+        # y -> XZ slice at j
+        # x -> YZ slice at i
+        view_in = input(
+            "View axis for slicing (z=XY, y=XZ, x=YZ, all) [default: z]: "
+        ).strip().lower()
+        if not view_in:
+            view_in = 'z'
+        view_in = view_in.replace(' ', '')
+        if view_in in ('all', 'xyz', 'x,y,z', 'z,y,x'):
+            views = ['z', 'y', 'x']
         else:
-            out_gif = os.path.join('pics', inpt)
+            # accept comma-separated list like: z,y,x
+            parts = [p for p in re.split(r'[,;]+', view_in) if p]
+            views = []
+            for p in parts:
+                a = p[0]
+                if a in ('x', 'y', 'z') and a not in views:
+                    views.append(a)
+            if not views:
+                views = ['z']
+
+        # Ask slice indices for requested views
+        slice_indices: dict[str, int] = {}
+        for ax in views:
+            if ax == 'z':
+                default_idx = int(Nz_use) // 2
+                prompt = f"XY view: z-slice index k [0..{int(Nz_use)-1}] [default: {default_idx}]: "
+            elif ax == 'y':
+                default_idx = int(Ny_use) // 2
+                prompt = f"XZ view: y-slice index j [0..{int(Ny_use)-1}] [default: {default_idx}]: "
+            else:
+                default_idx = int(Nx_use) // 2
+                prompt = f"YZ view: x-slice index i [0..{int(Nx_use)-1}] [default: {default_idx}]: "
+            s_in = input(prompt).strip()
+            try:
+                idx = int(s_in) if s_in else int(default_idx)
+            except ValueError:
+                idx = int(default_idx)
+            if ax == 'z':
+                idx = max(0, min(int(Nz_use) - 1, idx))
+            elif ax == 'y':
+                idx = max(0, min(int(Ny_use) - 1, idx))
+            else:
+                idx = max(0, min(int(Nx_use) - 1, idx))
+            slice_indices[ax] = int(idx)
 
         color_field = input("Choose color field (S, nz, n_perp) [default: S]: ").strip()
         if not color_field:
@@ -3990,26 +4312,44 @@ if __name__ == '__main__':
             arrows_per_axis = 20
 
         try:
-            output_c=input("Per how many itterations do you want output in the console? (default: 10): ").strip()
+            output_c = input("Per how many frames do you want output in the console? (default: 10): ").strip()
             if not output_c:
                 output_c = 10
             else:
                 output_c = int(output_c)
-            create_nematic_field_animation(
-                data_dir=data_dir,
-                output_gif=out_gif,
-                Nx=Nx_use, Ny=Ny_use, Nz=Nz_use,
-                frames_dir='frames_quench',
-                duration=duration,
-                frame_stride=stride,
-                color_field=color_field,
-                interpol=interpol,
-                zoom_radius=zoom_radius,
-                arrowColor='black',
-                arrows_per_axis=arrows_per_axis,
-                consistent_scale=True,
-                output_c=output_c,
-            )
+
+            # Build output path(s). If user provided .gif, treat it as base name.
+            base_name = os.path.basename(inpt)
+            if base_name.lower().endswith('.gif'):
+                stem = base_name[:-4]
+            else:
+                stem = base_name
+
+            os.makedirs('pics', exist_ok=True)
+            axis_to_plane = {'z': 'xy', 'y': 'xz', 'x': 'yz'}
+            for ax in views:
+                plane = axis_to_plane.get(ax, ax)
+                idx = int(slice_indices.get(ax, 0))
+                suffix = f"_{plane}_{ax}{idx}"
+                out_gif = os.path.join('pics', f"{stem}{suffix}.gif") if len(views) > 1 else os.path.join('pics', f"{stem}.gif")
+                frames_dir = f"frames_quench_{plane}_{ax}{idx}"
+                create_nematic_field_animation(
+                    data_dir=data_dir,
+                    output_gif=out_gif,
+                    Nx=Nx_use, Ny=Ny_use, Nz=Nz_use,
+                    slice_axis=ax,
+                    slice_index=idx,
+                    frames_dir=frames_dir,
+                    duration=duration,
+                    frame_stride=stride,
+                    color_field=color_field,
+                    interpol=interpol,
+                    zoom_radius=zoom_radius,
+                    arrowColor='black',
+                    arrows_per_axis=arrows_per_axis,
+                    consistent_scale=True,
+                    output_c=output_c,
+                )
         except Exception as e:
             print(f"Error creating quench animation: {e}")
     elif i == 8:
@@ -4058,6 +4398,19 @@ if __name__ == '__main__':
         pattern = input("Folder pattern [default: output_quench*]: ").strip() or 'output_quench*'
         x_axis = input("X-axis (t_ramp or rate) [default: t_ramp]: ").strip() or 't_ramp'
         measure = input("Measure state (final / after_Tlow / after_Tc) [default: final]: ").strip() or 'final'
+
+        # New (2026): support snapshot-free logging for KZ proxies.
+        # - defect_density_per_plaquette is logged by QSR_cuda if enabled
+        # - xi_grad_proxy is a cheap gradient-based proxy (also logged by QSR_cuda if enabled)
+        # If enabled, KZ aggregation will prefer log columns and will not error when snapshots are missing.
+        use_log_only = input(
+            "Use log-only KZ proxies if available (defect_density_per_plaquette, xi_grad_proxy)? (y/n) [default: y]: "
+        ).strip().lower()
+        if not use_log_only:
+            use_log_only = 'y'
+        allow_log_only = (use_log_only == 'y')
+        prefer_log_defects = allow_log_only
+        prefer_log_xi_proxy = allow_log_only
         after_Tlow_s = 0.0
         Tc = None
         after_Tc_s = 0.0
@@ -4133,6 +4486,9 @@ if __name__ == '__main__':
                 z_avg=z_avg,
                 z_margin_frac=z_margin_frac,
                 S_threshold=sthr,
+                prefer_log_defects=prefer_log_defects,
+                prefer_log_xi_proxy=prefer_log_xi_proxy,
+                allow_log_only=allow_log_only,
                 x_axis=x_axis,
                 fit_x_min=fit_x_min,
                 fit_x_max=fit_x_max,

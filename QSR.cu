@@ -20,11 +20,12 @@ static void cuda_check_or_die(const char* where) {
     }
 }
 
-static double qtensor_frobenius_norm(const QTensor& q5) {
+__host__ __device__ __forceinline__ double qtensor_frobenius_norm(const QTensor& q5) {
     FullQTensor q(q5);
     const double trQ2 = q.Qxx*q.Qxx + q.Qyy*q.Qyy + q.Qzz*q.Qzz
         + 2.0*(q.Qxy*q.Qxy + q.Qxz*q.Qxz + q.Qyz*q.Qyz);
-    return std::sqrt(std::max(0.0, trQ2));
+    const double x = (trQ2 > 0.0) ? trQ2 : 0.0;
+    return sqrt(x);
 }
 
 // ------------------------------------------------------------------
@@ -551,7 +552,7 @@ __global__ void computeAnchoringEnergyKernel(const QTensor* Q, const bool* is_sh
     anch_energy[idx] = 0.5 * (W / shell_thickness) * diff2 * (dx * dy * dz);
 }
 
-__global__ void updateQTensorKernel(QTensor* Q, const QTensor* mu, int Nx, int Ny, int Nz, double dt, const bool* is_shell, double gamma, double W) {
+__global__ void updateQTensorKernel(QTensor* Q, const QTensor* mu, int Nx, int Ny, int Nz, double dt, const bool* is_shell, double gamma, double W, double q_norm_cap) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     int j = blockIdx.y * blockDim.y + threadIdx.y;
     int k = blockIdx.z * blockDim.z + threadIdx.z;
@@ -579,6 +580,138 @@ __global__ void updateQTensorKernel(QTensor* Q, const QTensor* mu, int Nx, int N
     current_Q.Qxz -= mobility * current_mu.Qxz * dt;
     current_Q.Qyy -= mobility * current_mu.Qyy * dt;
     current_Q.Qyz -= mobility * current_mu.Qyz * dt;
+
+    if (q_norm_cap > 0.0) {
+        const double qnorm = qtensor_frobenius_norm(current_Q);
+        if (qnorm > q_norm_cap && qnorm > 0.0) {
+            const double s = q_norm_cap / qnorm;
+            current_Q.Qxx *= s;
+            current_Q.Qxy *= s;
+            current_Q.Qxz *= s;
+            current_Q.Qyy *= s;
+            current_Q.Qyz *= s;
+        }
+    }
+}
+
+__global__ void computeRhsSemiImplicitKernel(
+    const QTensor* Q,
+    const QTensor* mu,
+    const QTensor* laplacianQ,
+    QTensor* rhs,
+    int Nx, int Ny, int Nz,
+    double dt,
+    double gamma,
+    double L_stab,
+    const bool* is_shell,
+    double W
+) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    int j = blockIdx.y * blockDim.y + threadIdx.y;
+    int k = blockIdx.z * blockDim.z + threadIdx.z;
+
+    if (i >= Nx || j >= Ny || k >= Nz) return;
+    const int idx = k + Nz * (j + Ny * i);
+
+    // Keep boundary / shell fixed
+    if (W == 0.0 && is_shell[idx]) {
+        rhs[idx] = Q[idx];
+        return;
+    }
+
+    // Only evolve inside droplet (and slightly outside when W>0, matching updateQTensorKernel).
+    const double cx = Nx / 2.0, cy = Ny / 2.0, cz = Nz / 2.0;
+    const double R = min(min((double)Nx, (double)Ny), (double)Nz) / 2.0;
+    const double x = i - cx, y = j - cy, z = k - cz;
+    const double r = sqrt(x * x + y * y + z * z);
+    if (W == 0.0) { if (r > R) { rhs[idx] = Q[idx]; return; } }
+    else { if (r > R + 1.5) { rhs[idx] = Q[idx]; return; } }
+
+    const double mobility = 1.0 / gamma;
+    const double alpha = dt * mobility * L_stab;
+
+    const QTensor q = Q[idx];
+    const QTensor h = mu[idx];
+    const QTensor lap = laplacianQ[idx];
+
+    // For mu = mu_bulk + mu_aniso - L_stab*Laplace(Q),
+    // we want (I - alpha*Laplace) Q^{n+1} = Q^n - dt*m*(mu_bulk + mu_aniso)
+    // where alpha = dt*m*L_stab.
+    // Since (mu_bulk + mu_aniso) = mu + L_stab*Laplace(Q),
+    // RHS = Q^n - dt*m*mu(Q^n) - alpha*Laplace(Q^n).
+    QTensor out;
+    out.Qxx = q.Qxx - (dt * mobility) * h.Qxx - alpha * lap.Qxx;
+    out.Qxy = q.Qxy - (dt * mobility) * h.Qxy - alpha * lap.Qxy;
+    out.Qxz = q.Qxz - (dt * mobility) * h.Qxz - alpha * lap.Qxz;
+    out.Qyy = q.Qyy - (dt * mobility) * h.Qyy - alpha * lap.Qyy;
+    out.Qyz = q.Qyz - (dt * mobility) * h.Qyz - alpha * lap.Qyz;
+    rhs[idx] = out;
+}
+
+__global__ void jacobiHelmholtzStepKernel(
+    const QTensor* rhs,
+    const QTensor* Q_old,
+    QTensor* Q_new,
+    int Nx, int Ny, int Nz,
+    double alpha,
+    double dx, double dy, double dz,
+    const bool* is_shell,
+    double W
+) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    int j = blockIdx.y * blockDim.y + threadIdx.y;
+    int k = blockIdx.z * blockDim.z + threadIdx.z;
+
+    if (i >= Nx || j >= Ny || k >= Nz) return;
+    const int idx = k + Nz * (j + Ny * i);
+
+    // Keep boundaries fixed for simplicity and stability.
+    if (i == 0 || j == 0 || k == 0 || i == Nx - 1 || j == Ny - 1 || k == Nz - 1) {
+        Q_new[idx] = Q_old[idx];
+        return;
+    }
+    if (W == 0.0 && is_shell[idx]) {
+        Q_new[idx] = Q_old[idx];
+        return;
+    }
+
+    const double cx = Nx / 2.0, cy = Ny / 2.0, cz = Nz / 2.0;
+    const double R = min(min((double)Nx, (double)Ny), (double)Nz) / 2.0;
+    const double x = i - cx, y = j - cy, z = k - cz;
+    const double r = sqrt(x * x + y * y + z * z);
+    if (W == 0.0) { if (r > R) { Q_new[idx] = Q_old[idx]; return; } }
+    else { if (r > R + 1.5) { Q_new[idx] = Q_old[idx]; return; } }
+
+    const double inv_dx2 = 1.0 / (dx * dx);
+    const double inv_dy2 = 1.0 / (dy * dy);
+    const double inv_dz2 = 1.0 / (dz * dz);
+
+    const double denom = 1.0 + 2.0 * alpha * (inv_dx2 + inv_dy2 + inv_dz2);
+    if (!(denom > 0.0)) {
+        Q_new[idx] = Q_old[idx];
+        return;
+    }
+
+    const int sx = Ny * Nz;
+    const int sy = Nz;
+    const int sz = 1;
+
+    const QTensor qxp = Q_old[idx + sx];
+    const QTensor qxm = Q_old[idx - sx];
+    const QTensor qyp = Q_old[idx + sy];
+    const QTensor qym = Q_old[idx - sy];
+    const QTensor qzp = Q_old[idx + sz];
+    const QTensor qzm = Q_old[idx - sz];
+
+    const QTensor b = rhs[idx];
+
+    QTensor out;
+    out.Qxx = (b.Qxx + alpha * (inv_dx2 * (qxp.Qxx + qxm.Qxx) + inv_dy2 * (qyp.Qxx + qym.Qxx) + inv_dz2 * (qzp.Qxx + qzm.Qxx))) / denom;
+    out.Qxy = (b.Qxy + alpha * (inv_dx2 * (qxp.Qxy + qxm.Qxy) + inv_dy2 * (qyp.Qxy + qym.Qxy) + inv_dz2 * (qzp.Qxy + qzm.Qxy))) / denom;
+    out.Qxz = (b.Qxz + alpha * (inv_dx2 * (qxp.Qxz + qxm.Qxz) + inv_dy2 * (qyp.Qxz + qym.Qxz) + inv_dz2 * (qzp.Qxz + qzm.Qxz))) / denom;
+    out.Qyy = (b.Qyy + alpha * (inv_dx2 * (qxp.Qyy + qxm.Qyy) + inv_dy2 * (qyp.Qyy + qym.Qyy) + inv_dz2 * (qzp.Qyy + qzm.Qyy))) / denom;
+    out.Qyz = (b.Qyz + alpha * (inv_dx2 * (qxp.Qyz + qxm.Qyz) + inv_dy2 * (qyp.Qyz + qym.Qyz) + inv_dz2 * (qzp.Qyz + qzm.Qyz))) / denom;
+    Q_new[idx] = out;
 }
 
 __global__ void applyBoundaryConditionsKernel(QTensor* Q, int Nx, int Ny, int Nz, const bool* is_shell, double S0, double W) {
@@ -1449,7 +1582,7 @@ int main() {
         }
 
         // Device Memory
-        QTensor *d_Q, *d_laplacianQ, *d_mu;
+        QTensor *d_Q, *d_Q_alt, *d_laplacianQ, *d_mu, *d_rhs;
         bool *d_is_shell;
         double *d_Dcol_x, *d_Dcol_y, *d_Dcol_z;
         double *d_bulk_energy, *d_elastic_energy;
@@ -1462,8 +1595,10 @@ int main() {
         unsigned int *d_xi_grad_edges_used;
 
         cudaMalloc(&d_Q, size_Q);
+        cudaMalloc(&d_Q_alt, size_Q);
         cudaMalloc(&d_laplacianQ, size_Q);
         cudaMalloc(&d_mu, size_Q);
+        cudaMalloc(&d_rhs, size_Q);
         cudaMalloc(&d_is_shell, size_bool);
         cudaMalloc(&d_Dcol_x, size_double);
         cudaMalloc(&d_Dcol_y, size_double);
@@ -1621,17 +1756,99 @@ int main() {
 
             double min_dx = std::min({ dx, dy, dz });
             // dt_max estimate: use an effective elastic scale even if L1<=0 or L3 dominates.
+            // NOTE: if S runs away during a quench, it means dt was too optimistic for the nonlinear bulk term
+            // (or elastic discretization became unstable). Use a conservative S_scale and optionally add runtime guards.
             double S_scale = std::isfinite(S_ref_used) ? std::abs(S_ref_used) : std::max({std::abs(S0), std::abs(S_eq), 0.5});
             if (!(S_scale > 0.0)) S_scale = 0.5;
+            {
+                // Use the expected nematic equilibrium at T_low as an additional scale, when available.
+                double A_t = 0.0, B_t = 0.0, C_t = 0.0;
+                bulk_ABC_from_convention(a, b, c, T_low, T_star, modechoice, A_t, B_t, C_t);
+                const double S_eq_low = std::abs(S_eq_uniaxial_from_ABC(A_t, B_t, C_t));
+                if (std::isfinite(S_eq_low) && S_eq_low > 0.0) S_scale = std::max(S_scale, S_eq_low);
+            }
+            // Keep a minimum scale so the dt_bulk estimate isn't unrealistically large.
+            S_scale = std::max(S_scale, 1.0);
+
             double L_eff = 0.0;
             if (L1 != 0.0 || L2 != 0.0 || L3 != 0.0) {
-                L_eff = std::max({std::abs(L1), std::abs(L1 + L2), std::abs(L3) * S_scale});
+                // L2 can strongly affect high-k modes; use a conservative effective scale.
+                L_eff = std::max({
+                    std::abs(L1),
+                    std::abs(L2),
+                    std::abs(L1 + L2),
+                    std::abs(L1 + 2.0 * L2),
+                    std::abs(L3) * S_scale
+                });
             } else {
                 L_eff = std::abs(kappa);
             }
             if (!(L_eff > 0.0)) L_eff = 1e-12;
             double D = L_eff / gamma; if (D == 0) D = 1e-12;
-            const double dt_diff = 0.5 * (min_dx * min_dx) / (6.0 * D);
+            double dt_diff_total = 0.5 * (min_dx * min_dx) / (6.0 * D);
+            // Anisotropic elasticity (especially L2/L3) tends to be stiffer and is more prone to exciting
+            // Nyquist checkerboard modes with explicit Euler; tighten the cap.
+            if (L2 != 0.0 || L3 != 0.0) dt_diff_total *= 0.25;
+
+            // Semi-implicit stabilization for stiff elastic Laplacian term:
+            // backward-Euler on +L_stab*Laplace(Q)/gamma, explicit on everything else.
+            // NOTE: this only stabilizes the isotropic Laplacian-like piece; L2/L3 contributions remain explicit.
+            const bool use_semi_implicit = prompt_yes_no(
+                "Quench: use semi-implicit elastic stabilizer? (Helmholtz solve via Jacobi)",
+                true
+            );
+
+            // Choose the coefficient that multiplies the isotropic Laplacian in the chemical potential.
+            // - In LdG (L1/L2/L3) mode, that's L1.
+            // - In one-constant mode, that's kappa.
+            const bool using_LdG_elastic = (L1 != 0.0 || L2 != 0.0 || L3 != 0.0);
+            const double L_base = using_LdG_elastic ? L1 : kappa;
+            const double L_base_abs = std::abs(L_base);
+
+            double L_stab = 0.0;
+            int jacobi_iters = 0;
+            if (use_semi_implicit) {
+                const double L_stab_default = (L_base_abs > 0.0) ? L_base_abs : 0.0;
+                L_stab = prompt_with_default("Semi-implicit: L_stab (use |L1| or |kappa|)", L_stab_default);
+                if (!std::isfinite(L_stab) || L_stab < 0.0) L_stab = 0.0;
+                if (L_base_abs > 0.0 && L_stab > L_base_abs) {
+                    std::cout << "[SemiImplicit] Clamping L_stab from " << L_stab << " to |L_base|=" << L_base_abs
+                              << " to avoid anti-diffusive explicit remainder." << std::endl;
+                    L_stab = L_base_abs;
+                }
+                jacobi_iters = prompt_with_default("Semi-implicit: Jacobi iterations per step", 25);
+                if (jacobi_iters < 0) jacobi_iters = 0;
+            }
+
+            // If semi-implicit is enabled, relax the elastic dt cap to only cover the remaining explicit stiffness:
+            // L_explicit_eff ~ max( |L_base - sign(L_base)*L_stab|, |L2|, |L1+L2|, |L1+2L2|, |L3|*S_scale ).
+            // This way, in one-constant mode with L_stab≈kappa, dt_max becomes bulk-limited instead of dx^2-limited.
+            double dt_diff = dt_diff_total;
+            if (use_semi_implicit && L_stab > 0.0 && jacobi_iters > 0) {
+                const double L_stab_signed = (L_base >= 0.0) ? L_stab : -L_stab;
+                const double L_rem = std::abs(L_base - L_stab_signed);
+                double L_eff_explicit = 0.0;
+                if (using_LdG_elastic) {
+                    L_eff_explicit = std::max({
+                        L_rem,
+                        std::abs(L2),
+                        std::abs((L1) + L2),
+                        std::abs((L1) + 2.0 * L2),
+                        std::abs(L3) * S_scale
+                    });
+                } else {
+                    // one-constant mode: only the remainder of kappa*Laplace is explicit
+                    L_eff_explicit = L_rem;
+                }
+
+                if (L_eff_explicit > 0.0) {
+                    const double D_exp = L_eff_explicit / gamma;
+                    dt_diff = 0.5 * (min_dx * min_dx) / (6.0 * D_exp);
+                    if (L2 != 0.0 || L3 != 0.0) dt_diff *= 0.25;
+                } else {
+                    dt_diff = std::numeric_limits<double>::infinity();
+                }
+            }
 
             // Bulk stiffness can be much larger than elastic diffusion (especially deep in nematic),
             // so explicit Euler typically needs a dt cap based on |A|,|B|,|C|.
@@ -1642,17 +1859,44 @@ int main() {
                 return std::abs(A_t) + std::abs(B_t) * S_scale + std::abs(C_t) * S2;
             };
             const double bulk_rate = std::max(bulk_rate_at_T(T_high), bulk_rate_at_T(T_low));
-            const double dt_bulk = (bulk_rate > 0.0) ? (0.1 * gamma / bulk_rate) : std::numeric_limits<double>::infinity();
+            // Use a conservative factor; the bulk cubic/quartic nonlinearity can destabilize Euler if dt is too large.
+            const double dt_bulk = (bulk_rate > 0.0) ? (0.02 * gamma / bulk_rate) : std::numeric_limits<double>::infinity();
 
             double dt_max = std::min(dt_diff, dt_bulk);
             if (!(dt_max > 0.0) || !std::isfinite(dt_max)) dt_max = dt_diff;
 
             std::cout << "\nMaximum stable dt estimates:\n"
                       << "  dt_diff (elastic) ≈ " << dt_diff << " s\n"
+                      << "  dt_diff_total      ≈ " << dt_diff_total << " s" << (use_semi_implicit ? " (before semi-implicit)" : "") << "\n"
                       << "  dt_bulk (bulk)    ≈ " << dt_bulk << " s\n"
                       << "  dt_max            = " << dt_max << " s" << std::endl;
             double dt = prompt_with_default("Enter time step dt (s)", dt_max);
             if (dt > dt_max) dt = dt_max;
+
+            // Optional numerical guards to detect (and optionally mitigate) the runaway-S / Nyquist checkerboard.
+            const bool enable_instability_guard = prompt_yes_no(
+                "Enable instability guard? (abort/adjust if S blows up or Nyquist checkerboard grows)",
+                true
+            );
+            const bool enable_adaptive_dt = enable_instability_guard && prompt_yes_no(
+                "Guard: adapt dt downward when instability is detected? (no rollback)",
+                true
+            );
+            const double S_abort = enable_instability_guard
+                ? prompt_with_default("Guard: abort if max S exceeds", 2.0)
+                : 0.0;
+            const double checker_rel_abort = enable_instability_guard
+                ? prompt_with_default("Guard: abort if checkerboard rel-amplitude exceeds", 0.10)
+                : 0.0;
+
+            const bool enable_q_limiter = prompt_yes_no(
+                "Optional: clamp |Q| (caps S) to prevent blow-up? (numerical limiter)",
+                false
+            );
+            const double S_cap = enable_q_limiter
+                ? prompt_with_default("Limiter: S_cap (approx physical max)", 1.2)
+                : 0.0;
+            const double q_norm_cap = (enable_q_limiter && S_cap > 0.0) ? (S_cap * std::sqrt(2.0 / 3.0)) : 0.0;
 
             // Optional convergence/early-stop guard (useful when you only care about final aligned state).
             // For a quench/ramp, we only allow early-stop once the protocol has reached the final temperature.
@@ -1706,7 +1950,7 @@ int main() {
             dim3 blocksY((Nx + threads2D.x - 1) / threads2D.x, (Ny - 1 + threads2D.y - 1) / threads2D.y, 1);
 
             std::ofstream quench_log((out_dir / "quench_log.dat").string());
-            quench_log << "iteration,time_s,T_K,bulk,elastic,anchoring,total,radiality,avg_S,defect_density_per_plaquette,defect_plaquettes_used,xi_grad_proxy,xi_grad_edges_used\n";
+            quench_log << "iteration,time_s,dt_s,T_K,bulk,elastic,anchoring,total,radiality,avg_S,max_S,checker_rel,defect_density_per_plaquette,defect_plaquettes_used,xi_grad_proxy,xi_grad_edges_used\n";
 
             auto compute_T_current = [&](int iter) -> double {
                 if (iter < pre_equil_iters) return T_high;
@@ -1749,7 +1993,39 @@ int main() {
                 }
                 const double shell_thickness = std::min({dx, dy, dz});
                 applyWeakAnchoringPenaltyKernel<<<numBlocks, threadsPerBlock>>>(d_mu, d_Q, Nx, Ny, Nz, d_is_shell, S_shell, W, shell_thickness);
-                updateQTensorKernel<<<numBlocks, threadsPerBlock>>>(d_Q, d_mu, Nx, Ny, Nz, dt, d_is_shell, gamma, W);
+
+                if (use_semi_implicit && L_stab > 0.0 && jacobi_iters > 0) {
+                    computeRhsSemiImplicitKernel<<<numBlocks, threadsPerBlock>>>(
+                        d_Q, d_mu, d_laplacianQ, d_rhs,
+                        Nx, Ny, Nz,
+                        dt, gamma, L_stab,
+                        d_is_shell, W
+                    );
+
+                    const double alpha = (dt / gamma) * L_stab;
+                    QTensor* q_old = d_Q;
+                    QTensor* q_new = d_Q_alt;
+                    for (int it = 0; it < jacobi_iters; ++it) {
+                        jacobiHelmholtzStepKernel<<<numBlocks, threadsPerBlock>>>(
+                            d_rhs,
+                            q_old,
+                            q_new,
+                            Nx, Ny, Nz,
+                            alpha,
+                            dx, dy, dz,
+                            d_is_shell,
+                            W
+                        );
+                        QTensor* tmp = q_old;
+                        q_old = q_new;
+                        q_new = tmp;
+                    }
+                    // Keep d_Q as the latest solution buffer.
+                    d_Q = q_old;
+                    d_Q_alt = q_new;
+                } else {
+                    updateQTensorKernel<<<numBlocks, threadsPerBlock>>>(d_Q, d_mu, Nx, Ny, Nz, dt, d_is_shell, gamma, W, q_norm_cap);
+                }
                 applyBoundaryConditionsKernel<<<numBlocks, threadsPerBlock>>>(d_Q, Nx, Ny, Nz, d_is_shell, S_shell, W);
 
                 physical_time += dt;
@@ -1868,16 +2144,96 @@ int main() {
                     cudaFree(d_nf);
                     double avg_S = compute_avg_S_droplet(h_nf);
 
+                    // Diagnostics for numerical instability:
+                    // - max_S inside droplet interior
+                    // - checkerboard (Nyquist) relative amplitude on a representative z-slice
+                    double max_S = 0.0;
+                    double checker_rel = std::numeric_limits<double>::quiet_NaN();
+                    {
+                        const double cx_l = Nx / 2.0, cy_l = Ny / 2.0, cz_l = Nz / 2.0;
+                        const double R_l = std::min({ (double)Nx, (double)Ny, (double)Nz }) / 2.0;
+                        const double shell_exclude = 2.0;
+
+                        // max_S in interior
+                        for (int i = 0; i < Nx; ++i) {
+                            for (int j = 0; j < Ny; ++j) {
+                                for (int k = 0; k < Nz; ++k) {
+                                    const double x = i - cx_l, y = j - cy_l, z = k - cz_l;
+                                    const double r = std::sqrt(x * x + y * y + z * z);
+                                    if (r < (R_l - shell_exclude)) {
+                                        const size_t id = (size_t)k + (size_t)Nz * ((size_t)j + (size_t)Ny * (size_t)i);
+                                        const double s = h_nf[id].S;
+                                        if (std::isfinite(s)) max_S = std::max(max_S, s);
+                                    }
+                                }
+                            }
+                        }
+
+                        // checkerboard (Nyquist) metric on a chosen z slice.
+                        // IMPORTANT: early in the quench, only a small fraction of points have S > S_thr,
+                        // which can make even/odd means noisy and trigger false positives. We therefore
+                        // only evaluate this once the droplet has meaningfully ordered.
+                        const double maxS_for_checker = 0.5;
+                        if (max_S >= maxS_for_checker) {
+                            const int z_check = defects_z_slice;
+                            double even_sum = 0.0, odd_sum = 0.0, all_sum = 0.0;
+                            int even_n = 0, odd_n = 0, all_n = 0;
+                            const double S_thr = 0.01;
+                            for (int i = 0; i < Nx; ++i) {
+                                for (int j = 0; j < Ny; ++j) {
+                                    const int k = z_check;
+                                    const double x = i - cx_l, y = j - cy_l, z = k - cz_l;
+                                    const double r = std::sqrt(x * x + y * y + z * z);
+                                    if (r >= (R_l - shell_exclude)) continue;
+                                    const size_t id = (size_t)k + (size_t)Nz * ((size_t)j + (size_t)Ny * (size_t)i);
+                                    const double s = h_nf[id].S;
+                                    if (!std::isfinite(s) || s <= S_thr) continue;
+                                    all_sum += s; all_n++;
+                                    if (((i + j) & 1) == 0) { even_sum += s; even_n++; }
+                                    else { odd_sum += s; odd_n++; }
+                                }
+                            }
+                            if (even_n > 10 && odd_n > 10 && all_n > 20 && all_sum != 0.0) {
+                                // Parity projection: 0 means no odd-even bias.
+                                checker_rel = std::abs(even_sum - odd_sum) / std::abs(all_sum);
+                            }
+                        }
+                    }
+
                     if (do_log) {
-                        quench_log << iter << "," << physical_time << "," << T_current << "," << bulk_sum << "," << elastic_sum
+                        quench_log << iter << "," << physical_time << "," << dt << "," << T_current << "," << bulk_sum << "," << elastic_sum
                                   << "," << anch_sum << "," << total_F << "," << avg_rad << "," << avg_S
+                                  << "," << max_S << "," << checker_rel
                                   << "," << defect_density_2d << "," << defect_plaq_used
                                   << "," << xi_grad_proxy << "," << xi_grad_edges_used << "\n";
                         quench_log.flush();
                         if (user_choice == 'y' || user_choice == 'Y') {
                             std::cout << "Iter " << iter << "  t=" << physical_time << " s  T=" << T_current
                                       << " K  F=" << total_F << " (bulk=" << bulk_sum << ", el=" << elastic_sum
-                                      << ", anch=" << anch_sum << ")  Rbar=" << avg_rad << "  <S>=" << avg_S << std::endl;
+                                      << ", anch=" << anch_sum << ")  Rbar=" << avg_rad << "  <S>=" << avg_S
+                                      << "  maxS=" << max_S << "  checker=" << checker_rel << std::endl;
+                        }
+
+                        if (enable_instability_guard) {
+                            const bool s_bad = (!std::isfinite(max_S)) || (S_abort > 0.0 && max_S > S_abort);
+                            const bool cb_bad = std::isfinite(checker_rel) && (checker_rel_abort > 0.0) && (checker_rel > checker_rel_abort);
+                            if (s_bad || cb_bad) {
+                                std::cerr << "\n[InstabilityGuard] Detected runaway/aliasing at iter " << iter
+                                          << ": max_S=" << max_S << ", checker_rel=" << checker_rel
+                                          << ". dt=" << dt << " s" << std::endl;
+                                if (enable_adaptive_dt && dt > 0.0) {
+                                    const double dt_new = std::max(dt * 0.5, 1e-18);
+                                    if (dt_new < dt) {
+                                        std::cerr << "[InstabilityGuard] Reducing dt -> " << dt_new
+                                                  << " (no rollback; continuing)" << std::endl;
+                                        dt = dt_new;
+                                    }
+                                } else {
+                                    std::cerr << "[InstabilityGuard] Aborting to avoid corrupt final state."
+                                              << " Try smaller dt or disable L2/L3." << std::endl;
+                                    break;
+                                }
+                            }
                         }
 
                         if (enable_early_stop && has_reached_final_T(iter)) {
@@ -2064,7 +2420,7 @@ int main() {
                     }
                     const double shell_thickness = std::min({dx, dy, dz});
                     applyWeakAnchoringPenaltyKernel<<<numBlocks, threadsPerBlock>>>(d_mu, d_Q, Nx, Ny, Nz, d_is_shell, S_shell, W, shell_thickness);
-                    updateQTensorKernel<<<numBlocks, threadsPerBlock>>>(d_Q, d_mu, Nx, Ny, Nz, dt, d_is_shell, gamma, W);
+                    updateQTensorKernel<<<numBlocks, threadsPerBlock>>>(d_Q, d_mu, Nx, Ny, Nz, dt, d_is_shell, gamma, W, 0.0);
                     applyBoundaryConditionsKernel<<<numBlocks, threadsPerBlock>>>(d_Q, Nx, Ny, Nz, d_is_shell, S_shell, W);
 
                     physical_time += dt;
@@ -2203,7 +2559,7 @@ int main() {
                     const double shell_thickness = std::min({dx, dy, dz});
                     applyWeakAnchoringPenaltyKernel<<<numBlocks, threadsPerBlock>>>(d_mu, d_Q, Nx, Ny, Nz, d_is_shell, S_shell_single, W, shell_thickness);
                     if (check_now) cuda_check_or_die("applyWeakAnchoringPenaltyKernel");
-                    updateQTensorKernel<<<numBlocks, threadsPerBlock>>>(d_Q, d_mu, Nx, Ny, Nz, dt, d_is_shell, gamma, W);
+                    updateQTensorKernel<<<numBlocks, threadsPerBlock>>>(d_Q, d_mu, Nx, Ny, Nz, dt, d_is_shell, gamma, W, 0.0);
                     if (check_now) cuda_check_or_die("updateQTensorKernel");
                     applyBoundaryConditionsKernel<<<numBlocks, threadsPerBlock>>>(d_Q, Nx, Ny, Nz, d_is_shell, S_shell_single, W);
                     if (check_now) cuda_check_or_die("applyBoundaryConditionsKernel");
@@ -2315,7 +2671,7 @@ int main() {
                     const double shell_thickness = std::min({dx, dy, dz});
                     applyWeakAnchoringPenaltyKernel<<<numBlocks, threadsPerBlock>>>(d_mu, d_Q, Nx, Ny, Nz, d_is_shell, S_shell_single, W, shell_thickness);
                     if (check_now) cuda_check_or_die("applyWeakAnchoringPenaltyKernel");
-                    updateQTensorKernel<<<numBlocks, threadsPerBlock>>>(d_Q, d_mu, Nx, Ny, Nz, dt, d_is_shell, gamma, W);
+                    updateQTensorKernel<<<numBlocks, threadsPerBlock>>>(d_Q, d_mu, Nx, Ny, Nz, dt, d_is_shell, gamma, W, 0.0);
                     if (check_now) cuda_check_or_die("updateQTensorKernel");
                     applyBoundaryConditionsKernel<<<numBlocks, threadsPerBlock>>>(d_Q, Nx, Ny, Nz, d_is_shell, S_shell_single, W);
                     if (check_now) cuda_check_or_die("applyBoundaryConditionsKernel");
@@ -2421,7 +2777,8 @@ int main() {
         }
 
         // Cleanup
-        cudaFree(d_Q); cudaFree(d_laplacianQ); cudaFree(d_mu); cudaFree(d_is_shell);
+        cudaFree(d_Q); cudaFree(d_Q_alt); cudaFree(d_rhs);
+        cudaFree(d_laplacianQ); cudaFree(d_mu); cudaFree(d_is_shell);
         cudaFree(d_Dcol_x); cudaFree(d_Dcol_y); cudaFree(d_Dcol_z);
         cudaFree(d_bulk_energy); cudaFree(d_elastic_energy); cudaFree(d_anch_energy);
         cudaFree(d_radiality_vals); cudaFree(d_count_vals);
