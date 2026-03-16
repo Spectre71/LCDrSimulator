@@ -809,6 +809,14 @@ def create_nematic_field_animation(
     if frame_stride is None or frame_stride < 1:
         frame_stride = 1
 
+    try:
+        if output_c is not None:
+            output_c = int(output_c)
+            if output_c < 1:
+                output_c = None
+    except Exception:
+        output_c = None
+
     # Create a directory for temporary frames
     if not os.path.exists(frames_dir):
         os.makedirs(frames_dir)
@@ -852,7 +860,8 @@ def create_nematic_field_animation(
                 slice_index_use = int(slice_index)
 
             vals = []
-            for fp in files:
+            print(f"Computing consistent color scale from {len(files)} snapshots…")
+            for j, fp in enumerate(files):
                 try:
                     # Use the same plane as the animation for consistent scaling.
                     S_arr, _, _, _ = _load_nematic_slice_arrays(fp, Nx, Ny, Nz, slice_index_use, slice_axis=axis)
@@ -862,6 +871,11 @@ def create_nematic_field_animation(
                 v = v[v > 0.1]
                 if v.size:
                     vals.append(v)
+                if output_c is not None and (j % int(output_c) == 0 or j == len(files) - 1):
+                    try:
+                        print(f"  scale scan {j+1}/{len(files)}")
+                    except Exception:
+                        pass
             if vals:
                 vv = np.concatenate(vals)
                 vmin = 0.0
@@ -1606,7 +1620,6 @@ def _parse_temperature_from_dir(d):
         return float(m.group(1))
     except ValueError:
         return float('nan')
-
 
 def _load_nematic_slice_arrays(path, Nx, Ny, Nz, z_slice, *, slice_axis: str = 'z'):
     """Load a 2D slice from a 3D nematic_field_*.dat dump.
@@ -3931,6 +3944,7 @@ def animate_tempSweep(
     selected: str = 'all',
     out_dir: str = 'pics',
     duration: float = 0.5,
+    output_c: int | None = None,
     show: bool = False,
     close: bool = True,
     return_gif_path: bool = False,
@@ -4045,6 +4059,14 @@ def animate_tempSweep(
     if choice == 'g':
         os.makedirs(tmp_dir, exist_ok=True)
 
+    try:
+        if output_c is not None:
+            output_c = int(output_c)
+            if output_c < 1:
+                output_c = None
+    except Exception:
+        output_c = None
+
     frame_paths: list[str] = []
     for idx, d in enumerate(dirs):
         S, nx, ny, nz = _load_nematic_slice_arrays(os.path.join(d, 'nematic_field_final.dat'), Nx, Ny, Nz, z_slice)
@@ -4088,6 +4110,10 @@ def animate_tempSweep(
             frame_path = os.path.join(tmp_dir, f'frame_{idx:04d}.png')
             plt.savefig(frame_path)
             frame_paths.append(frame_path)
+            if output_c is not None and (idx % output_c == 0 or idx == len(dirs) - 1):
+                temp_val = _parse_temperature_from_dir(d)
+                temp_str = f"{temp_val:g}" if np.isfinite(temp_val) else os.path.basename(os.path.normpath(d))
+                print(f"Generated sweep frame {idx+1}/{len(dirs)} (T={temp_str}K) -> {frame_path}")
             if close:
                 plt.close(fig)
         elif choice == 'f':
@@ -4113,9 +4139,11 @@ def animate_tempSweep(
         gif_path = os.path.join(out_dir, f'temp_sweep_animation_{Vname}.gif' if Vname else 'temp_sweep_animation.gif')
         writer: Any = imageio.get_writer(gif_path, mode='I', duration=float(duration))
         try:
-            for fp in frame_paths:
+            for j, fp in enumerate(frame_paths):
                 image = imageio.imread(fp)
                 writer.append_data(image)
+                if output_c is not None and (j % output_c == 0 or j == len(frame_paths) - 1):
+                    print(f"Stitching GIF {j+1}/{len(frame_paths)} -> {gif_path}")
         finally:
             writer.close()
 

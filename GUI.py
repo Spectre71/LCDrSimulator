@@ -6,6 +6,7 @@ import subprocess
 import threading
 import time
 import sys
+import io
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -82,6 +83,10 @@ def _render_help(spec: FieldSpec) -> str:
 
 
 def _repo_root() -> Path:
+	# Support running from a PyInstaller bundle.
+	meipass = getattr(sys, "_MEIPASS", None)
+	if meipass:
+		return Path(meipass)
 	return Path(__file__).resolve().parent
 
 
@@ -1409,6 +1414,7 @@ class QSRGui(tk.Tk):
 				"This requires snapshot files (snapshot_mode=1 or 2 in the backend).",
 				"duration is the per-frame time in seconds (smaller = faster playback).",
 				"frame_stride skips frames: stride=2 uses every 2nd snapshot, etc.",
+				"Console progress every N frames controls how often GIF generation prints progress into the GUI log.",
 				"Color field and arrows match mode 0 meanings. The GUI previews only the first frame; the GIF is saved to Output dir.",
 			),
 		)
@@ -1422,6 +1428,7 @@ class QSRGui(tk.Tk):
 		self._plot_vars["m1_interp"] = tk.StringVar(value="nearest")
 		self._plot_vars["m1_arrows"] = tk.StringVar(value="20")
 		self._plot_vars["m1_zoom"] = tk.StringVar(value="")
+		self._plot_vars["m1_output_c"] = tk.StringVar(value="10")
 		add_choice(m1_body, 0, "Slice axis", self._plot_vars["m1_axis"], ["x", "y", "z"])
 		add_row(m1_body, 1, "Slice index (blank=mid)", self._plot_vars["m1_slice"], width=10)
 		add_row(m1_body, 2, "duration (s / frame)", self._plot_vars["m1_duration"], width=10)
@@ -1430,6 +1437,7 @@ class QSRGui(tk.Tk):
 		add_choice(m1_body, 5, "Interpolation", self._plot_vars["m1_interp"], ["nearest", "bilinear", "bicubic", "spline16", "spline36", "sinc"])
 		add_row(m1_body, 6, "Arrows per axis (0=off)", self._plot_vars["m1_arrows"], width=10)
 		add_row(m1_body, 7, "Zoom radius (blank=off)", self._plot_vars["m1_zoom"], width=10)
+		add_row(m1_body, 8, "Console progress every N frames (blank=off)", self._plot_vars["m1_output_c"], width=10)
 
 		# Mode 2
 		m2 = ttk.Frame(parent)
@@ -1493,6 +1501,7 @@ class QSRGui(tk.Tk):
 				"Source can be either the repo root (it will look for output_temp_sweep/) or the output_temp_sweep folder itself.",
 				"Color field controls what is visualized in each frame (S / nz / n_perp).",
 				"When output=GIF, duration is the per-frame time in seconds.",
+				"Console progress every N frames controls how often frame generation / stitching prints into the GUI log.",
 				"When output=frames, use indices like: 0,2,5-7 or 'all'.",
 			),
 		)
@@ -1502,10 +1511,12 @@ class QSRGui(tk.Tk):
 		self._plot_vars["m5_color"] = tk.StringVar(value="S")
 		self._plot_vars["m5_duration"] = tk.StringVar(value="0.5")
 		self._plot_vars["m5_selected"] = tk.StringVar(value="all")
+		self._plot_vars["m5_output_c"] = tk.StringVar(value="10")
 		add_choice(m5_body, 0, "Output", self._plot_vars["m5_output"], ["gif", "frames"])
 		add_choice(m5_body, 1, "Color field", self._plot_vars["m5_color"], ["S", "nz", "n_perp"])
 		add_row(m5_body, 2, "duration (s / frame)", self._plot_vars["m5_duration"], width=10)
 		add_row(m5_body, 3, "selected indices", self._plot_vars["m5_selected"], width=18)
+		add_row(m5_body, 4, "Console progress every N frames (blank=off)", self._plot_vars["m5_output_c"], width=10)
 
 		# Mode 6
 		m6 = ttk.Frame(parent)
@@ -1539,6 +1550,7 @@ class QSRGui(tk.Tk):
 			text=_join_lines(
 				"Same as mode 1, but intended for quench runs (output_quench*/ with nematic_field_iter_*.dat).",
 				"If you ran snapshot_mode=2 (KZ), you’ll only have frames near Tc; the GIF will cover that window.",
+				"Console progress every N frames controls how often GIF generation prints progress into the GUI log.",
 			),
 		)
 		m7_body = ttk.Frame(m7)
@@ -1551,6 +1563,7 @@ class QSRGui(tk.Tk):
 		self._plot_vars["m7_interp"] = tk.StringVar(value="nearest")
 		self._plot_vars["m7_arrows"] = tk.StringVar(value="20")
 		self._plot_vars["m7_zoom"] = tk.StringVar(value="")
+		self._plot_vars["m7_output_c"] = tk.StringVar(value="10")
 		add_choice(m7_body, 0, "Slice axis", self._plot_vars["m7_axis"], ["x", "y", "z"])
 		add_row(m7_body, 1, "Slice index (blank=mid)", self._plot_vars["m7_slice"], width=10)
 		add_row(m7_body, 2, "duration (s / frame)", self._plot_vars["m7_duration"], width=10)
@@ -1559,6 +1572,7 @@ class QSRGui(tk.Tk):
 		add_choice(m7_body, 5, "Interpolation", self._plot_vars["m7_interp"], ["nearest", "bilinear", "bicubic", "spline16", "spline36", "sinc"])
 		add_row(m7_body, 6, "Arrows per axis (0=off)", self._plot_vars["m7_arrows"], width=10)
 		add_row(m7_body, 7, "Zoom radius (blank=off)", self._plot_vars["m7_zoom"], width=10)
+		add_row(m7_body, 8, "Console progress every N frames (blank=off)", self._plot_vars["m7_output_c"], width=10)
 
 		# Mode 8
 		m8 = ttk.Frame(parent)
@@ -1827,6 +1841,109 @@ class QSRGui(tk.Tk):
 				return str(snaps[-1])
 		raise FileNotFoundError(f"Could not resolve a field file from: {src}")
 
+	def _repo_venv_python(self) -> Path | None:
+		"""Return repo-local venv python if it looks usable."""
+		cand = _repo_root() / "venv" / "bin" / "python"
+		if cand.exists() and os.access(str(cand), os.X_OK):
+			return cand
+		return None
+
+	def _offer_relaunch_with_venv(self, *, missing: str) -> None:
+		"""Offer to relaunch the GUI using ./venv/bin/python when available."""
+		venv_py = self._repo_venv_python()
+		if venv_py is None:
+			return
+		try:
+			ans = messagebox.askyesno(
+				"Missing Python package",
+				(
+					f"The current Python interpreter ({sys.executable}) cannot import '{missing}'.\n\n"
+					"A repo-local virtualenv was found at ./venv/.\n"
+					"Relaunch this GUI using that venv now?"
+				),
+			)
+		except Exception:
+			ans = False
+		if not ans:
+			return
+		# Avoid relaunch loops.
+		os.environ["QSR_GUI_RELAUNCHED"] = "1"
+		argv0 = str(venv_py)
+		argv = [argv0, str(Path(__file__).resolve())] + sys.argv[1:]
+		os.execv(argv0, argv)
+
+	def _handle_missing_plot_dependency(self, err: BaseException) -> None:
+		"""Show a clear message for missing plotting deps (matplotlib / QSRvis stack)."""
+		missing = None
+		if isinstance(err, ModuleNotFoundError):
+			missing = err.name
+		missing = missing or "a required module"
+
+		# If we already relaunched once, don't keep prompting.
+		if os.environ.get("QSR_GUI_RELAUNCHED") != "1":
+			self._offer_relaunch_with_venv(missing=missing)
+
+		msg = _join_lines(
+			f"Plotting requires extra Python packages, but the current interpreter cannot import '{missing}'.",
+			"",
+			"Why this happens:",
+			"  You likely started the GUI with system Python (e.g. /usr/bin/python3) instead of the repo virtualenv.",
+			"",
+			"Fix (recommended: use a venv in the repo):",
+			"  1) python3 -m venv venv",
+			"  2) ./venv/bin/python -m pip install -r requirements.txt",
+			"  3) ./venv/bin/python GUI.py",
+			"",
+			"Alternative:",
+			"  Install matplotlib into whatever Python you are using (not recommended system-wide if you prefer isolation).",
+			"",
+			f"Current Python: {sys.executable}",
+		)
+		try:
+			messagebox.showerror("Plotting dependencies missing", msg)
+		except Exception:
+			# If Tk messagebox isn't available for some reason, fall back to log/status.
+			pass
+		self._plot_status.set(f"Plotting unavailable: missing '{missing}'")
+		self._append_log(f"[GUI][Plot] Missing dependency: {missing} (python={sys.executable})\n")
+
+	class _GuiLogStream(io.TextIOBase):
+		encoding = "utf-8"
+
+		def __init__(self, app: "QSRGui", *, prefix: str) -> None:
+			self._app = app
+			self._prefix = prefix
+			self._buf = ""
+
+		def write(self, s: str) -> int:
+			if not s:
+				return 0
+			self._buf += str(s)
+			# Flush complete lines so progress output shows promptly.
+			while "\n" in self._buf:
+				line, self._buf = self._buf.split("\n", 1)
+				if line.strip() != "":
+					self._app._append_log(f"{self._prefix}{line}\n")
+				else:
+					self._app._append_log("\n")
+				# Keep UI responsive enough to show progress text.
+				try:
+					self._app.update_idletasks()
+					self._app.update()
+				except Exception:
+					pass
+			return len(s)
+
+		def flush(self) -> None:
+			if self._buf.strip() != "":
+				self._app._append_log(f"{self._prefix}{self._buf}\n")
+				self._buf = ""
+				try:
+					self._app.update_idletasks()
+					self._app.update()
+				except Exception:
+					pass
+
 	def _on_render_plot(self) -> None:
 		self._plot_status.set("Rendering…")
 		m = self.plot_mode.get().strip()
@@ -1836,374 +1953,431 @@ class QSRGui(tk.Tk):
 			import QSRvis as v
 			import matplotlib.pyplot as plt
 			import numpy as np
+		except ModuleNotFoundError as e:
+			self._handle_missing_plot_dependency(e)
+			return
 		except Exception as e:
 			self._plot_status.set(f"Import failed: {e}")
+			self._append_log(f"[GUI][Plot] Import failed: {e}\n")
 			return
 
-		try:
-			if m == "0":
-				field_fp = self._pick_field_file(src)
-				Nx, Ny, Nz = v.infer_grid_dims_from_nematic_field_file(field_fp)
-				axis = str(self._plot_vars["m0_axis"].get())
-				sl = str(self._plot_vars["m0_slice"].get()).strip()
-				slice_idx = int(float(sl)) if sl else None
-				zoom_s = str(self._plot_vars["m0_zoom"].get()).strip()
-				zoom = int(float(zoom_s)) if zoom_s else None
-				arrows = int(float(str(self._plot_vars["m0_arrows"].get()).strip() or "20"))
-				vmin_s = str(self._plot_vars["m0_vmin"].get()).strip()
-				vmax_s = str(self._plot_vars["m0_vmax"].get()).strip()
-				vmin = float(vmin_s) if vmin_s else None
-				vmax = float(vmax_s) if vmax_s else None
-				fig = v.plot_nematic_field_slice(
-					filename=field_fp,
-					Nx=Nx,
-					Ny=Ny,
-					Nz=Nz,
-					z_slice=slice_idx,
-					slice_axis=axis,
-					output_path=None,
-					zoom_radius=zoom,
-					interpol=str(self._plot_vars["m0_interp"].get()),
-					color_field=str(self._plot_vars["m0_color"].get()),
-					arrows_per_axis=arrows,
-					vmin=vmin,
-					vmax=vmax,
-					print_stats=False,
-					show=False,
-					close=False,
-					return_fig=True,
-				)
-				self._display_figure(fig)
-				self._plot_status.set(f"Mode 0 rendered from {Path(field_fp).name}")
-
-			elif m in ("1", "7"):
-				data_dir = src
-				if not Path(data_dir).is_dir():
-					raise ValueError("Mode 1/7 expects a directory containing nematic_field_iter_*.dat")
-				import glob
-				snaps = glob.glob(str(Path(data_dir) / "nematic_field_iter_*.dat"))
-				if not snaps:
-					raise FileNotFoundError("No nematic_field_iter_*.dat files found")
-				Nx, Ny, Nz = v.infer_grid_dims_from_nematic_field_file(snaps[0])
-				out_name = "nematic_field_evolution.gif" if m == "1" else "quench_evolution.gif"
-				out_gif = str(Path(out_dir) / out_name)
-				prefix = "m1" if m == "1" else "m7"
-				axis = str(self._plot_vars[f"{prefix}_axis"].get()).strip() or "z"
-				sl_s = str(self._plot_vars[f"{prefix}_slice"].get()).strip()
-				slice_idx = int(float(sl_s)) if sl_s else None
-				duration = float(str(self._plot_vars[f"{prefix}_duration"].get()).strip() or "0.1")
-				stride = int(float(str(self._plot_vars[f"{prefix}_stride"].get()).strip() or "1"))
-				color_field = str(self._plot_vars[f"{prefix}_color"].get()).strip() or "S"
-				interpol = str(self._plot_vars[f"{prefix}_interp"].get()).strip() or "nearest"
-				arrows = int(float(str(self._plot_vars[f"{prefix}_arrows"].get()).strip() or "20"))
-				zoom_s = str(self._plot_vars[f"{prefix}_zoom"].get()).strip()
-				zoom = int(float(zoom_s)) if zoom_s else None
-				frames_dir = str(Path(out_dir) / ("frames_m1" if m == "1" else "frames_m7"))
-				v.create_nematic_field_animation(
-					data_dir=data_dir,
-					output_gif=out_gif,
-					Nx=Nx,
-					Ny=Ny,
-					Nz=Nz,
-					slice_axis=axis,
-					slice_index=slice_idx,
-					frames_dir=frames_dir,
-					duration=duration,
-					frame_stride=stride,
-					color_field=color_field,
-					interpol=interpol,
-					zoom_radius=zoom,
-					arrows_per_axis=arrows,
-				)
-				try:
-					import imageio.v2 as imageio
-				except Exception:
-					import imageio
-					imageio = imageio  # type: ignore
-				frame0 = imageio.imread(out_gif)
-				fig, ax = plt.subplots(1, 1, figsize=(8, 6))
-				ax.imshow(frame0)
-				ax.set_axis_off()
-				ax.set_title(Path(out_gif).name)
-				fig.tight_layout()
-				self._display_figure(fig)
-				self._plot_status.set(f"Saved GIF -> {out_gif} (stride={stride}, duration={duration:g}s)")
-
-			elif m == "2":
-				fig = v.plot_energy_VS_iter(src, out_dir=out_dir, show=False, close=False, return_fig=True)
-				self._display_figure(fig)
-				self._plot_status.set("Saved and rendered free energy vs iteration")
-
-			elif m == "3":
-				fig = v.energy_components(src, out_dir=out_dir, show=False, close=False, return_fig=True)
-				self._display_figure(fig)
-				self._plot_status.set("Saved and rendered energy components vs iteration")
-
-			elif m == "4":
-				which = str(self._plot_vars["m4_which"].get())
-				figs = v.plotS_F(src, out_dir=out_dir, show=False, close=False, which=which, return_figs=True)
-				if isinstance(figs, dict) and figs:
-					fig = figs.get("S") or figs.get("F")
-					if fig is None:
-						raise RuntimeError("plotS_F returned no figures")
+		import contextlib
+		from typing import cast
+		out_stream = QSRGui._GuiLogStream(self, prefix="[Plot] ")
+		err_stream = QSRGui._GuiLogStream(self, prefix="[Plot][stderr] ")
+		with contextlib.redirect_stdout(cast(Any, out_stream)), contextlib.redirect_stderr(cast(Any, err_stream)):
+			try:
+				if m == "0":
+					field_fp = self._pick_field_file(src)
+					Nx, Ny, Nz = v.infer_grid_dims_from_nematic_field_file(field_fp)
+					axis = str(self._plot_vars["m0_axis"].get())
+					sl = str(self._plot_vars["m0_slice"].get()).strip()
+					slice_idx = int(float(sl)) if sl else None
+					zoom_s = str(self._plot_vars["m0_zoom"].get()).strip()
+					zoom = int(float(zoom_s)) if zoom_s else None
+					arrows = int(float(str(self._plot_vars["m0_arrows"].get()).strip() or "20"))
+					vmin_s = str(self._plot_vars["m0_vmin"].get()).strip()
+					vmax_s = str(self._plot_vars["m0_vmax"].get()).strip()
+					vmin = float(vmin_s) if vmin_s else None
+					vmax = float(vmax_s) if vmax_s else None
+					fig = v.plot_nematic_field_slice(
+						filename=field_fp,
+						Nx=Nx,
+						Ny=Ny,
+						Nz=Nz,
+						z_slice=slice_idx,
+						slice_axis=axis,
+						output_path=None,
+						zoom_radius=zoom,
+						interpol=str(self._plot_vars["m0_interp"].get()),
+						color_field=str(self._plot_vars["m0_color"].get()),
+						arrows_per_axis=arrows,
+						vmin=vmin,
+						vmax=vmax,
+						print_stats=False,
+						show=False,
+						close=False,
+						return_fig=True,
+					)
 					self._display_figure(fig)
-				self._plot_status.set("Saved and rendered sweep summary")
+					self._plot_status.set(f"Mode 0 rendered from {Path(field_fp).name}")
 
-			elif m == "6":
-				kind = str(self._plot_vars["m6_kind"].get()).strip().lower() or "s"
-				it_min_s = str(self._plot_vars["m6_it_min"].get()).strip()
-				it_max_s = str(self._plot_vars["m6_it_max"].get()).strip()
-				it_min = int(float(it_min_s)) if it_min_s else None
-				it_max = int(float(it_max_s)) if it_max_s else None
-				if kind in ("s", "a"):
-					fig, _axes = v.plot_quench_log(src, out_dir=out_dir, show=False, close=False, it_min=it_min, it_max=it_max)
-					self._display_figure(fig)
-					self._plot_status.set("Saved and rendered quench summary")
-				else:
-					self._plot_status.set("Mode 6 subplots (2/4/d) are saved by QSRvis; summary is embeddable.")
-
-			elif m == "8":
-				z_s = str(self._plot_vars["m8_z"].get()).strip()
-				z = int(float(z_s)) if z_s else None
-				stride = int(float(str(self._plot_vars["m8_stride"].get()).strip() or "10"))
-				max_s = str(self._plot_vars["m8_max"].get()).strip()
-				max_frames = int(float(max_s)) if max_s else None
-				sthr = float(str(self._plot_vars["m8_sthr"].get()).strip() or "0.1")
-				res = v.plot_quench_kz_metrics(
-					src,
-					out_dir=out_dir,
-					z_slice=z,
-					frame_stride=stride,
-					max_frames=max_frames,
-					S_threshold=sthr,
-					show=False,
-					close=False,
-					return_figs=True,
-				)
-				rows = res[0]
-				out_png = res[1]
-				figs = res[3] if len(res) >= 4 else {}
-				fig = figs.get("metrics") if isinstance(figs, dict) else None
-				if fig is not None:
-					self._display_figure(fig)
-				self._plot_status.set(f"Saved KZ metrics -> {out_png} (rows={len(rows)})")
-
-			elif m == "9":
-				parent_dir = str(self._plot_vars["m9_parent"].get()).strip() or "."
-				pattern = str(self._plot_vars["m9_pattern"].get()).strip() or "output_quench*"
-				x_axis = str(self._plot_vars["m9_xaxis"].get()).strip() or "t_ramp"
-				measure = str(self._plot_vars["m9_measure"].get()).strip() or "final"
-				allow_log_only = str(self._plot_vars["m9_allow_log"].get()).strip().lower() == "true"
-				sthr = float(str(self._plot_vars["m9_sthr"].get()).strip() or "0.1")
-				z_s = str(self._plot_vars["m9_z"].get()).strip()
-				z_slice = int(float(z_s)) if z_s else None
-				z_avg = int(float(str(self._plot_vars["m9_zavg"].get()).strip() or "1"))
-				z_marg = float(str(self._plot_vars["m9_zmarg"].get()).strip() or "0.0")
-				Tc = float(str(self._plot_vars["m9_tc"].get()).strip() or "310.2")
-				after_Tc_s = float(str(self._plot_vars["m9_after_tc"].get()).strip() or "0.0")
-				after_Tlow_s = float(str(self._plot_vars["m9_after_tlow"].get()).strip() or "0.0")
-				fx1 = str(self._plot_vars["m9_fxmin"].get()).strip()
-				fx2 = str(self._plot_vars["m9_fxmax"].get()).strip()
-				fit_x_min = float(fx1) if fx1 else None
-				fit_x_max = float(fx2) if fx2 else None
-				res = v.aggregate_kz_scaling(
-					parent_dir,
-					pattern=pattern,
-					out_dir=out_dir,
-					z_slice=z_slice,
-					z_avg=z_avg,
-					z_margin_frac=z_marg,
-					S_threshold=sthr,
-					prefer_log_defects=allow_log_only,
-					prefer_log_xi_proxy=allow_log_only,
-					allow_log_only=allow_log_only,
-					x_axis=x_axis,
-					fit_x_min=fit_x_min,
-					fit_x_max=fit_x_max,
-					measure=measure,
-					after_Tlow_s=after_Tlow_s,
-					Tc=Tc,
-					after_Tc_s=after_Tc_s,
-					show=False,
-					close=False,
-					return_figs=True,
-				)
-				rows = res[0]
-				out_png = res[1]
-				figs = res[3] if len(res) >= 4 else {}
-				fig = figs.get("kz_scaling") if isinstance(figs, dict) else None
-				if fig is not None:
-					self._display_figure(fig)
-				self._plot_status.set(f"Saved KZ scaling -> {out_png} (runs={len(rows)})")
-
-			elif m == "10":
-				parent_dir = str(self._plot_vars["m10_parent"].get()).strip() or "."
-				pattern = str(self._plot_vars["m10_pattern"].get()).strip() or "output_quench*"
-				x_axis = str(self._plot_vars["m10_xaxis"].get()).strip() or "t_ramp"
-				Tc = float(str(self._plot_vars["m10_tc"].get()).strip() or "310.2")
-				snapfreq = int(float(str(self._plot_vars["m10_snapfreq"].get()).strip() or "10000"))
-				off_s = str(self._plot_vars["m10_offsets"].get()).strip()
-				offsets = None
-				if off_s:
-					offsets = [int(s.strip()) for s in off_s.split(",") if s.strip()]
-				sthr = float(str(self._plot_vars["m10_sthr"].get()).strip() or "0.02")
-				z_s = str(self._plot_vars["m10_z"].get()).strip()
-				z_slice = int(float(z_s)) if z_s else None
-				z_avg = int(float(str(self._plot_vars["m10_zavg"].get()).strip() or "11"))
-				z_marg = float(str(self._plot_vars["m10_zmarg"].get()).strip() or "0.2")
-				res = v.sweep_kz_slope_stability(
-					parent_dir,
-					pattern=pattern,
-					out_dir=out_dir,
-					x_axis=x_axis,
-					S_threshold=sthr,
-					z_slice=z_slice,
-					z_avg=z_avg,
-					z_margin_frac=z_marg,
-					Tc=Tc,
-					snapshotFreq_iters=snapfreq,
-					offsets_in_snaps=offsets,
-					show=False,
-					close=False,
-					return_fig=True,
-				)
-				slopes = res[0]
-				out_png = res[1]
-				fig = res[3] if len(res) >= 4 else None
-				if fig is None:
-					raise RuntimeError("sweep_kz_slope_stability did not return a Figure (return_fig=True)")
-				self._display_figure(fig)
-				self._plot_status.set(f"Saved slope stability -> {out_png} (n={len(slopes)})")
-
-			elif m == "11":
-				field_fp = self._pick_field_file(src)
-				sxi = float(str(self._plot_vars["m11_sxi"].get()).strip() or "0.1")
-				sdrop = float(str(self._plot_vars["m11_sdrop"].get()).strip() or "0.1")
-				score = float(str(self._plot_vars["m11_score"].get()).strip() or "0.05")
-				dilate = int(float(str(self._plot_vars["m11_dilate"].get()).strip() or "2"))
-				mincore = int(float(str(self._plot_vars["m11_mincore"].get()).strip() or "30"))
-				use_skel = str(self._plot_vars["m11_skeleton"].get()).strip().lower() == "true"
-				xi3, _corr, _rs, dims = v.correlation_length_3d_from_field_file(field_fp, S_threshold=sxi)
-				defect = v.defect_line_metrics_3d_from_field_file(
-					field_fp,
-					S_droplet=sdrop,
-					S_core=score,
-					dilate_iters=dilate,
-					min_core_voxels=mincore,
-					use_skeleton=use_skel,
-					return_masks=True,
-				)
-				Nx, Ny, Nz = int(defect.get("Nx", dims[0])), int(defect.get("Ny", dims[1])), int(defect.get("Nz", dims[2]))
-				S, _nx, _ny, _nz = v.load_nematic_field_volume(field_fp, Nx, Ny, Nz)
-				z = Nz // 2
-				core = defect.get("core_mask")
-				skel = defect.get("skeleton_mask")
-				fig, axes = plt.subplots(1, 3, figsize=(12, 4))
-				axes[0].imshow(np.asarray(S)[:, :, z].T, origin="lower", cmap="viridis")
-				axes[0].set_title(f"S (z={z})")
-				axes[0].set_axis_off()
-				axes[1].imshow(np.asarray(core)[:, :, z].T if core is not None else np.zeros((Ny, Nx)), origin="lower", cmap="gray")
-				axes[1].set_title("core mask")
-				axes[1].set_axis_off()
-				axes[2].imshow(np.asarray(skel)[:, :, z].T if skel is not None else np.zeros((Ny, Nx)), origin="lower", cmap="gray")
-				axes[2].set_title("skeleton")
-				axes[2].set_axis_off()
-				fig.suptitle(
-					f"xi_3D={xi3:.3g} | line_density={defect.get('line_density_per_system_voxel', float('nan')):.3g} | "
-					f"core_density={defect.get('core_density_per_system_voxel', float('nan')):.3g}"
-				)
-				fig.tight_layout(rect=(0, 0, 1, 0.92))
-				self._display_figure(fig)
-				self._plot_status.set("Computed 3D snapshot metrics (SciPy + scikit-image required)")
-
-			elif m == "12":
-				parent_dir = str(self._plot_vars["m12_parent"].get()).strip() or "."
-				pattern = str(self._plot_vars["m12_pattern"].get()).strip() or "output_quench*"
-				x_axis = str(self._plot_vars["m12_xaxis"].get()).strip() or "t_ramp"
-				measure = str(self._plot_vars["m12_measure"].get()).strip() or "after_Tc"
-				Tc = float(str(self._plot_vars["m12_tc"].get()).strip() or "310.2")
-				after_Tc_s = float(str(self._plot_vars["m12_after_tc"].get()).strip() or "0.0")
-				sxi = float(str(self._plot_vars["m12_sxi"].get()).strip() or "0.1")
-				sdrop = float(str(self._plot_vars["m12_sdrop"].get()).strip() or "0.1")
-				score = float(str(self._plot_vars["m12_score"].get()).strip() or "0.05")
-				dilate = int(float(str(self._plot_vars["m12_dilate"].get()).strip() or "2"))
-				mincore = int(float(str(self._plot_vars["m12_mincore"].get()).strip() or "30"))
-				proxy = str(self._plot_vars["m12_proxy"].get()).strip() or "skeleton"
-				maxruns_s = str(self._plot_vars["m12_maxruns"].get()).strip()
-				max_runs = int(float(maxruns_s)) if maxruns_s else None
-				res = v.aggregate_kz_scaling_3d(
-					parent_dir,
-					pattern=pattern,
-					out_dir=out_dir,
-					x_axis=x_axis,
-					measure=measure,
-					Tc=Tc,
-					after_Tc_s=after_Tc_s,
-					S_threshold_xi=sxi,
-					S_droplet=sdrop,
-					S_core=score,
-					dilate_iters=dilate,
-					min_core_voxels=mincore,
-					defect_proxy=proxy,
-					max_runs=max_runs,
-					show=False,
-					close=False,
-					return_fig=True,
-				)
-				rows = res[0]
-				out_png = res[1]
-				fig = res[3] if len(res) >= 4 else None
-				if fig is None:
-					raise RuntimeError("aggregate_kz_scaling_3d did not return a Figure (return_fig=True)")
-				self._display_figure(fig)
-				self._plot_status.set(f"Saved 3D KZ scaling -> {out_png} (runs={len(rows)})")
-
-			elif m == "5":
-				p = Path(src)
-				if p.is_file():
-					raise ValueError("Mode 5 expects a directory (repo root or output_temp_sweep folder)")
-				data_root = p
-				if not any(data_root.glob("T_*/")):
-					cand = data_root / "output_temp_sweep"
-					if cand.is_dir() and any(cand.glob("T_*/")):
-						data_root = cand
-				out_kind = str(self._plot_vars["m5_output"].get()).strip().lower() or "gif"
-				choice = "g" if out_kind == "gif" else "f"
-				color_field = str(self._plot_vars["m5_color"].get()).strip() or "S"
-				duration = float(str(self._plot_vars["m5_duration"].get()).strip() or "0.5")
-				selected = str(self._plot_vars["m5_selected"].get()).strip() or "all"
-				gif_path = v.animate_tempSweep(
-					data_root=str(data_root),
-					color_field=color_field,
-					choice=choice,
-					selected=selected,
-					out_dir=out_dir,
-					duration=duration,
-					return_gif_path=True,
-				)
-				if choice == "g":
-					if not gif_path:
-						raise RuntimeError("animate_tempSweep did not produce a GIF")
+				elif m in ("1", "7"):
+					data_dir = src
+					if not Path(data_dir).is_dir():
+						raise ValueError("Mode 1/7 expects a directory containing nematic_field_iter_*.dat")
+					import glob
+					snaps = glob.glob(str(Path(data_dir) / "nematic_field_iter_*.dat"))
+					if not snaps:
+						raise FileNotFoundError("No nematic_field_iter_*.dat files found")
+					Nx, Ny, Nz = v.infer_grid_dims_from_nematic_field_file(snaps[0])
+					out_name = "nematic_field_evolution.gif" if m == "1" else "quench_evolution.gif"
+					out_gif = str(Path(out_dir) / out_name)
+					prefix = "m1" if m == "1" else "m7"
+					axis = str(self._plot_vars[f"{prefix}_axis"].get()).strip() or "z"
+					sl_s = str(self._plot_vars[f"{prefix}_slice"].get()).strip()
+					slice_idx = int(float(sl_s)) if sl_s else None
+					duration = float(str(self._plot_vars[f"{prefix}_duration"].get()).strip() or "0.1")
+					stride = int(float(str(self._plot_vars[f"{prefix}_stride"].get()).strip() or "1"))
+					outc_var = self._plot_vars.get(f"{prefix}_output_c")
+					outc_s = str(outc_var.get()).strip() if outc_var is not None else ""
+					output_c = int(float(outc_s)) if outc_s else None
+					color_field = str(self._plot_vars[f"{prefix}_color"].get()).strip() or "S"
+					interpol = str(self._plot_vars[f"{prefix}_interp"].get()).strip() or "nearest"
+					arrows = int(float(str(self._plot_vars[f"{prefix}_arrows"].get()).strip() or "20"))
+					zoom_s = str(self._plot_vars[f"{prefix}_zoom"].get()).strip()
+					zoom = int(float(zoom_s)) if zoom_s else None
+					frames_dir = str(Path(out_dir) / ("frames_m1" if m == "1" else "frames_m7"))
+					v.create_nematic_field_animation(
+						data_dir=data_dir,
+						output_gif=out_gif,
+						Nx=Nx,
+						Ny=Ny,
+						Nz=Nz,
+						slice_axis=axis,
+						slice_index=slice_idx,
+						frames_dir=frames_dir,
+						duration=duration,
+						frame_stride=stride,
+						color_field=color_field,
+						interpol=interpol,
+						zoom_radius=zoom,
+						arrows_per_axis=arrows,
+						output_c=output_c,
+					)
 					try:
 						import imageio.v2 as imageio
 					except Exception:
 						import imageio
 						imageio = imageio  # type: ignore
-					frame0 = imageio.imread(gif_path)
+					frame0 = imageio.imread(out_gif)
 					fig, ax = plt.subplots(1, 1, figsize=(8, 6))
 					ax.imshow(frame0)
 					ax.set_axis_off()
-					ax.set_title(Path(gif_path).name)
+					ax.set_title(Path(out_gif).name)
 					fig.tight_layout()
 					self._display_figure(fig)
-					self._plot_status.set(f"Saved temp sweep GIF -> {gif_path} (duration={duration:g}s)")
+					self._plot_status.set(f"Saved GIF -> {out_gif} (stride={stride}, duration={duration:g}s)")
+
+				elif m == "2":
+					fig = v.plot_energy_VS_iter(src, out_dir=out_dir, show=False, close=False, return_fig=True)
+					self._display_figure(fig)
+					self._plot_status.set("Saved and rendered free energy vs iteration")
+
+				elif m == "3":
+					fig = v.energy_components(src, out_dir=out_dir, show=False, close=False, return_fig=True)
+					self._display_figure(fig)
+					self._plot_status.set("Saved and rendered energy components vs iteration")
+
+				elif m == "4":
+					which = str(self._plot_vars["m4_which"].get())
+					figs = v.plotS_F(src, out_dir=out_dir, show=False, close=False, which=which, return_figs=True)
+					if isinstance(figs, dict) and figs:
+						fig = figs.get("S") or figs.get("F")
+						if fig is None:
+							raise RuntimeError("plotS_F returned no figures")
+						self._display_figure(fig)
+					self._plot_status.set("Saved and rendered sweep summary")
+
+				elif m == "5":
+					p = Path(src)
+					if p.is_file():
+						raise ValueError("Mode 5 expects a directory (repo root or output_temp_sweep folder)")
+					data_root = p
+					if not any(data_root.glob("T_*/")):
+						cand = data_root / "output_temp_sweep"
+						if cand.is_dir() and any(cand.glob("T_*/")):
+							data_root = cand
+					out_kind = str(self._plot_vars["m5_output"].get()).strip().lower() or "gif"
+					choice = "g" if out_kind == "gif" else "f"
+					color_field = str(self._plot_vars["m5_color"].get()).strip() or "S"
+					duration = float(str(self._plot_vars["m5_duration"].get()).strip() or "0.5")
+					selected = str(self._plot_vars["m5_selected"].get()).strip() or "all"
+					outc_var = self._plot_vars.get("m5_output_c")
+					outc_s = str(outc_var.get()).strip() if outc_var is not None else ""
+					output_c = int(float(outc_s)) if outc_s else None
+					gif_path = v.animate_tempSweep(
+						data_root=str(data_root),
+						color_field=color_field,
+						choice=choice,
+						selected=selected,
+						out_dir=out_dir,
+						duration=duration,
+						output_c=output_c,
+						return_gif_path=True,
+					)
+					if choice == "g":
+						if not gif_path:
+							raise RuntimeError("animate_tempSweep did not produce a GIF")
+						try:
+							import imageio.v2 as imageio
+						except Exception:
+							import imageio
+							imageio = imageio  # type: ignore
+						frame0 = imageio.imread(gif_path)
+						fig, ax = plt.subplots(1, 1, figsize=(8, 6))
+						ax.imshow(frame0)
+						ax.set_axis_off()
+						ax.set_title(Path(gif_path).name)
+						fig.tight_layout()
+						self._display_figure(fig)
+						self._plot_status.set(f"Saved temp sweep GIF -> {gif_path} (duration={duration:g}s)")
+					else:
+						self._plot_status.set(f"Saved selected temp sweep frames to {out_dir}")
+
+				elif m == "6":
+					kind = str(self._plot_vars["m6_kind"].get()).strip().lower() or "s"
+					it_min_s = str(self._plot_vars["m6_it_min"].get()).strip()
+					it_max_s = str(self._plot_vars["m6_it_max"].get()).strip()
+					it_min = int(float(it_min_s)) if it_min_s else None
+					it_max = int(float(it_max_s)) if it_max_s else None
+					saved: list[str] = []
+					if kind in ("s", "a"):
+						fig, _axes = v.plot_quench_log(
+							src,
+							out_dir=out_dir,
+							show=False,
+							close=False,
+							it_min=it_min,
+							it_max=it_max,
+						)
+						self._display_figure(fig)
+						saved.append("quench_summary*.png")
+					if kind in ("2", "a"):
+						out_path = v.plot_quench_energy_vs_iteration(
+							src,
+							out_dir=out_dir,
+							show=False,
+							it_min=it_min,
+							it_max=it_max,
+						)
+						saved.append(str(out_path))
+					if kind in ("4", "a"):
+						out_path = v.plot_quench_order_vs_iteration(
+							src,
+							out_dir=out_dir,
+							show=False,
+							it_min=it_min,
+							it_max=it_max,
+						)
+						saved.append(str(out_path))
+					if kind in ("d", "a"):
+						out_path = v.plot_quench_energy_deltas(
+							src,
+							out_dir=out_dir,
+							show=False,
+							it_min=it_min,
+							it_max=it_max,
+						)
+						saved.append(str(out_path))
+
+					if saved:
+						self._plot_status.set(f"Saved quench plot(s) -> {out_dir} ({kind})")
+						self._append_log(f"[GUI][Plot][Mode 6] Saved: {', '.join(saved)}\n")
+					else:
+						self._plot_status.set("Mode 6: nothing selected to plot")
+
+				elif m == "8":
+					z_s = str(self._plot_vars["m8_z"].get()).strip()
+					z = int(float(z_s)) if z_s else None
+					stride = int(float(str(self._plot_vars["m8_stride"].get()).strip() or "10"))
+					max_s = str(self._plot_vars["m8_max"].get()).strip()
+					max_frames = int(float(max_s)) if max_s else None
+					sthr = float(str(self._plot_vars["m8_sthr"].get()).strip() or "0.1")
+					res = v.plot_quench_kz_metrics(
+						src,
+						out_dir=out_dir,
+						z_slice=z,
+						frame_stride=stride,
+						max_frames=max_frames,
+						S_threshold=sthr,
+						show=False,
+						close=False,
+						return_figs=True,
+					)
+					rows = res[0]
+					out_png = res[1]
+					figs = res[3] if len(res) >= 4 else {}
+					fig = figs.get("metrics") if isinstance(figs, dict) else None
+					if fig is not None:
+						self._display_figure(fig)
+					self._plot_status.set(f"Saved KZ metrics -> {out_png} (rows={len(rows)})")
+
+				elif m == "9":
+					parent_dir = str(self._plot_vars["m9_parent"].get()).strip() or "."
+					pattern = str(self._plot_vars["m9_pattern"].get()).strip() or "output_quench*"
+					x_axis = str(self._plot_vars["m9_xaxis"].get()).strip() or "t_ramp"
+					measure = str(self._plot_vars["m9_measure"].get()).strip() or "final"
+					allow_log_only = str(self._plot_vars["m9_allow_log"].get()).strip().lower() == "true"
+					sthr = float(str(self._plot_vars["m9_sthr"].get()).strip() or "0.1")
+					z_s = str(self._plot_vars["m9_z"].get()).strip()
+					z_slice = int(float(z_s)) if z_s else None
+					z_avg = int(float(str(self._plot_vars["m9_zavg"].get()).strip() or "1"))
+					z_marg = float(str(self._plot_vars["m9_zmarg"].get()).strip() or "0.0")
+					Tc = float(str(self._plot_vars["m9_tc"].get()).strip() or "310.2")
+					after_Tc_s = float(str(self._plot_vars["m9_after_tc"].get()).strip() or "0.0")
+					after_Tlow_s = float(str(self._plot_vars["m9_after_tlow"].get()).strip() or "0.0")
+					fx1 = str(self._plot_vars["m9_fxmin"].get()).strip()
+					fx2 = str(self._plot_vars["m9_fxmax"].get()).strip()
+					fit_x_min = float(fx1) if fx1 else None
+					fit_x_max = float(fx2) if fx2 else None
+					res = v.aggregate_kz_scaling(
+						parent_dir,
+						pattern=pattern,
+						out_dir=out_dir,
+						z_slice=z_slice,
+						z_avg=z_avg,
+						z_margin_frac=z_marg,
+						S_threshold=sthr,
+						prefer_log_defects=allow_log_only,
+						prefer_log_xi_proxy=allow_log_only,
+						allow_log_only=allow_log_only,
+						x_axis=x_axis,
+						fit_x_min=fit_x_min,
+						fit_x_max=fit_x_max,
+						measure=measure,
+						after_Tlow_s=after_Tlow_s,
+						Tc=Tc,
+						after_Tc_s=after_Tc_s,
+						show=False,
+						close=False,
+						return_figs=True,
+					)
+					rows = res[0]
+					out_png = res[1]
+					figs = res[3] if len(res) >= 4 else {}
+					fig = figs.get("kz_scaling") if isinstance(figs, dict) else None
+					if fig is not None:
+						self._display_figure(fig)
+					self._plot_status.set(f"Saved KZ scaling -> {out_png} (runs={len(rows)})")
+
+				elif m == "10":
+					parent_dir = str(self._plot_vars["m10_parent"].get()).strip() or "."
+					pattern = str(self._plot_vars["m10_pattern"].get()).strip() or "output_quench*"
+					x_axis = str(self._plot_vars["m10_xaxis"].get()).strip() or "t_ramp"
+					Tc = float(str(self._plot_vars["m10_tc"].get()).strip() or "310.2")
+					snapfreq = int(float(str(self._plot_vars["m10_snapfreq"].get()).strip() or "10000"))
+					off_s = str(self._plot_vars["m10_offsets"].get()).strip()
+					offsets = None
+					if off_s:
+						offsets = [int(s.strip()) for s in off_s.split(",") if s.strip()]
+					sthr = float(str(self._plot_vars["m10_sthr"].get()).strip() or "0.02")
+					z_s = str(self._plot_vars["m10_z"].get()).strip()
+					z_slice = int(float(z_s)) if z_s else None
+					z_avg = int(float(str(self._plot_vars["m10_zavg"].get()).strip() or "11"))
+					z_marg = float(str(self._plot_vars["m10_zmarg"].get()).strip() or "0.2")
+					res = v.sweep_kz_slope_stability(
+						parent_dir,
+						pattern=pattern,
+						out_dir=out_dir,
+						x_axis=x_axis,
+						S_threshold=sthr,
+						z_slice=z_slice,
+						z_avg=z_avg,
+						z_margin_frac=z_marg,
+						Tc=Tc,
+						snapshotFreq_iters=snapfreq,
+						offsets_in_snaps=offsets,
+						show=False,
+						close=False,
+						return_fig=True,
+					)
+					slopes = res[0]
+					out_png = res[1]
+					fig = res[3] if len(res) >= 4 else None
+					if fig is None:
+						raise RuntimeError("sweep_kz_slope_stability did not return a Figure (return_fig=True)")
+					self._display_figure(fig)
+					self._plot_status.set(f"Saved slope stability -> {out_png} (n={len(slopes)})")
+
+				elif m == "11":
+					field_fp = self._pick_field_file(src)
+					sxi = float(str(self._plot_vars["m11_sxi"].get()).strip() or "0.1")
+					sdrop = float(str(self._plot_vars["m11_sdrop"].get()).strip() or "0.1")
+					score = float(str(self._plot_vars["m11_score"].get()).strip() or "0.05")
+					dilate = int(float(str(self._plot_vars["m11_dilate"].get()).strip() or "2"))
+					mincore = int(float(str(self._plot_vars["m11_mincore"].get()).strip() or "30"))
+					use_skel = str(self._plot_vars["m11_skeleton"].get()).strip().lower() == "true"
+					xi3, _corr, _rs, dims = v.correlation_length_3d_from_field_file(field_fp, S_threshold=sxi)
+					defect = v.defect_line_metrics_3d_from_field_file(
+						field_fp,
+						S_droplet=sdrop,
+						S_core=score,
+						dilate_iters=dilate,
+						min_core_voxels=mincore,
+						use_skeleton=use_skel,
+						return_masks=True,
+					)
+					Nx, Ny, Nz = int(defect.get("Nx", dims[0])), int(defect.get("Ny", dims[1])), int(defect.get("Nz", dims[2]))
+					S, _nx, _ny, _nz = v.load_nematic_field_volume(field_fp, Nx, Ny, Nz)
+					z = Nz // 2
+					core = defect.get("core_mask")
+					skel = defect.get("skeleton_mask")
+					fig, axes = plt.subplots(1, 3, figsize=(12, 4))
+					axes[0].imshow(np.asarray(S)[:, :, z].T, origin="lower", cmap="viridis")
+					axes[0].set_title(f"S (z={z})")
+					axes[0].set_axis_off()
+					axes[1].imshow(np.asarray(core)[:, :, z].T if core is not None else np.zeros((Ny, Nx)), origin="lower", cmap="gray")
+					axes[1].set_title("core mask")
+					axes[1].set_axis_off()
+					axes[2].imshow(np.asarray(skel)[:, :, z].T if skel is not None else np.zeros((Ny, Nx)), origin="lower", cmap="gray")
+					axes[2].set_title("skeleton")
+					axes[2].set_axis_off()
+					fig.suptitle(
+						f"xi_3D={xi3:.3g} | line_density={defect.get('line_density_per_system_voxel', float('nan')):.3g} | "
+						f"core_density={defect.get('core_density_per_system_voxel', float('nan')):.3g}"
+					)
+					fig.tight_layout(rect=(0, 0, 1, 0.92))
+					self._display_figure(fig)
+					self._plot_status.set("Computed 3D snapshot metrics (SciPy + scikit-image required)")
+
+				elif m == "12":
+					parent_dir = str(self._plot_vars["m12_parent"].get()).strip() or "."
+					pattern = str(self._plot_vars["m12_pattern"].get()).strip() or "output_quench*"
+					x_axis = str(self._plot_vars["m12_xaxis"].get()).strip() or "t_ramp"
+					measure = str(self._plot_vars["m12_measure"].get()).strip() or "after_Tc"
+					Tc = float(str(self._plot_vars["m12_tc"].get()).strip() or "310.2")
+					after_Tc_s = float(str(self._plot_vars["m12_after_tc"].get()).strip() or "0.0")
+					sxi = float(str(self._plot_vars["m12_sxi"].get()).strip() or "0.1")
+					sdrop = float(str(self._plot_vars["m12_sdrop"].get()).strip() or "0.1")
+					score = float(str(self._plot_vars["m12_score"].get()).strip() or "0.05")
+					dilate = int(float(str(self._plot_vars["m12_dilate"].get()).strip() or "2"))
+					mincore = int(float(str(self._plot_vars["m12_mincore"].get()).strip() or "30"))
+					proxy = str(self._plot_vars["m12_proxy"].get()).strip() or "skeleton"
+					maxruns_s = str(self._plot_vars["m12_maxruns"].get()).strip()
+					max_runs = int(float(maxruns_s)) if maxruns_s else None
+					res = v.aggregate_kz_scaling_3d(
+						parent_dir,
+						pattern=pattern,
+						out_dir=out_dir,
+						x_axis=x_axis,
+						measure=measure,
+						Tc=Tc,
+						after_Tc_s=after_Tc_s,
+						S_threshold_xi=sxi,
+						S_droplet=sdrop,
+						S_core=score,
+						dilate_iters=dilate,
+						min_core_voxels=mincore,
+						defect_proxy=proxy,
+						max_runs=max_runs,
+						show=False,
+						close=False,
+						return_fig=True,
+					)
+					rows = res[0]
+					out_png = res[1]
+					fig = res[3] if len(res) >= 4 else None
+					if fig is None:
+						raise RuntimeError("aggregate_kz_scaling_3d did not return a Figure (return_fig=True)")
+					self._display_figure(fig)
+					self._plot_status.set(f"Saved 3D KZ scaling -> {out_png} (runs={len(rows)})")
+
 				else:
-					self._plot_status.set(f"Saved selected temp sweep frames to {out_dir}")
-			else:
-				self._plot_status.set("Mode not implemented in GUI yet.")
-		except Exception as e:
-			self._plot_status.set(f"Plot failed: {e}")
-			self._append_log(f"[GUI][Plot] Error: {e}\n")
+					self._plot_status.set("Mode not implemented in GUI yet.")
+			except Exception as e:
+				self._plot_status.set(f"Plot failed: {e}")
+				self._append_log(f"[GUI][Plot] Error: {e}\n")
 
 	def _collect_config_items(self) -> dict[str, str]:
 		items: dict[str, str] = {}

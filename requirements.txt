@@ -4,3 +4,12 @@ matplotlib
 imageio
 imageio-ffmpeg
 pillow
+scipy
+
+#----------------------------------COMMENTS-------------------------------------------#
+# requires python3-tk for GUI elements:
+#      LINUX -> install via sudo apt-get update && sudo apt-get install python3-tk
+#      WINDOWS -> Should come pre-installed with standard python installation
+
+#nvidia toolkit is required for CUDA support, please install from:
+#      https://developer.nvidia.com/cuda-toolkit
