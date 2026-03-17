@@ -43,7 +43,7 @@ Run:
 #### 2. GPU (CUDA) Version
 Compiling with `nvcc`:
 ```bash
-# Adjust -arch=sm_XX to match your GPU's compute capability (e.g., sm_75 for Turing)
+# Adjust -arch=sm_XX to match your GPU's compute capability (e.g., sm_75 for Turing, sm_86 for Ampere)
 nvcc -O3 -arch=sm_75 -std=c++17 -o QSR_cuda QSR.cu
 ```
 Run:
