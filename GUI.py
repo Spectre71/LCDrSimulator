@@ -130,6 +130,9 @@ class QSRGui(tk.Tk):
 
 		self.backend_path = tk.StringVar(value=str(_default_backend_path()))
 		self.last_out_dir: Path | None = None
+		self.last_run_sim_mode: str | None = None
+		self.last_run_submode: str | None = None
+		self._last_run_items: dict[str, str] | None = None
 		self._proc: subprocess.Popen[str] | None = None
 		self._reader_thread: threading.Thread | None = None
 		self._log_queue: queue.Queue[str] = queue.Queue()
@@ -217,6 +220,17 @@ class QSRGui(tk.Tk):
 					),
 				),
 				FieldSpec(
+					"random_seed",
+					"Random seed",
+					"(default: -1=random_device)",
+					"int",
+					help_text=_join_lines(
+						"Controls stochastic initialization reproducibility for init_mode=0 and init_mode=2.",
+						"Set a fixed integer seed when you want mesh checks, protocol comparisons, or regression runs to be repeatable.",
+						"Use -1 (or leave blank) to let the backend draw a fresh random seed from random_device.",
+					),
+				),
+				FieldSpec(
 					"submode",
 					"Single-T submode",
 					"(default: 1)",
@@ -224,8 +238,8 @@ class QSRGui(tk.Tk):
 					choices=["default", "1", "2"],
 					help_text=_join_lines(
 						"Applies only when sim_mode=1 (Single T).",
-						"- 1: logs total free energy + radiality.",
-						"- 2: logs bulk/elastic/anchoring components separately.",
+						"- 1: writes free_energy_vs_iteration.dat with the full current regression schema (bulk, elastic, anchoring, total, radiality, time, avg_S, max_S, defect proxy, xi proxy).",
+						"- 2: writes energy_components_vs_iteration.dat with the same observable set.",
 						"Use submode=2 when you are tuning elastic constants or anchoring: it makes it much easier to see which term is dominating the dynamics.",
 						"Numerics note: splitting energy terms is diagnostic only; it does not change the evolution equation.",
 					),
@@ -341,15 +355,14 @@ class QSRGui(tk.Tk):
 					),
 				),
 				FieldSpec(
-					"RbEps",
-					"Radiality eps (RbEps)",
-					"1e-2",
+					"defect_density_abs_eps",
+					"Defect-density eps",
+					"1e-4",
 					"float",
 					help_text=_join_lines(
-						"Relative convergence threshold for the radiality metric between samples.",
-						"Used by the early-stop logic in quench and by convergence checks in some single-temp outputs.",
-						"Radiality is a geometry-specific order metric for the droplet texture; it is useful when the expected ground state is the radial hedgehog.",
-						"If you are studying non-radial textures (e.g., escaped or bipolar states), avoid using radiality-based stopping as your primary convergence signal.",
+						"Absolute convergence threshold for the 2D defect-density proxy between successive logged samples.",
+						"The rewritten solver now uses energy + defect-proxy stability for quench and single-temperature stopping; radiality remains diagnostic only.",
+						"Smaller values make stopping stricter, but if the chosen slice contains too few ordered plaquettes the proxy stays unavailable and stopping remains disabled instead of faking convergence.",
 					),
 				),
 			],
@@ -435,9 +448,33 @@ class QSRGui(tk.Tk):
 						"Initial scalar order magnitude used in init_mode=0/1 (random/radial).",
 						"If not set, backend uses S_eq(T) when nematic is stable, otherwise a heuristic value.",
 						"For init_mode=2, S0 is ignored (use noise_amplitude instead).",
-						"Physics: S0 only affects the transient; the equilibrium S is set by the bulk coefficients and temperature.",
+						"Physics: S0 affects only the initial condition; shell anchoring order is now controlled separately via boundary_order_mode / boundary_S.",
 						"Numerics: extremely large S0 can make the first few steps stiff (bulk term large), which can amplify instability if dt is aggressive.",
 						"Tip: for reproducible KZ runs, prefer init_mode=2; for equilibrium radial runs, keep init_mode=1 and omit S0 so it is consistent with S_eq(T).",
+					),
+				),
+				FieldSpec(
+					"boundary_order_mode",
+					"Boundary order mode",
+					"(default: equilibrium)",
+					"choice",
+					choices=["default", "equilibrium", "custom"],
+					help_text=_join_lines(
+						"Controls how the shell order parameter S_shell is chosen for strong and weak anchoring.",
+						"- equilibrium: use max(S_eq(T), 0) at the current temperature.",
+						"- custom: use the explicit boundary_S value instead of reusing S0.",
+						"Use custom only when you intentionally want nonequilibrium shell order; otherwise equilibrium keeps the boundary condition consistent with the chosen bulk convention.",
+					),
+				),
+				FieldSpec(
+					"boundary_S",
+					"Boundary S_shell",
+					"(used when mode=custom)",
+					"float",
+					help_text=_join_lines(
+						"Explicit shell order used only when boundary_order_mode=custom.",
+						"This decouples the imposed shell order from the initialization amplitude S0.",
+						"If boundary_order_mode=equilibrium, omit this and let the backend compute S_shell(T) automatically.",
 					),
 				),
 				FieldSpec(
@@ -923,10 +960,10 @@ class QSRGui(tk.Tk):
 					"tri_bool",
 					help_text=_join_lines(
 						"Correlation-length resolution guard.",
-						"The backend estimates xi and aborts if xi is too small compared to dx (under-resolved core/interface).",
+						"The backend now estimates xi using the anisotropic elastic band and checks it against the coarsest physical spacing, not just dx.",
 						"Disable only for quick smoke tests; for production/KZ runs, keep enabled to avoid meaningless results.",
-						"Why it matters: if the nematic correlation length (or defect core size) is smaller than a couple of grid spacings, defects become ‘numerical’ and their density is not physically interpretable.",
-						"If the guard triggers, you can (a) increase dx (coarser physical resolution), (b) move closer to Tc (larger xi), or (c) change elastic/bulk parameters that set xi.",
+						"Why it matters: if the nematic correlation length (or defect core size) is smaller than a couple of grid spacings on the worst axis, defects become mesh-dependent and their density is not physically interpretable.",
+						"If the guard triggers, reduce the coarsest spacing, enlarge the smallest droplet semi-axis, or move closer to Tc to increase xi.",
 					),
 				),
 				FieldSpec(
@@ -936,21 +973,8 @@ class QSRGui(tk.Tk):
 					"tri_bool",
 					help_text=_join_lines(
 						"Runtime guard that monitors for numerical blow-up / aliasing.",
-						"It checks max_S and a checkerboard (Nyquist) metric and can abort or reduce dt.",
-						"Use this when exploring small dx or strong anisotropic elasticity (L2/L3) where explicit stiffness can excite odd-even modes.",
-					),
-				),
-				FieldSpec(
-					"enable_adaptive_dt",
-					"Adaptive dt",
-					"(default: true)",
-					"tri_bool",
-					help_text=_join_lines(
-						"Only relevant if enable_instability_guard=true.",
-						"If enabled, the guard reduces dt when it detects instability (no rollback).",
-						"If disabled, the guard aborts to avoid writing a corrupted final state.",
-						"Use adaptive dt when you are exploring parameter space and prefer ‘finish safely’ over strict reproducibility.",
-						"For production measurements, fixed dt is usually cleaner: if dt changes mid-run, you should interpret iteration counts in physical time carefully.",
+						"For quench/Kibble-Zurek runs the solver keeps dt fixed and aborts if the guard trips; it no longer rescales dt mid-protocol.",
+						"Use this when exploring small spacing or strong anisotropic elasticity (L2/L3) where explicit high-k modes can excite odd-even artifacts.",
 					),
 				),
 				FieldSpec(
@@ -973,7 +997,7 @@ class QSRGui(tk.Tk):
 					help_text=_join_lines(
 						"Guard threshold for the odd-even / Nyquist checkerboard metric (relative amplitude).",
 						"If this grows, you often see grid-aligned dot artifacts in S or director.",
-						"If you get false positives early in weak ordering, increase this threshold or disable adaptive dt.",
+						"If you get false positives early in weak ordering, increase this threshold slightly or log less aggressively until the droplet is meaningfully ordered.",
 					),
 				),
 				FieldSpec(
@@ -1006,7 +1030,8 @@ class QSRGui(tk.Tk):
 					"tri_bool",
 					help_text=_join_lines(
 						"Stops the simulation early once convergence is detected at the final temperature.",
-						"Criteria combine relative energy change (tolerance), relative radiality change (RbEps), and optionally an absolute radiality threshold.",
+						"The current solver uses relative energy change plus absolute stability of the 2D defect-density proxy.",
+						"Radiality is still logged and printed, but it no longer gates convergence by itself.",
 						"Useful to save time in long quenches once the texture is essentially settled.",
 					),
 				),
@@ -1017,10 +1042,9 @@ class QSRGui(tk.Tk):
 					"float",
 					help_text=_join_lines(
 						"Only used when enable_early_stop=true.",
-						"If >0, requires the radiality metric to exceed this value before early stop is allowed.",
-						"Set to 0 to disable the absolute threshold and rely only on relative convergence.",
-						"This is best used when you know the true equilibrium is the radial state and you want to stop once you are ‘close enough’.",
-						"If you are scanning parameters where the equilibrium might not be radial, keeping a high radiality_threshold can prevent early stop from ever triggering (which is usually safer).",
+						"This threshold is now diagnostic only: the solver reports whether radiality crossed it, but early stop is decided by energy + defect-proxy stability.",
+						"Set it if you still want the run log to tell you whether the texture is close to the radial state.",
+						"If you are scanning parameters where the equilibrium might not be radial, leave it at 0 or treat it as a readout rather than a stopping condition.",
 					),
 				),
 				FieldSpec(
@@ -2394,6 +2418,46 @@ class QSRGui(tk.Tk):
 			items["sim_mode"] = "3"
 		return items
 
+	def _resolve_run_output_dir(self, items: dict[str, str]) -> Path:
+		sim_mode = str(items.get("sim_mode", "3")).strip() or "3"
+		if sim_mode == "3":
+			out_dir = Path(items.get("out_dir", "output_quench")).expanduser()
+			if not out_dir.is_absolute():
+				out_dir = _repo_root() / out_dir
+			return out_dir
+		if sim_mode == "2":
+			return _repo_root() / "output_temp_sweep"
+		return _repo_root() / "output"
+
+	def _launch_config_path(self) -> Path:
+		return _repo_root() / ".gui_last_run.cfg"
+
+	def _persist_last_run_config(self) -> None:
+		if self.last_out_dir is None or self._last_run_items is None:
+			return
+		try:
+			self.last_out_dir.mkdir(parents=True, exist_ok=True)
+			cfg_copy = self.last_out_dir / "run_config.cfg"
+			_write_kv_config(cfg_copy, self._last_run_items)
+			self._append_log(f"[GUI] Saved run config copy: {cfg_copy}\n")
+		except Exception as e:
+			self._append_log(f"[GUI] Failed to save run config copy: {e}\n")
+
+	def _build_last_run_plot_command(self) -> list[str] | None:
+		if self.last_out_dir is None:
+			return None
+		py = sys.executable
+		target = repr(str(self.last_out_dir))
+		sim_mode = self.last_run_sim_mode or "3"
+		submode = self.last_run_submode or "1"
+		if sim_mode == "1":
+			if submode == "2":
+				return [py, "-c", f"import QSRvis as v; v.energy_components({target}, show=False)"]
+			return [py, "-c", f"import QSRvis as v; v.plot_energy_VS_iter({target}, show=False)"]
+		if sim_mode == "2":
+			return [py, "-c", f"import QSRvis as v; v.plotS_F({target}, show=False)"]
+		return [py, "-c", f"import QSRvis as v; v.plot_quench_log({target}, show=False)"]
+
 	@staticmethod
 	def _safe_float(items: dict[str, str], key: str) -> float | None:
 		try:
@@ -2636,19 +2700,26 @@ class QSRGui(tk.Tk):
 			return
 
 		items = self._collect_config_items()
-		out_dir = Path(items.get("out_dir", "output_quench")).expanduser()
-		if not out_dir.is_absolute():
-			out_dir = _repo_root() / out_dir
-		items["out_dir"] = str(out_dir)
+		sim_mode = str(items.get("sim_mode", "3")).strip() or "3"
+		submode = str(items.get("submode", "1")).strip() or "1"
+		out_dir = self._resolve_run_output_dir(items)
+		if sim_mode == "3":
+			items["out_dir"] = str(out_dir)
+		else:
+			items.pop("out_dir", None)
 
-		# write config inside output directory
+		# Write the launch config outside the solver-managed output directory so quench overwrite_out_dir
+		# cannot delete it before the backend has finished reading it.
 		out_dir.mkdir(parents=True, exist_ok=True)
-		cfg_path = out_dir / "run_config.cfg"
+		cfg_path = self._launch_config_path()
 		_write_kv_config(cfg_path, items)
 
 		self.last_out_dir = out_dir
+		self.last_run_sim_mode = sim_mode
+		self.last_run_submode = submode
+		self._last_run_items = dict(items)
 		self.log_text.delete("1.0", tk.END)
-		self._append_log(f"[GUI] Wrote config: {cfg_path}\n")
+		self._append_log(f"[GUI] Wrote launch config: {cfg_path}\n")
 		# Pre-run: report a best-effort KZ/Zurek time estimate if we can.
 		self._log_zurek_estimate_from_items(items, stage="pre-run")
 
@@ -2697,10 +2768,10 @@ class QSRGui(tk.Tk):
 		if not self.last_out_dir:
 			messagebox.showinfo("No output yet", "Run a simulation first.")
 			return
-		# Run QSRvis plotting for the chosen out_dir
-		py = sys.executable
-		out_dir = str(self.last_out_dir)
-		cmd = [py, "-c", f"import QSRvis as v; v.plot_quench_log(r'{out_dir}', show=False)"]
+		cmd = self._build_last_run_plot_command()
+		if cmd is None:
+			messagebox.showinfo("No output yet", "Run a simulation first.")
+			return
 		self._append_log(f"[GUI] Plotting: {' '.join(cmd)}\n")
 		try:
 			subprocess.Popen(cmd, cwd=str(_repo_root()))
@@ -2759,6 +2830,7 @@ class QSRGui(tk.Tk):
 					self.status.set("Idle")
 					# Post-run: estimate KZ/Zurek time from the actual temperature trace.
 					if self.last_out_dir:
+						self._persist_last_run_config()
 						self._log_zurek_estimate_post_run(self.last_out_dir)
 					self._proc = None
 					break

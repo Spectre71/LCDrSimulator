@@ -636,6 +636,28 @@ def _resolve_data_file(path_or_dir: str, filename: str) -> str:
     return path_or_dir
 
 
+def _load_named_csv_rows(path: str) -> tuple[np.ndarray, set[str]]:
+    data = np.genfromtxt(path, delimiter=',', names=True, dtype=float, encoding='utf-8')
+    if getattr(data, 'size', 0) == 0:
+        raise ValueError(f"CSV file is empty or unreadable: {path}")
+    rows = np.array(data, ndmin=1)
+    return rows, set(rows.dtype.names or ())
+
+
+def _series_from_candidates(
+    rows: np.ndarray,
+    field_names: set[str],
+    *candidates: str,
+    default: float | None = None,
+) -> np.ndarray:
+    for name in candidates:
+        if name in field_names:
+            return np.atleast_1d(rows[name]).astype(float)
+    if default is not None:
+        return np.full(np.atleast_1d(rows).shape[0], float(default), dtype=float)
+    raise ValueError(f"Missing required columns {candidates}; available columns are {sorted(field_names)}")
+
+
 def plot_energy_VS_iter(
     path: str = '.',
     out_dir: str = 'pics',
@@ -649,12 +671,39 @@ def plot_energy_VS_iter(
     Primary source: `free_energy_vs_iteration.dat`.
     Fallback (for quench runs): `quench_log.dat/.csv` where we use `total` as F.
 
+    Current single-temperature runs also use this file name, but now write the full
+    regression schema with `total,time` instead of the legacy `free_energy,time` pair.
+
     `path` may be a directory or a direct file path.
     """
     data_path = _resolve_data_file(path, 'free_energy_vs_iteration.dat')
+    components_path = _resolve_data_file(path, 'energy_components_vs_iteration.dat')
 
-    use_quench_log = not os.path.exists(data_path)
-    if use_quench_log:
+    if os.path.exists(data_path):
+        rows, field_names = _load_named_csv_rows(data_path)
+        it = _series_from_candidates(rows, field_names, 'iteration')
+        F = _series_from_candidates(rows, field_names, 'free_energy', 'total')
+        radial = _series_from_candidates(rows, field_names, 'radiality', default=np.nan)
+        time_s = _series_from_candidates(rows, field_names, 'time', 'time_s')
+        m = np.isfinite(it) & np.isfinite(F) & np.isfinite(time_s)
+        if not np.any(m):
+            raise ValueError(f"Iteration log contains no finite rows: {data_path}")
+        it, F, radial, time_s = it[m], F[m], radial[m], time_s[m]
+        tag = os.path.basename(os.path.normpath(os.path.dirname(data_path) or '.'))
+        source_note = "" if 'free_energy' in field_names else "(from iteration log: total)"
+    elif os.path.exists(components_path):
+        rows, field_names = _load_named_csv_rows(components_path)
+        it = _series_from_candidates(rows, field_names, 'iteration')
+        F = _series_from_candidates(rows, field_names, 'total', 'free_energy')
+        radial = _series_from_candidates(rows, field_names, 'radiality', default=np.nan)
+        time_s = _series_from_candidates(rows, field_names, 'time', 'time_s')
+        m = np.isfinite(it) & np.isfinite(F) & np.isfinite(time_s)
+        if not np.any(m):
+            raise ValueError(f"Energy-components log contains no finite rows: {components_path}")
+        it, F, radial, time_s = it[m], F[m], radial[m], time_s[m]
+        tag = os.path.basename(os.path.normpath(os.path.dirname(components_path) or '.'))
+        source_note = "(from energy-components log: total)"
+    else:
         # Quench runs usually only have quench_log.*
         q, log_path = load_quench_log(path)
         it = np.atleast_1d(q['iteration']).astype(float)
@@ -668,15 +717,6 @@ def plot_energy_VS_iter(
         it, F, radial, time_s = it[m], F[m], radial[m], time_s[m]
         tag = os.path.basename(os.path.normpath(os.path.dirname(log_path) or '.'))
         source_note = f"(from quench log: total)"
-    else:
-        # Format: iteration,free_energy,radiality,time
-        data = np.genfromtxt(data_path, delimiter=',', names=True)
-        it = np.asarray(data['iteration'], dtype=float)
-        F = np.asarray(data['free_energy'], dtype=float)
-        radial = np.asarray(data['radiality'], dtype=float)
-        time_s = np.asarray(data['time'], dtype=float)
-        tag = os.path.basename(os.path.normpath(os.path.dirname(data_path) or '.'))
-        source_note = ""
 
     # Create subplots for energy, radiality, and time
     fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(10, 8))
@@ -691,10 +731,15 @@ def plot_energy_VS_iter(
     
     # Plot radiality on secondary y-axis
     ax1_twin = ax1.twinx()
-    ax1_twin.plot(it, radial, marker='s', linestyle='--', color='red', alpha=0.7)
-    ax1_twin.set_ylabel(r'Radialnost $\overline{R}$', color='red')
-    ax1_twin.tick_params(axis='y', labelcolor='red')
-    ax1_twin.set_ylim([0, 1.05])
+    if np.any(np.isfinite(radial)):
+        ax1_twin.plot(it, radial, marker='s', linestyle='--', color='red', alpha=0.7)
+        ax1_twin.set_ylabel(r'Radialnost $\overline{R}$', color='red')
+        ax1_twin.tick_params(axis='y', labelcolor='red')
+        ax1_twin.set_ylim([0, 1.05])
+    else:
+        ax1_twin.set_ylabel(r'Radialnost $\overline{R}$ (n/a)', color='red')
+        ax1_twin.tick_params(axis='y', labelcolor='red')
+        ax1_twin.set_yticks([])
     
     # Plot 2: Physical Time vs Iteration
     ax2.plot(it, time_s, marker='^', linestyle='-', color='green')
@@ -735,16 +780,38 @@ def energy_components(
     data_path = _resolve_data_file(path, 'energy_components_vs_iteration.dat')
     if not os.path.exists(data_path):
         raise FileNotFoundError(f"Missing energy components file: {data_path}")
-    # Format: iteration,bulk,elastic,total,radiality,time
-    data = np.genfromtxt(data_path, delimiter=',', names=True)
+    rows, field_names = _load_named_csv_rows(data_path)
+    it = _series_from_candidates(rows, field_names, 'iteration')
+    bulk = _series_from_candidates(rows, field_names, 'bulk')
+    elastic = _series_from_candidates(rows, field_names, 'elastic')
+    anchoring = _series_from_candidates(rows, field_names, 'anchoring', default=np.nan)
+    total = _series_from_candidates(rows, field_names, 'total', 'free_energy')
+    radiality = _series_from_candidates(rows, field_names, 'radiality', default=np.nan)
+    time_s = _series_from_candidates(rows, field_names, 'time', 'time_s')
+
+    m = np.isfinite(it) & np.isfinite(bulk) & np.isfinite(elastic) & np.isfinite(total) & np.isfinite(time_s)
+    if not np.any(m):
+        raise ValueError(f"Energy components log contains no finite rows: {data_path}")
+
+    it, bulk, elastic, anchoring, total, radiality, time_s = (
+        it[m],
+        bulk[m],
+        elastic[m],
+        anchoring[m],
+        total[m],
+        radiality[m],
+        time_s[m],
+    )
 
     # Create subplots for energy components, radiality, and time
     fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(10, 8))
     
     # Plot 1: Energy Components
-    ax1.plot(data['iteration'], data['bulk'], label='Bulk', linewidth=2)
-    ax1.plot(data['iteration'], data['elastic'], label='Elastic', linewidth=2)
-    ax1.plot(data['iteration'], data['total'], label='Total', linestyle='--', color='k', linewidth=2)
+    ax1.plot(it, bulk, label='Bulk', linewidth=2)
+    ax1.plot(it, elastic, label='Elastic', linewidth=2)
+    if np.any(np.isfinite(anchoring)):
+        ax1.plot(it, anchoring, label='Anchoring', linewidth=2)
+    ax1.plot(it, total, label='Total', linestyle='--', color='k', linewidth=2)
     ax1.set_xlabel('$i$')
     ax1.set_ylabel('$F$ [J]')
     ax1.set_title('$F_{komp}(t)$')
@@ -753,7 +820,8 @@ def energy_components(
     
     # Plot 2: Radiality and Time
     ax2_left = ax2
-    ax2_left.plot(data['iteration'], data['radiality'], marker='o', linestyle='-', color='red', label=r'Radialnost $\overline{R}$')
+    if np.any(np.isfinite(radiality)):
+        ax2_left.plot(it, radiality, marker='o', linestyle='-', color='red', label=r'Radialnost $\overline{R}$')
     ax2_left.set_xlabel('$i$')
     ax2_left.set_ylabel(r'Radialnost $\overline{R}$', color='red')
     ax2_left.tick_params(axis='y', labelcolor='red')
@@ -762,7 +830,7 @@ def energy_components(
     
     # Plot physical time on secondary y-axis
     ax2_right = ax2.twinx()
-    ax2_right.plot(data['iteration'], data['time'], marker='s', linestyle='--', color='green', alpha=0.7, label='Fizični čas')
+    ax2_right.plot(it, time_s, marker='s', linestyle='--', color='green', alpha=0.7, label='Fizični čas')
     ax2_right.set_ylabel('$t$ [s]', color='green')
     ax2_right.tick_params(axis='y', labelcolor='green')
     

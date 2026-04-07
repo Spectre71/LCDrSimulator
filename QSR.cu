@@ -31,6 +31,159 @@ __host__ __device__ __forceinline__ double qtensor_frobenius_norm(const QTensor&
     return sqrt(x);
 }
 
+struct DropletGeometry {
+    double dx = 1.0;
+    double dy = 1.0;
+    double dz = 1.0;
+    double center_x = 0.0;
+    double center_y = 0.0;
+    double center_z = 0.0;
+    double radius_x = 1.0;
+    double radius_y = 1.0;
+    double radius_z = 1.0;
+    double min_spacing = 1.0;
+    double min_radius = 1.0;
+    double shell_half_thickness = 1.0;
+    double core_radius = 1.0;
+};
+
+struct DropletGeometryPoint {
+    double x = 0.0;
+    double y = 0.0;
+    double z = 0.0;
+    double center_radius = 0.0;
+    double signed_distance = 0.0;
+};
+
+__constant__ DropletGeometry d_droplet_geometry;
+
+__host__ __device__ __forceinline__ QTensor make_uniaxial_qtensor(double S, double nx, double ny, double nz) {
+    return {
+        S * (nx * nx - 1.0 / 3.0),
+        S * (nx * ny),
+        S * (nx * nz),
+        S * (ny * ny - 1.0 / 3.0),
+        S * (ny * nz)
+    };
+}
+
+__host__ __device__ inline DropletGeometryPoint sampleDropletGeometry(const DropletGeometry& geom, int i, int j, int k) {
+    DropletGeometryPoint point;
+    point.x = i * geom.dx - geom.center_x;
+    point.y = j * geom.dy - geom.center_y;
+    point.z = k * geom.dz - geom.center_z;
+    point.center_radius = sqrt(point.x * point.x + point.y * point.y + point.z * point.z);
+
+    const double scaled_x = point.x / geom.radius_x;
+    const double scaled_y = point.y / geom.radius_y;
+    const double scaled_z = point.z / geom.radius_z;
+    const double rho_sq = scaled_x * scaled_x + scaled_y * scaled_y + scaled_z * scaled_z;
+    if (rho_sq <= 1e-30) {
+        point.signed_distance = -geom.min_radius;
+        return point;
+    }
+
+    const double rho = sqrt(rho_sq);
+    const double grad_x = point.x / (geom.radius_x * geom.radius_x);
+    const double grad_y = point.y / (geom.radius_y * geom.radius_y);
+    const double grad_z = point.z / (geom.radius_z * geom.radius_z);
+    const double grad_norm = sqrt(grad_x * grad_x + grad_y * grad_y + grad_z * grad_z) / rho;
+
+    if (grad_norm > 1e-30) {
+        point.signed_distance = (rho - 1.0) / grad_norm;
+    } else {
+        point.signed_distance = point.center_radius - geom.min_radius;
+    }
+    return point;
+}
+
+__host__ __device__ inline bool dropletContainsPoint(const DropletGeometryPoint& point) {
+    return point.signed_distance <= 0.0;
+}
+
+__host__ __device__ inline bool dropletIsInShell(const DropletGeometry& geom, const DropletGeometryPoint& point) {
+    return fabs(point.signed_distance) <= geom.shell_half_thickness;
+}
+
+__host__ __device__ inline bool dropletShouldEvolve(const DropletGeometry& geom, const DropletGeometryPoint& point, double W) {
+    const double outer_band = (W > 0.0) ? geom.shell_half_thickness : 0.0;
+    return point.signed_distance <= outer_band;
+}
+
+__host__ __device__ inline double dropletNominalShellThickness(const DropletGeometry& geom) {
+    return 2.0 * geom.shell_half_thickness;
+}
+
+__host__ __device__ inline bool getCenterDirection(const DropletGeometryPoint& point, double& nx, double& ny, double& nz) {
+    if (point.center_radius <= 1e-30) {
+        nx = 1.0;
+        ny = 0.0;
+        nz = 0.0;
+        return false;
+    }
+    nx = point.x / point.center_radius;
+    ny = point.y / point.center_radius;
+    nz = point.z / point.center_radius;
+    return true;
+}
+
+__host__ __device__ inline bool getSurfaceNormal(const DropletGeometry& geom, const DropletGeometryPoint& point, double& nx, double& ny, double& nz) {
+    const double grad_x = point.x / (geom.radius_x * geom.radius_x);
+    const double grad_y = point.y / (geom.radius_y * geom.radius_y);
+    const double grad_z = point.z / (geom.radius_z * geom.radius_z);
+    const double grad_norm = sqrt(grad_x * grad_x + grad_y * grad_y + grad_z * grad_z);
+    if (grad_norm <= 1e-30) {
+        return getCenterDirection(point, nx, ny, nz);
+    }
+    nx = grad_x / grad_norm;
+    ny = grad_y / grad_norm;
+    nz = grad_z / grad_norm;
+    return true;
+}
+
+static DropletGeometry makeDropletGeometry(int Nx, int Ny, int Nz, double dx, double dy, double dz) {
+    DropletGeometry geom;
+    geom.dx = dx;
+    geom.dy = dy;
+    geom.dz = dz;
+    geom.center_x = 0.5 * (static_cast<double>(Nx) - 1.0) * dx;
+    geom.center_y = 0.5 * (static_cast<double>(Ny) - 1.0) * dy;
+    geom.center_z = 0.5 * (static_cast<double>(Nz) - 1.0) * dz;
+
+    const double radius_index = 0.5 * (static_cast<double>(std::min({Nx, Ny, Nz})) - 1.0);
+    geom.radius_x = std::max(radius_index * dx, 0.5 * dx);
+    geom.radius_y = std::max(radius_index * dy, 0.5 * dy);
+    geom.radius_z = std::max(radius_index * dz, 0.5 * dz);
+    geom.min_spacing = std::min({dx, dy, dz});
+    geom.min_radius = std::min({geom.radius_x, geom.radius_y, geom.radius_z});
+    geom.shell_half_thickness = geom.min_spacing;
+    geom.core_radius = geom.min_spacing;
+    return geom;
+}
+
+static double estimateEllipsoidSurfaceArea(const DropletGeometry& geom) {
+    constexpr double p = 1.6075;
+    const double ap = std::pow(geom.radius_x, p);
+    const double bp = std::pow(geom.radius_y, p);
+    const double cp = std::pow(geom.radius_z, p);
+    const double mean_term = (ap * bp + ap * cp + bp * cp) / 3.0;
+    if (!(mean_term > 0.0)) return std::numeric_limits<double>::quiet_NaN();
+    return 4.0 * PI * std::pow(mean_term, 1.0 / p);
+}
+
+static double estimateShellThicknessFromMask(const DropletGeometry& geom, size_t shell_point_count) {
+    const double nominal_shell_thickness = dropletNominalShellThickness(geom);
+    if (shell_point_count == 0) return nominal_shell_thickness;
+
+    const double shell_volume = static_cast<double>(shell_point_count) * geom.dx * geom.dy * geom.dz;
+    const double surface_area = estimateEllipsoidSurfaceArea(geom);
+    if (!(surface_area > 0.0)) return nominal_shell_thickness;
+
+    const double shell_thickness = shell_volume / surface_area;
+    if (!std::isfinite(shell_thickness) || !(shell_thickness > 0.0)) return nominal_shell_thickness;
+    return shell_thickness;
+}
+
 // ------------------------------------------------------------------
 // Device Helper Functions
 // ------------------------------------------------------------------
@@ -480,18 +633,10 @@ __global__ void applyWeakAnchoringPenaltyKernel(QTensor* mu, const QTensor* Q, i
     if (W == 0.0) return;
     if (!(shell_thickness > 0.0)) return;
 
-    double cx = Nx / 2.0, cy = Ny / 2.0, cz = Nz / 2.0;
-    double x = i - cx, y = j - cy, z = k - cz;
-    double r = sqrt(x*x + y*y + z*z);
-    if (r < 1e-9) return;
-    
-    double nx = x/r, ny = y/r, nz = z/r;
-    QTensor Q0;
-    Q0.Qxx = S_shell * (nx*nx - 1.0/3.0);
-    Q0.Qxy = S_shell * (nx*ny);
-    Q0.Qxz = S_shell * (nx*nz);
-    Q0.Qyy = S_shell * (ny*ny - 1.0/3.0);
-    Q0.Qyz = S_shell * (ny*nz);
+    const DropletGeometryPoint point = sampleDropletGeometry(d_droplet_geometry, i, j, k);
+    double nx = 1.0, ny = 0.0, nz = 0.0;
+    getSurfaceNormal(d_droplet_geometry, point, nx, ny, nz);
+    const QTensor Q0 = make_uniaxial_qtensor(S_shell, nx, ny, nz);
     
     const QTensor& q = Q[idx];
     QTensor& h = mu[idx];
@@ -521,15 +666,9 @@ __global__ void computeAnchoringEnergyKernel(const QTensor* Q, const bool* is_sh
         return;
     }
 
-    double cx = Nx / 2.0, cy = Ny / 2.0, cz = Nz / 2.0;
-    double x = i - cx, y = j - cy, z = k - cz;
-    double r = sqrt(x * x + y * y + z * z);
-    if (r < 1e-9) {
-        anch_energy[idx] = 0.0;
-        return;
-    }
-
-    double nx = x / r, ny = y / r, nz = z / r;
+    const DropletGeometryPoint point = sampleDropletGeometry(d_droplet_geometry, i, j, k);
+    double nx = 1.0, ny = 0.0, nz = 0.0;
+    getSurfaceNormal(d_droplet_geometry, point, nx, ny, nz);
 
     // Target Q0 = S_shell (n⊗n - I/3)
     const double Q0_xx = S_shell * (nx * nx - 1.0 / 3.0);
@@ -566,13 +705,8 @@ __global__ void updateQTensorKernel(QTensor* Q, const QTensor* mu, int Nx, int N
     // Skip shell for strong anchoring
     if (W == 0.0 && is_shell[idx]) return;
 
-    double cx = Nx / 2.0, cy = Ny / 2.0, cz = Nz / 2.0;
-    double R = min(min((double)Nx, (double)Ny), (double)Nz) / 2.0;
-    double x = i - cx, y = j - cy, z = k - cz;
-    double r = sqrt(x * x + y * y + z * z);
-    
-    if (W == 0.0) { if (r > R) return; } 
-    else { if (r > R + 1.5) return; }
+    const DropletGeometryPoint point = sampleDropletGeometry(d_droplet_geometry, i, j, k);
+    if (!dropletShouldEvolve(d_droplet_geometry, point, W)) return;
 
     double mobility = 1.0 / gamma;
     const QTensor& current_mu = mu[idx];
@@ -622,13 +756,11 @@ __global__ void computeRhsSemiImplicitKernel(
         return;
     }
 
-    // Only evolve inside droplet (and slightly outside when W>0, matching updateQTensorKernel).
-    const double cx = Nx / 2.0, cy = Ny / 2.0, cz = Nz / 2.0;
-    const double R = min(min((double)Nx, (double)Ny), (double)Nz) / 2.0;
-    const double x = i - cx, y = j - cy, z = k - cz;
-    const double r = sqrt(x * x + y * y + z * z);
-    if (W == 0.0) { if (r > R) { rhs[idx] = Q[idx]; return; } }
-    else { if (r > R + 1.5) { rhs[idx] = Q[idx]; return; } }
+    const DropletGeometryPoint point = sampleDropletGeometry(d_droplet_geometry, i, j, k);
+    if (!dropletShouldEvolve(d_droplet_geometry, point, W)) {
+        rhs[idx] = Q[idx];
+        return;
+    }
 
     const double mobility = 1.0 / gamma;
     const double alpha = dt * mobility * L_stab;
@@ -678,12 +810,11 @@ __global__ void jacobiHelmholtzStepKernel(
         return;
     }
 
-    const double cx = Nx / 2.0, cy = Ny / 2.0, cz = Nz / 2.0;
-    const double R = min(min((double)Nx, (double)Ny), (double)Nz) / 2.0;
-    const double x = i - cx, y = j - cy, z = k - cz;
-    const double r = sqrt(x * x + y * y + z * z);
-    if (W == 0.0) { if (r > R) { Q_new[idx] = Q_old[idx]; return; } }
-    else { if (r > R + 1.5) { Q_new[idx] = Q_old[idx]; return; } }
+    const DropletGeometryPoint point = sampleDropletGeometry(d_droplet_geometry, i, j, k);
+    if (!dropletShouldEvolve(d_droplet_geometry, point, W)) {
+        Q_new[idx] = Q_old[idx];
+        return;
+    }
 
     const double inv_dx2 = 1.0 / (dx * dx);
     const double inv_dy2 = 1.0 / (dy * dy);
@@ -717,7 +848,7 @@ __global__ void jacobiHelmholtzStepKernel(
     Q_new[idx] = out;
 }
 
-__global__ void applyBoundaryConditionsKernel(QTensor* Q, int Nx, int Ny, int Nz, const bool* is_shell, double S0, double W) {
+__global__ void applyBoundaryConditionsKernel(QTensor* Q, int Nx, int Ny, int Nz, const bool* is_shell, double S_shell, double W) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     int j = blockIdx.y * blockDim.y + threadIdx.y;
     int k = blockIdx.z * blockDim.z + threadIdx.z;
@@ -728,18 +859,10 @@ __global__ void applyBoundaryConditionsKernel(QTensor* Q, int Nx, int Ny, int Nz
     if (W > 0.0) return;
 
     if (is_shell[idx]) {
-        double cx = Nx / 2.0, cy = Ny / 2.0, cz = Nz / 2.0;
-        double x = i - cx, y = j - cy, z = k - cz;
-        double r = sqrt(x * x + y * y + z * z);
-        if (r > 1e-9) {
-            double nx = x / r, ny = y / r, nz = z / r;
-            QTensor& q = Q[idx];
-            q.Qxx = S0 * (nx * nx - 1.0 / 3.0);
-            q.Qxy = S0 * (nx * ny);
-            q.Qxz = S0 * (nx * nz);
-            q.Qyy = S0 * (ny * ny - 1.0 / 3.0);
-            q.Qyz = S0 * (ny * nz);
-        }
+        const DropletGeometryPoint point = sampleDropletGeometry(d_droplet_geometry, i, j, k);
+        double nx = 1.0, ny = 0.0, nz = 0.0;
+        getSurfaceNormal(d_droplet_geometry, point, nx, ny, nz);
+        Q[idx] = make_uniaxial_qtensor(S_shell, nx, ny, nz);
     }
 }
 
@@ -876,15 +999,13 @@ __global__ void computeRadialityKernel(const QTensor* Q, double* radiality_vals,
     if (i >= Nx || j >= Ny || k >= Nz) return;
     int idx = k + Nz * (j + Ny * i);
 
-    double cx = Nx / 2.0, cy = Ny / 2.0, cz = Nz / 2.0;
-    double R = min(min((double)Nx, (double)Ny), (double)Nz) / 2.0;
-    double x = i - cx, y = j - cy, z = k - cz;
-    double r = sqrt(x*x + y*y + z*z);
+    const DropletGeometryPoint point = sampleDropletGeometry(d_droplet_geometry, i, j, k);
 
-    if (r < R && r > 2.0) {
+    if (dropletContainsPoint(point) && point.center_radius > 2.0 * d_droplet_geometry.min_spacing) {
         NematicField nf = calculateNematicFieldDevice(Q[idx]);
-        double nx_r = x/r, ny_r = y/r, nz_r = z/r;
-        double dot_product = abs(nf.nx*nx_r + nf.ny*ny_r + nf.nz*nz_r);
+        double nx_r = 1.0, ny_r = 0.0, nz_r = 0.0;
+        getCenterDirection(point, nx_r, ny_r, nz_r);
+        double dot_product = fabs(nf.nx * nx_r + nf.ny * ny_r + nf.nz * nz_r);
         radiality_vals[idx] = dot_product;
         count_vals[idx] = 1;
     } else {
@@ -1064,6 +1185,11 @@ static inline std::string trim_copy(const std::string& s) {
     size_t e = s.size();
     while (e > b && std::isspace(static_cast<unsigned char>(s[e - 1]))) --e;
     return s.substr(b, e - b);
+}
+
+static inline std::string lower_copy(std::string s) {
+    for (char& c : s) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    return s;
 }
 
 static std::unordered_map<std::string, std::string> parse_kv_config_file(const std::string& path) {
@@ -1311,20 +1437,265 @@ static double T_from_A(double A, double a, double T_star) {
     return T_star + A / (3.0 * a);
 }
 
+enum class BoundaryOrderMode {
+    Equilibrium,
+    Custom
+};
+
+static BoundaryOrderMode boundary_order_mode_from_string(const std::string& raw_mode) {
+    const std::string mode = lower_copy(trim_copy(raw_mode));
+    if (mode == "custom" || mode == "fixed") return BoundaryOrderMode::Custom;
+    return BoundaryOrderMode::Equilibrium;
+}
+
+static const char* boundary_order_mode_name(BoundaryOrderMode mode) {
+    switch (mode) {
+        case BoundaryOrderMode::Custom:
+            return "custom";
+        case BoundaryOrderMode::Equilibrium:
+        default:
+            return "equilibrium";
+    }
+}
+
+static double equilibrium_shell_order_from_temperature(
+    double a,
+    double b,
+    double c,
+    double T,
+    double T_star,
+    int modechoice
+) {
+    double A = 0.0, B = 0.0, C = 0.0;
+    bulk_ABC_from_convention(a, b, c, T, T_star, modechoice, A, B, C);
+    const double S_eq = S_eq_uniaxial_from_ABC(A, B, C);
+    return (S_eq > 0.0) ? S_eq : 0.0;
+}
+
+static double resolve_boundary_shell_order(
+    BoundaryOrderMode mode,
+    double custom_shell_order,
+    double a,
+    double b,
+    double c,
+    double T,
+    double T_star,
+    int modechoice
+) {
+    if (mode == BoundaryOrderMode::Custom) return custom_shell_order;
+    return equilibrium_shell_order_from_temperature(a, b, c, T, T_star, modechoice);
+}
+
+struct DtEstimateRequest {
+    double dx = 1.0;
+    double dy = 1.0;
+    double dz = 1.0;
+    double gamma = 1.0;
+    double a = 0.0;
+    double b = 0.0;
+    double c = 0.0;
+    double T_star = 0.0;
+    int modechoice = 1;
+    double kappa = 0.0;
+    double L1 = 0.0;
+    double L2 = 0.0;
+    double L3 = 0.0;
+    double S_ref_used = std::numeric_limits<double>::quiet_NaN();
+    double S0 = 0.0;
+    double T_a = 0.0;
+    double T_b = 0.0;
+    bool use_semi_implicit = false;
+    double L_stab = 0.0;
+    int jacobi_iters = 0;
+};
+
+struct DtEstimateResult {
+    double min_dx = 0.0;
+    double S_scale = 1.0;
+    double L_eff_total = 0.0;
+    double D_total = 0.0;
+    double dt_diff_total = std::numeric_limits<double>::infinity();
+    double L_eff_explicit = 0.0;
+    double dt_diff = std::numeric_limits<double>::infinity();
+    double bulk_rate = 0.0;
+    double dt_bulk = std::numeric_limits<double>::infinity();
+    double dt_max = std::numeric_limits<double>::infinity();
+    bool using_LdG_elastic = false;
+    bool anisotropic_penalty_applied = false;
+    bool semi_implicit_active = false;
+};
+
+static DtEstimateResult estimate_stable_dt_window(const DtEstimateRequest& req) {
+    DtEstimateResult out;
+    out.min_dx = std::min({req.dx, req.dy, req.dz});
+
+    out.S_scale = std::isfinite(req.S_ref_used)
+        ? std::abs(req.S_ref_used)
+        : std::max({std::abs(req.S0), 0.5});
+    const double S_eq_a = std::abs(equilibrium_shell_order_from_temperature(req.a, req.b, req.c, req.T_a, req.T_star, req.modechoice));
+    const double S_eq_b = std::abs(equilibrium_shell_order_from_temperature(req.a, req.b, req.c, req.T_b, req.T_star, req.modechoice));
+    if (std::isfinite(S_eq_a) && S_eq_a > 0.0) out.S_scale = std::max(out.S_scale, S_eq_a);
+    if (std::isfinite(S_eq_b) && S_eq_b > 0.0) out.S_scale = std::max(out.S_scale, S_eq_b);
+    out.S_scale = std::max(out.S_scale, 1.0);
+
+    out.using_LdG_elastic = (req.L1 != 0.0 || req.L2 != 0.0 || req.L3 != 0.0);
+    out.anisotropic_penalty_applied = (req.L2 != 0.0 || req.L3 != 0.0);
+
+    if (out.using_LdG_elastic) {
+        out.L_eff_total = std::max({
+            std::abs(req.L1),
+            std::abs(req.L2),
+            std::abs(req.L1 + req.L2),
+            std::abs(req.L1 + 2.0 * req.L2),
+            std::abs(req.L3) * out.S_scale
+        });
+    } else {
+        out.L_eff_total = std::abs(req.kappa);
+    }
+    if (!(out.L_eff_total > 0.0)) out.L_eff_total = 1e-12;
+    out.D_total = out.L_eff_total / req.gamma;
+    if (!(out.D_total > 0.0) || !std::isfinite(out.D_total)) out.D_total = 1e-12;
+
+    out.dt_diff_total = 0.5 * (out.min_dx * out.min_dx) / (6.0 * out.D_total);
+    if (out.anisotropic_penalty_applied) out.dt_diff_total *= 0.25;
+
+    out.L_eff_explicit = out.L_eff_total;
+    out.dt_diff = out.dt_diff_total;
+    if (req.use_semi_implicit && req.L_stab > 0.0 && req.jacobi_iters > 0) {
+        const double L_base = out.using_LdG_elastic ? req.L1 : req.kappa;
+        const double L_stab_signed = (L_base >= 0.0) ? req.L_stab : -req.L_stab;
+        const double L_rem = std::abs(L_base - L_stab_signed);
+        if (out.using_LdG_elastic) {
+            out.L_eff_explicit = std::max({
+                L_rem,
+                std::abs(req.L2),
+                std::abs(req.L1 + req.L2),
+                std::abs(req.L1 + 2.0 * req.L2),
+                std::abs(req.L3) * out.S_scale
+            });
+        } else {
+            out.L_eff_explicit = L_rem;
+        }
+
+        if (out.L_eff_explicit > 0.0) {
+            const double D_explicit = out.L_eff_explicit / req.gamma;
+            out.dt_diff = 0.5 * (out.min_dx * out.min_dx) / (6.0 * D_explicit);
+            if (out.anisotropic_penalty_applied) out.dt_diff *= 0.25;
+        } else {
+            out.dt_diff = std::numeric_limits<double>::infinity();
+        }
+        out.semi_implicit_active = true;
+    }
+
+    auto bulk_rate_at_T = [&](double Tval) {
+        double A = 0.0, B = 0.0, C = 0.0;
+        bulk_ABC_from_convention(req.a, req.b, req.c, Tval, req.T_star, req.modechoice, A, B, C);
+        const double S2 = out.S_scale * out.S_scale;
+        return std::abs(A) + std::abs(B) * out.S_scale + std::abs(C) * S2;
+    };
+    out.bulk_rate = std::max(bulk_rate_at_T(req.T_a), bulk_rate_at_T(req.T_b));
+    out.dt_bulk = (out.bulk_rate > 0.0)
+        ? (0.02 * req.gamma / out.bulk_rate)
+        : std::numeric_limits<double>::infinity();
+
+    out.dt_max = std::min(out.dt_diff, out.dt_bulk);
+    if (!(out.dt_max > 0.0) || !std::isfinite(out.dt_max)) out.dt_max = out.dt_diff;
+    return out;
+}
+
+static void print_dt_estimate_summary(const DtEstimateResult& estimate) {
+    std::cout << "\nMaximum stable dt estimates:\n"
+              << "  dt_diff (elastic) ~= " << estimate.dt_diff << " s\n"
+              << "  dt_diff_total     ~= " << estimate.dt_diff_total << " s"
+              << (estimate.semi_implicit_active ? " (before semi-implicit)" : "") << "\n"
+              << "  dt_bulk (bulk)    ~= " << estimate.dt_bulk << " s\n"
+              << "  dt_max            = " << estimate.dt_max << " s" << std::endl;
+}
+
+struct CorrelationLengthElasticBand {
+    bool using_ldg = false;
+    bool used_magnitude_fallback = false;
+    double base_min = std::numeric_limits<double>::quiet_NaN();
+    double base_max = std::numeric_limits<double>::quiet_NaN();
+    double nematic_min = std::numeric_limits<double>::quiet_NaN();
+    double nematic_max = std::numeric_limits<double>::quiet_NaN();
+    double l3_envelope = 0.0;
+};
+
+static void update_positive_band(double value, bool& have_band, double& band_min, double& band_max) {
+    if (!std::isfinite(value) || !(value > 0.0)) return;
+    if (!have_band) {
+        band_min = value;
+        band_max = value;
+        have_band = true;
+        return;
+    }
+    band_min = std::min(band_min, value);
+    band_max = std::max(band_max, value);
+}
+
+static CorrelationLengthElasticBand estimate_correlation_length_elastic_band(
+    double kappa,
+    double L1,
+    double L2,
+    double L3,
+    double S_eq
+) {
+    CorrelationLengthElasticBand band;
+    band.using_ldg = (L1 != 0.0 || L2 != 0.0 || L3 != 0.0);
+
+    if (!band.using_ldg) {
+        const double L_iso = std::abs(kappa);
+        band.base_min = L_iso;
+        band.base_max = L_iso;
+        band.nematic_min = L_iso;
+        band.nematic_max = L_iso;
+        return band;
+    }
+
+    bool have_band = false;
+    double band_min = 0.0;
+    double band_max = 0.0;
+    update_positive_band(L1, have_band, band_min, band_max);
+    update_positive_band(L1 + L2, have_band, band_min, band_max);
+    update_positive_band(L1 + 2.0 * L2, have_band, band_min, band_max);
+
+    if (!have_band) {
+        const double fallback = std::max({std::abs(L1), std::abs(L1 + L2), std::abs(L1 + 2.0 * L2), 1e-12});
+        band.base_min = fallback;
+        band.base_max = fallback;
+        band.nematic_min = fallback;
+        band.nematic_max = fallback;
+        band.used_magnitude_fallback = true;
+        return band;
+    }
+
+    band.base_min = band_min;
+    band.base_max = band_max;
+    band.l3_envelope = (S_eq > 0.0 && std::isfinite(S_eq)) ? (std::abs(L3) * S_eq) : 0.0;
+    band.nematic_min = band.base_min;
+    band.nematic_max = band.base_max;
+    if (band.l3_envelope > 0.0) {
+        band.nematic_min = std::max(band.base_min - band.l3_envelope, 1e-12);
+        band.nematic_max = band.base_max + band.l3_envelope;
+    }
+    return band;
+}
+
 // Prints an estimate of the LdG correlation length xi (core size ~ O(xi)) and optionally aborts
 // if xi is under-resolved by the spatial discretization.
 static bool correlation_length_guard(
-    int Nx, int Ny, int Nz,
-    double dx, double dy, double dz,
+    const DropletGeometry& droplet_geometry,
     double a, double b, double c,
     double T, double T_star,
     int modechoice,
-    double kappa, double L1, double L2,
+    double kappa, double L1, double L2, double L3,
     bool guard_enabled,
+    bool interactive,
     double min_ratio_to_pass = 2.0
 ) {
-    const double min_d = std::min({dx, dy, dz});
-    const double dT = T - T_star;
+    const double min_d = droplet_geometry.min_spacing;
+    const double max_d = std::max({droplet_geometry.dx, droplet_geometry.dy, droplet_geometry.dz});
 
     // Bulk coefficients actually used by the selected convention.
     double A = 0.0, B = 0.0, C = 0.0;
@@ -1342,20 +1713,40 @@ static bool correlation_length_guard(
                                       : std::numeric_limits<double>::quiet_NaN();
     const double absA_nem = (std::isfinite(fpp_S) ? std::abs(fpp_S) : std::numeric_limits<double>::quiet_NaN());
 
-    // Choose an elastic scale for xi. L1 is the primary gradient stiffness when using L1/L2;
-    // otherwise kappa is used.
-    const double L_eff = (L1 > 0.0 ? L1 : kappa);
+    const CorrelationLengthElasticBand elastic_band = estimate_correlation_length_elastic_band(kappa, L1, L2, L3, S_eq);
+    const double xi_lin_min = correlation_length_from_L_and_A(elastic_band.base_min, absA_lin);
+    const double xi_lin_max = correlation_length_from_L_and_A(elastic_band.base_max, absA_lin);
+    const double xi_nem_min = correlation_length_from_L_and_A(elastic_band.nematic_min, absA_nem);
+    const double xi_nem_max = correlation_length_from_L_and_A(elastic_band.nematic_max, absA_nem);
+    const double xi_guard = std::isfinite(xi_nem_min) ? xi_nem_min : xi_lin_min;
+    const double xi_conf = std::isfinite(xi_nem_max)
+        ? xi_nem_max
+        : (std::isfinite(xi_lin_max) ? xi_lin_max : xi_guard);
 
-    const double xi_lin = correlation_length_from_L_and_A(L_eff, absA_lin);
-    const double xi_nem = correlation_length_from_L_and_A(L_eff, absA_nem);
-    const double xi_core = (std::isfinite(xi_nem) ? xi_nem : xi_lin);
-    const double ratio = (std::isfinite(xi_core) && min_d > 0.0) ? (xi_core / min_d) : 0.0;
-    const double R_phys = 0.5 * std::min({(double)Nx, (double)Ny, (double)Nz}) * min_d;
+    const double ratio_x = (std::isfinite(xi_guard) && droplet_geometry.dx > 0.0) ? (xi_guard / droplet_geometry.dx) : 0.0;
+    const double ratio_y = (std::isfinite(xi_guard) && droplet_geometry.dy > 0.0) ? (xi_guard / droplet_geometry.dy) : 0.0;
+    const double ratio_z = (std::isfinite(xi_guard) && droplet_geometry.dz > 0.0) ? (xi_guard / droplet_geometry.dz) : 0.0;
+    const double worst_spacing_ratio = std::min({ratio_x, ratio_y, ratio_z});
+    const double best_spacing_ratio = (std::isfinite(xi_guard) && min_d > 0.0) ? (xi_guard / min_d) : 0.0;
+    const double radius_ratio_x = (std::isfinite(xi_conf) && xi_conf > 0.0) ? (droplet_geometry.radius_x / xi_conf) : 0.0;
+    const double radius_ratio_y = (std::isfinite(xi_conf) && xi_conf > 0.0) ? (droplet_geometry.radius_y / xi_conf) : 0.0;
+    const double radius_ratio_z = (std::isfinite(xi_conf) && xi_conf > 0.0) ? (droplet_geometry.radius_z / xi_conf) : 0.0;
+    const double min_radius_ratio = std::min({radius_ratio_x, radius_ratio_y, radius_ratio_z});
 
     std::cout << "\n--- Correlation Length (xi) Estimate ---\n";
-    std::cout << "Using L_eff=" << L_eff << " J/m (" << (L1 > 0.0 ? "L1" : "kappa") << ")";
-    if (L2 != 0.0) std::cout << ", L2=" << L2;
-    std::cout << "\n";
+    if (elastic_band.using_ldg) {
+        std::cout << "Elastic stiffness band for xi (LdG): base=[" << elastic_band.base_min << ", " << elastic_band.base_max << "] J/m";
+        if (elastic_band.l3_envelope > 0.0) {
+            std::cout << ", nematic=[" << elastic_band.nematic_min << ", " << elastic_band.nematic_max << "] J/m"
+                      << " using +- |L3| S_eq = " << elastic_band.l3_envelope << " J/m";
+        }
+        std::cout << "\n";
+        if (elastic_band.used_magnitude_fallback) {
+            std::cout << "[xi] Elastic band fallback used because no positive LdG stiffness combination was available.\n";
+        }
+    } else {
+        std::cout << "Elastic stiffness for xi: " << elastic_band.base_min << " J/m (kappa)\n";
+    }
     std::cout << "Bulk convention = " << (modechoice == 1 ? "std" : "ravnik") << "\n";
     std::cout << "Bulk stiffness (linear) |A_lin| = |A| = |3 a (T-T*)| = " << absA_lin << " J/m^3\n";
     if (std::isfinite(fpp_S)) {
@@ -1363,25 +1754,46 @@ static bool correlation_length_guard(
     } else {
         std::cout << "Bulk curvature at S_eq: unavailable (likely isotropic / above T*)\n";
     }
-    if (std::isfinite(xi_lin)) std::cout << "xi_lin ≈ sqrt(L_eff/|A_lin|) = " << xi_lin << " m\n";
-    if (std::isfinite(xi_nem)) std::cout << "xi_nem ≈ sqrt(L_eff/|f''(S_eq)|) = " << xi_nem << " m\n";
-    if (std::isfinite(xi_core)) {
-        std::cout << "xi_used = " << xi_core << " m,  xi/min(dx,dy,dz) = " << ratio << "\n";
-        std::cout << "Suggested resolution: dx \u2272 xi/3 => dx \u2272 " << (xi_core / 3.0) << " m\n";
-        std::cout << "Droplet radius R \u2248 " << R_phys << " m,  R/xi \u2248 " << (R_phys / xi_core) << "\n";
+    if (std::isfinite(xi_lin_min)) {
+        std::cout << "xi_lin band ≈ [" << xi_lin_min << ", " << xi_lin_max << "] m\n";
+    }
+    if (std::isfinite(xi_nem_min)) {
+        std::cout << "xi_nem band ≈ [" << xi_nem_min << ", " << xi_nem_max << "] m\n";
+    }
+    if (std::isfinite(xi_guard)) {
+        std::cout << "xi_guard = " << xi_guard
+                  << " m, xi/dx = " << ratio_x
+                  << ", xi/dy = " << ratio_y
+                  << ", xi/dz = " << ratio_z
+                  << " (worst axis ratio = " << worst_spacing_ratio << ")\n";
+        std::cout << "Best-axis ratio xi/min(dx,dy,dz) = " << best_spacing_ratio
+                  << ", worst-axis spacing = " << max_d << " m\n";
+        std::cout << "Suggested coarsest spacing target: max(dx,dy,dz) <= xi_guard/3 => " << (xi_guard / 3.0) << " m\n";
+        std::cout << "Droplet semi-axes: Rx=" << droplet_geometry.radius_x
+                  << " m, Ry=" << droplet_geometry.radius_y
+                  << " m, Rz=" << droplet_geometry.radius_z << " m\n";
+        std::cout << "Geometry confinement ratios using xi_conf = " << xi_conf
+                  << ": Rx/xi=" << radius_ratio_x
+                  << ", Ry/xi=" << radius_ratio_y
+                  << ", Rz/xi=" << radius_ratio_z
+                  << " (min = " << min_radius_ratio << ")\n";
     } else {
-        std::cout << "xi estimate unavailable (check L_eff>0 and that T is not exactly T*)\n";
+        std::cout << "xi estimate unavailable (check elastic stiffness and that T is not exactly T*)\n";
     }
 
     if (!guard_enabled) return true;
 
-    // Under-resolution heuristic: if xi is less than ~2 grid spacings, the core is not reliably resolved.
-    if (std::isfinite(xi_core) && ratio < min_ratio_to_pass) {
-        std::cout << "\n[WARN] xi is under-resolved by the grid (xi/dx \u2248 " << ratio
+    // Under-resolution heuristic: use the coarsest physical spacing, not the smallest one,
+    // because an anisotropic grid only resolves the core as well as its worst axis.
+    if (std::isfinite(xi_guard) && worst_spacing_ratio < min_ratio_to_pass) {
+        std::cout << "\n[WARN] xi is under-resolved on the coarsest grid axis (worst xi/dh ≈ " << worst_spacing_ratio
                   << " < " << min_ratio_to_pass << ").\n";
-        std::cout << "       Expect mesh-dependent cores and more frequent escaped/uniaxial solutions.\n";
-        bool proceed = prompt_yes_no("Proceed anyway?", false);
-        return proceed;
+        std::cout << "       Expect mesh-dependent cores, axis-biased defect structure, and more frequent escaped/uniaxial solutions.\n";
+        if (!interactive) {
+            std::cout << "       Non-interactive run: aborting instead of prompting.\n";
+            return false;
+        }
+        return prompt_yes_no("Proceed anyway?", false);
     }
 
     return true;
@@ -1419,74 +1831,66 @@ void saveQTensorToFile(const std::vector<QTensor>& Q, int Nx, int Ny, int Nz, co
     fclose(f);
 }
 
-void initializeQTensor(std::vector<QTensor>& Q, int Nx, int Ny, int Nz, double q0, int mode) {
-    double cx = Nx / 2.0, cy = Ny / 2.0, cz = Nz / 2.0; 
-    double R = std::min({ (double)Nx, (double)Ny, (double)Nz }) / 2.0;
-    auto idx = [&](int i, int j, int k) {return k + Nz * (j + Ny * i); };
-    
-    std::mt19937 gen(std::random_device{}());
-    std::uniform_real_distribution<double>dist_theta(0.0, PI);
+static std::mt19937 makeHostRng(long long random_seed) {
+    if (random_seed >= 0) {
+        return std::mt19937(static_cast<std::mt19937::result_type>(random_seed));
+    }
+    return std::mt19937(std::random_device{}());
+}
+
+void initializeQTensor(std::vector<QTensor>& Q, int Nx, int Ny, int Nz, double q0, int mode, const DropletGeometry& droplet_geometry, long long random_seed) {
+    Q.assign((size_t)Nx * (size_t)Ny * (size_t)Nz, {0, 0, 0, 0, 0});
+    auto idx = [&](int i, int j, int k) { return (size_t)k + (size_t)Nz * ((size_t)j + (size_t)Ny * (size_t)i); };
+
+    std::mt19937 gen = makeHostRng(random_seed);
+    std::uniform_real_distribution<double> dist_theta(0.0, PI);
     std::uniform_real_distribution<double> dist_phi(0.0, 2.0 * PI);
 
     for (int i = 0; i < Nx; ++i) {
         for (int j = 0; j < Ny; ++j) {
             for (int k = 0; k < Nz; ++k) {
-                double x = i - cx, y = j - cy, z = k - cz;
-                double r = std::sqrt(x * x + y * y + z * z);
-                double r_min = 1.0; 
+                const DropletGeometryPoint point = sampleDropletGeometry(droplet_geometry, i, j, k);
+                const double r_min = droplet_geometry.core_radius;
 
-                if (r < R) {
+                if (dropletContainsPoint(point)) {
                     double S = q0;
-                    if (r < r_min) S *= (r / r_min); 
+                    if (point.center_radius < r_min) S *= (point.center_radius / r_min);
 
-                    QTensor& q = Q[idx(i, j, k)]; 
-                    if (mode == 0) { // Random
-                        double theta = dist_theta(gen);
-                        double phi = dist_phi(gen);
-                        double nx = std::sin(theta) * std::cos(phi);
-                        double ny = std::sin(theta) * std::sin(phi);
-                        double nz = std::cos(theta);
-                        q.Qxx = S * (nx * nx - 1.0 / 3.0);
-                        q.Qxy = S * (nx * ny);
-                        q.Qxz = S * (nx * nz);
-                        q.Qyy = S * (ny * ny - 1.0 / 3.0);
-                        q.Qyz = S * (ny * nz);
+                    QTensor& q = Q[idx(i, j, k)];
+                    if (mode == 0) {
+                        const double theta = dist_theta(gen);
+                        const double phi = dist_phi(gen);
+                        const double nx = std::sin(theta) * std::cos(phi);
+                        const double ny = std::sin(theta) * std::sin(phi);
+                        const double nz = std::cos(theta);
+                        q = make_uniaxial_qtensor(S, nx, ny, nz);
+                    } else {
+                        double nx = 1.0;
+                        double ny = 0.0;
+                        double nz = 0.0;
+                        getCenterDirection(point, nx, ny, nz);
+                        q = make_uniaxial_qtensor(S, nx, ny, nz);
                     }
-                    else { // Radial
-                        double nx, ny, nz;
-                        if (r < 1e-6) { nx=1; ny=0; nz=0; } 
-                        else { nx=x/r; ny=y/r; nz=z/r; }
-                        q.Qxx = S * (nx * nx - 1.0 / 3.0);
-                        q.Qxy = S * (nx * ny);
-                        q.Qxz = S * (nx * nz);
-                        q.Qyy = S * (ny * ny - 1.0 / 3.0);
-                        q.Qyz = S * (ny * nz);
-                    }
-                } else {
-                    Q[idx(i,j,k)] = {0,0,0,0,0};
                 }
             }
         }
     }
 }
 
-static void initializeIsotropicWithNoise(std::vector<QTensor>& Q, int Nx, int Ny, int Nz, double noise_amplitude) {
+static void initializeIsotropicWithNoise(std::vector<QTensor>& Q, int Nx, int Ny, int Nz, double noise_amplitude, const DropletGeometry& droplet_geometry, long long random_seed) {
     Q.assign((size_t)Nx * (size_t)Ny * (size_t)Nz, {0, 0, 0, 0, 0});
     if (noise_amplitude <= 0.0) return;
 
-    double cx = Nx / 2.0, cy = Ny / 2.0, cz = Nz / 2.0;
-    double R = std::min({ (double)Nx, (double)Ny, (double)Nz }) / 2.0;
     auto idx = [&](int i, int j, int k) { return (size_t)k + (size_t)Nz * ((size_t)j + (size_t)Ny * (size_t)i); };
 
-    std::mt19937 gen(std::random_device{}());
+    std::mt19937 gen = makeHostRng(random_seed);
     std::normal_distribution<double> dist(0.0, noise_amplitude);
 
     for (int i = 0; i < Nx; ++i) {
         for (int j = 0; j < Ny; ++j) {
             for (int k = 0; k < Nz; ++k) {
-                double x = i - cx, y = j - cy, z = k - cz;
-                double r = std::sqrt(x * x + y * y + z * z);
-                if (r < R) {
+                const DropletGeometryPoint point = sampleDropletGeometry(droplet_geometry, i, j, k);
+                if (dropletContainsPoint(point)) {
                     QTensor& q = Q[idx(i, j, k)];
                     q.Qxx = dist(gen);
                     q.Qxy = dist(gen);
@@ -1554,6 +1958,13 @@ int main(int argc, char** argv) {
         int mode = cfg_or_prompt<int>(cfg, "init_mode", "Select initialization mode: [0] random, [1] radial, [2] isotropic+noise", 1, interactive);
         if (mode < 0) mode = 0;
         if (mode > 2) mode = 2;
+        long long random_seed = cfg_or_prompt<long long>(
+            cfg,
+            "random_seed",
+            "Random seed for stochastic initialization (-1 = random_device)",
+            -1,
+            interactive
+        );
 
         std::cout << "\n--- Spatial Parameters ---" << std::endl;
         int Nx = cfg_or_prompt<int>(cfg, "Nx", "Enter grid size Nx", Nx_default, interactive);
@@ -1591,7 +2002,7 @@ int main(int argc, char** argv) {
                     << "  T_NI (coexistence, global min) ≈ " << T_NI << " K\n"
                     << "  T_spin,N (nematic disappears)  ≈ " << T_spinN << " K\n";
           }
-        double S0 = cfg_or_prompt<double>(cfg, "S0", "Enter initial S0", S_eq > 0 ? S_eq : 0.5, interactive);
+        double S0 = cfg_or_prompt<double>(cfg, "S0", "Enter initial S0 (initial condition only)", S_eq > 0 ? S_eq : 0.5, interactive);
         
         std::cout << "\n--- Elastic and Dynamic Parameters ---" << std::endl;
         // color yellow text: \033[1;33m
@@ -1686,10 +2097,12 @@ int main(int argc, char** argv) {
             }
         }
 
+        const DropletGeometry droplet_geometry = makeDropletGeometry(Nx, Ny, Nz, dx, dy, dz);
+
         bool xi_guard_enabled = cfg_or_prompt_yes_no(cfg, "xi_guard_enabled", "Enable correlation-length guard (abort if xi is under-resolved)?", true, interactive);
-        if (!correlation_length_guard(Nx, Ny, Nz, dx, dy, dz, a, b, c, T, T_star, modechoice, kappa, L1, L2, xi_guard_enabled)) {
+        if (!correlation_length_guard(droplet_geometry, a, b, c, T, T_star, modechoice, kappa, L1, L2, L3, xi_guard_enabled, interactive)) {
             std::cout << "\nAborting this run due to correlation-length guard." << std::endl;
-            std::cout << "Tip: decrease dx/dy/dz or move T closer to T* to increase xi." << std::endl;
+            std::cout << "Tip: decrease the coarsest spacing, enlarge the smallest droplet semi-axis, or move T closer to T* to increase xi." << std::endl;
             if (!allow_run_again_loop) return 1;
             std::cout << "Would you like to run another simulation? (y/n): ";
             std::string again; std::getline(std::cin, again);
@@ -1702,9 +2115,14 @@ int main(int argc, char** argv) {
         int maxIterations = cfg_or_prompt<int>(cfg, "iterations", "Enter iterations", maxIterations_default, interactive);
         int printFreq = cfg_or_prompt<int>(cfg, "print_freq", "Enter print freq", 200, interactive);
         double tolerance = cfg_or_prompt<double>(cfg, "tolerance", "Enter tolerance", 1e-2, interactive);
-        // Relative convergence threshold for radiality changes between consecutive samples.
-        // Example: 1e-2 means "< 1% change".
-        double RbEps = cfg_or_prompt<double>(cfg, "RbEps", "Enter radiality convergence eps RbEps (relative ΔR̄)", 1e-2, interactive);
+        // Absolute convergence threshold for the 2D defect-density proxy between consecutive samples.
+        double defectDensityAbsEps = cfg_or_prompt<double>(
+            cfg,
+            "defect_density_abs_eps",
+            "Enter 2D defect-density convergence eps (absolute Δn_def)",
+            1e-4,
+            interactive
+        );
 
         // Debugging aids (off by default because they can slow down runs).
         const bool debug_cuda_checks = cfg_or_prompt_yes_no(
@@ -1732,19 +2150,40 @@ int main(int argc, char** argv) {
 
         std::vector<QTensor> prev_Q_debug;
         bool have_prev_Q_debug = false;
+
+        cudaError_t geom_copy_err = cudaMemcpyToSymbol(d_droplet_geometry, &droplet_geometry, sizeof(DropletGeometry));
+        if (geom_copy_err != cudaSuccess) {
+            std::cerr << "[CUDA] Failed to upload droplet geometry: " << cudaGetErrorString(geom_copy_err) << std::endl;
+            return 1;
+        }
         
         // Initialize Shell
-        double R_geom = std::min({ (double)Nx, (double)Ny, (double)Nz }) / 2.0;
-        double cx = Nx / 2.0, cy = Ny / 2.0, cz = Nz / 2.0;
+        size_t shell_point_count = 0;
         for (int i = 0; i < Nx; ++i) {
             for (int j = 0; j < Ny; ++j) {
                 for (int k = 0; k < Nz; ++k) {
-                    double r = std::sqrt(std::pow(i - cx, 2) + std::pow(j - cy, 2) + std::pow(k - cz, 2));
-                    if (std::abs(r - R_geom) < 1.0) {
+                    const DropletGeometryPoint point = sampleDropletGeometry(droplet_geometry, i, j, k);
+                    if (dropletIsInShell(droplet_geometry, point)) {
                         h_is_shell[k + Nz * (j + Ny * i)] = true;
+                        ++shell_point_count;
                     }
                 }
             }
+        }
+
+        const double shell_nominal_thickness = dropletNominalShellThickness(droplet_geometry);
+        const double shell_surface_area_estimate = estimateEllipsoidSurfaceArea(droplet_geometry);
+        const double shell_volume = static_cast<double>(shell_point_count) * dx * dy * dz;
+        const double shell_effective_thickness = estimateShellThicknessFromMask(droplet_geometry, shell_point_count);
+
+        if (W > 0.0) {
+            std::cout << "\n--- Weak Anchoring Shell ---" << std::endl;
+            std::cout << "Shell voxels              = " << shell_point_count << std::endl;
+            std::cout << "Shell volume              = " << shell_volume << " m^3" << std::endl;
+            std::cout << "Estimated surface area    = " << shell_surface_area_estimate << " m^2" << std::endl;
+            std::cout << "Nominal shell thickness   = " << shell_nominal_thickness << " m" << std::endl;
+            std::cout << "Effective shell thickness = " << shell_effective_thickness << " m" << std::endl;
+            std::cout << "Weak anchoring scale W/δ  = " << (W / shell_effective_thickness) << " J/m^3" << std::endl;
         }
 
         // Device Memory
@@ -1785,22 +2224,74 @@ int main(int argc, char** argv) {
         // CUDA Grid
         dim3 threadsPerBlock(8, 8, 8);
         dim3 numBlocks((Nx + 7) / 8, (Ny + 7) / 8, (Nz + 7) / 8);
+        dim3 threads2D(16, 16, 1);
+        dim3 blocks2D((Nx - 1 + threads2D.x - 1) / threads2D.x, (Ny - 1 + threads2D.y - 1) / threads2D.y, 1);
+        dim3 blocksX((Nx - 1 + threads2D.x - 1) / threads2D.x, (Ny + threads2D.y - 1) / threads2D.y, 1);
+        dim3 blocksY((Nx + threads2D.x - 1) / threads2D.x, (Ny - 1 + threads2D.y - 1) / threads2D.y, 1);
 
         std::cout << "\nSelect simulation mode: [1] Single Temp, [2] Temp Range, [3] Quench (time-dependent T): ";
         int sim_mode = cfg_or_prompt<int>(cfg, "sim_mode", "", 1, interactive);
 
+        const std::string boundary_order_mode_raw = cfg_or_prompt<std::string>(
+            cfg,
+            "boundary_order_mode",
+            "Boundary order policy [equilibrium/custom]",
+            "equilibrium",
+            interactive
+        );
+        const std::string boundary_order_mode_norm = lower_copy(trim_copy(boundary_order_mode_raw));
+        const BoundaryOrderMode boundary_order_mode = boundary_order_mode_from_string(boundary_order_mode_norm);
+        if (!boundary_order_mode_norm.empty() &&
+            boundary_order_mode_norm != "equilibrium" &&
+            boundary_order_mode_norm != "custom" &&
+            boundary_order_mode_norm != "fixed") {
+            std::cout << "[Boundary] Unrecognized boundary_order_mode='" << boundary_order_mode_raw
+                      << "'; using equilibrium." << std::endl;
+        }
+
+        double boundary_S_custom = 0.0;
+        if (boundary_order_mode == BoundaryOrderMode::Custom) {
+            const double boundary_S_default = equilibrium_shell_order_from_temperature(a, b, c, T, T_star, modechoice);
+            boundary_S_custom = cfg_or_prompt<double>(
+                cfg,
+                "boundary_S",
+                "Boundary shell order S_shell for custom policy",
+                boundary_S_default,
+                interactive
+            );
+            if (!std::isfinite(boundary_S_custom)) boundary_S_custom = boundary_S_default;
+        }
+
+        auto compute_S_shell = [&](double T_shell) {
+            return resolve_boundary_shell_order(
+                boundary_order_mode,
+                boundary_S_custom,
+                a,
+                b,
+                c,
+                T_shell,
+                T_star,
+                modechoice
+            );
+        };
+
+        if (boundary_order_mode == BoundaryOrderMode::Equilibrium) {
+            std::cout << "[Boundary] Shell order policy: equilibrium S_shell = max(S_eq(T), 0)." << std::endl;
+        } else {
+            std::cout << "[Boundary] Shell order policy: custom S_shell = " << boundary_S_custom
+                      << " (independent of init S0 and temperature)." << std::endl;
+        }
+
         auto compute_avg_S_droplet = [&](const std::vector<NematicField>& nf) -> double {
             double total_S = 0.0;
             int count = 0;
-            double cx_l = Nx / 2.0, cy_l = Ny / 2.0, cz_l = Nz / 2.0;
-            double R_l = std::min({ (double)Nx, (double)Ny, (double)Nz }) / 2.0;
             // Exclude a thin layer near the shell to avoid anchoring-dominated averages.
-            const double shell_exclude = 2.0;
+            const double shell_exclude = 2.0 * droplet_geometry.min_spacing;
             for (int i = 0; i < Nx; ++i) {
                 for (int j = 0; j < Ny; ++j) {
                     for (int k = 0; k < Nz; ++k) {
-                        double r = std::sqrt(std::pow(i - cx_l, 2) + std::pow(j - cy_l, 2) + std::pow(k - cz_l, 2));
-                        if (r < (R_l - shell_exclude)) {
+                        const DropletGeometryPoint point = sampleDropletGeometry(droplet_geometry, i, j, k);
+                        if (point.signed_distance < -shell_exclude) {
                             size_t id = (size_t)k + (size_t)Nz * ((size_t)j + (size_t)Ny * (size_t)i);
                             total_S += nf[id].S;
                             ++count;
@@ -1811,10 +2302,27 @@ int main(int argc, char** argv) {
             return (count > 0) ? (total_S / count) : 0.0;
         };
 
+        auto compute_max_S_droplet = [&](const std::vector<NematicField>& nf) -> double {
+            double max_S = 0.0;
+            const double shell_exclude = 2.0 * droplet_geometry.min_spacing;
+            for (int i = 0; i < Nx; ++i) {
+                for (int j = 0; j < Ny; ++j) {
+                    for (int k = 0; k < Nz; ++k) {
+                        const DropletGeometryPoint point = sampleDropletGeometry(droplet_geometry, i, j, k);
+                        if (point.signed_distance < -shell_exclude) {
+                            const size_t id = (size_t)k + (size_t)Nz * ((size_t)j + (size_t)Ny * (size_t)i);
+                            const double s = nf[id].S;
+                            if (std::isfinite(s)) max_S = std::max(max_S, s);
+                        }
+                    }
+                }
+            }
+            return max_S;
+        };
+
         auto reduce_energy = [&](DimensionalParams p, double S_shell) -> std::tuple<double, double, double> {
             computeEnergyKernel<<<numBlocks, threadsPerBlock>>>(d_Q, d_bulk_energy, d_elastic_energy, Nx, Ny, Nz, dx, dy, dz, p, kappa, modechoice);
-            const double shell_thickness = std::min({dx, dy, dz});
-            computeAnchoringEnergyKernel<<<numBlocks, threadsPerBlock>>>(d_Q, d_is_shell, d_anch_energy, Nx, Ny, Nz, dx, dy, dz, S_shell, p.W, shell_thickness);
+            computeAnchoringEnergyKernel<<<numBlocks, threadsPerBlock>>>(d_Q, d_is_shell, d_anch_energy, Nx, Ny, Nz, dx, dy, dz, S_shell, p.W, shell_effective_thickness);
 
             std::vector<double> h_bulk(num_elements), h_elastic(num_elements), h_anch(num_elements);
             cudaMemcpy(h_bulk.data(), d_bulk_energy, size_double, cudaMemcpyDeviceToHost);
@@ -1831,6 +2339,75 @@ int main(int argc, char** argv) {
             }
             return {bulk_sum, elastic_sum, anch_sum};
         };
+
+                    auto compute_defect_density_2d = [&](int z_slice, double S_threshold, double charge_cutoff, double& density, unsigned int& plaq_used) {
+                        cudaMemset(d_defects_2d_count, 0, sizeof(unsigned int));
+                        cudaMemset(d_defects_2d_plaq_used, 0, sizeof(unsigned int));
+                        computeDefectDensity2DProxyKernel<<<blocks2D, threads2D>>>(
+                            d_Q,
+                            Nx,
+                            Ny,
+                            Nz,
+                            z_slice,
+                            S_threshold,
+                            charge_cutoff,
+                            d_defects_2d_count,
+                            d_defects_2d_plaq_used
+                        );
+                        if (debug_cuda_checks) cuda_check_or_die("computeDefectDensity2DProxyKernel");
+
+                        unsigned int defect_count = 0u;
+                        plaq_used = 0u;
+                        cudaMemcpy(&defect_count, d_defects_2d_count, sizeof(unsigned int), cudaMemcpyDeviceToHost);
+                        cudaMemcpy(&plaq_used, d_defects_2d_plaq_used, sizeof(unsigned int), cudaMemcpyDeviceToHost);
+                        density = (plaq_used > 0u) ? (double(defect_count) / double(plaq_used)) : std::numeric_limits<double>::quiet_NaN();
+                    };
+
+                    auto defect_density_converged = [&](double prev_density, double current_density, unsigned int plaq_used) {
+                        if (!(plaq_used > 0u)) return false;
+                        if (!std::isfinite(prev_density) || !std::isfinite(current_density)) return false;
+                        return std::abs(current_density - prev_density) < defectDensityAbsEps;
+                    };
+
+                    auto compute_xi_grad_proxy_2d = [&](int z_slice, double S_threshold, double& xi_grad_proxy, unsigned int& xi_grad_edges_used) {
+                        xi_grad_proxy = std::numeric_limits<double>::quiet_NaN();
+                        xi_grad_edges_used = 0u;
+
+                        cudaMemset(d_xi_grad_sum, 0, sizeof(double));
+                        cudaMemset(d_xi_grad_edges_used, 0, sizeof(unsigned int));
+                        computeXiGradEdgesXKernel<<<blocksX, threads2D>>>(
+                            d_Q,
+                            Nx,
+                            Ny,
+                            Nz,
+                            z_slice,
+                            S_threshold,
+                            d_xi_grad_sum,
+                            d_xi_grad_edges_used
+                        );
+                        computeXiGradEdgesYKernel<<<blocksY, threads2D>>>(
+                            d_Q,
+                            Nx,
+                            Ny,
+                            Nz,
+                            z_slice,
+                            S_threshold,
+                            d_xi_grad_sum,
+                            d_xi_grad_edges_used
+                        );
+                        if (debug_cuda_checks) cuda_check_or_die("computeXiGradEdges kernels");
+
+                        double sum_sq = 0.0;
+                        cudaMemcpy(&sum_sq, d_xi_grad_sum, sizeof(double), cudaMemcpyDeviceToHost);
+                        cudaMemcpy(&xi_grad_edges_used, d_xi_grad_edges_used, sizeof(unsigned int), cudaMemcpyDeviceToHost);
+                        if (xi_grad_edges_used > 0u) {
+                            const double mean_sq = sum_sq / double(xi_grad_edges_used);
+                            const double eps = 1e-30;
+                            const double inv = (mean_sq > 0.0) ? (1.0 / sqrt(mean_sq + eps)) : (1.0 / sqrt(eps));
+                            const double xi_cap = 0.5 * double(std::min(Nx, Ny));
+                            xi_grad_proxy = std::min(inv, xi_cap);
+                        }
+                    };
 
         if (sim_mode == 3) {
             std::string out_dir_name;
@@ -1924,47 +2501,11 @@ int main(int argc, char** argv) {
             double noise_amplitude = 0.0;
             if (mode == 2) {
                 noise_amplitude = cfg_or_prompt<double>(cfg, "noise_amplitude", "Noise amplitude for isotropic init", 1e-3, interactive);
-                initializeIsotropicWithNoise(h_Q, Nx, Ny, Nz, noise_amplitude);
+                initializeIsotropicWithNoise(h_Q, Nx, Ny, Nz, noise_amplitude, droplet_geometry, random_seed);
             } else {
-                initializeQTensor(h_Q, Nx, Ny, Nz, S0, mode);
+                initializeQTensor(h_Q, Nx, Ny, Nz, S0, mode, droplet_geometry, random_seed);
             }
             cudaMemcpy(d_Q, h_Q.data(), size_Q, cudaMemcpyHostToDevice);
-
-            double min_dx = std::min({ dx, dy, dz });
-            // dt_max estimate: use an effective elastic scale even if L1<=0 or L3 dominates.
-            // NOTE: if S runs away during a quench, it means dt was too optimistic for the nonlinear bulk term
-            // (or elastic discretization became unstable). Use a conservative S_scale and optionally add runtime guards.
-            double S_scale = std::isfinite(S_ref_used) ? std::abs(S_ref_used) : std::max({std::abs(S0), std::abs(S_eq), 0.5});
-            if (!(S_scale > 0.0)) S_scale = 0.5;
-            {
-                // Use the expected nematic equilibrium at T_low as an additional scale, when available.
-                double A_t = 0.0, B_t = 0.0, C_t = 0.0;
-                bulk_ABC_from_convention(a, b, c, T_low, T_star, modechoice, A_t, B_t, C_t);
-                const double S_eq_low = std::abs(S_eq_uniaxial_from_ABC(A_t, B_t, C_t));
-                if (std::isfinite(S_eq_low) && S_eq_low > 0.0) S_scale = std::max(S_scale, S_eq_low);
-            }
-            // Keep a minimum scale so the dt_bulk estimate isn't unrealistically large.
-            S_scale = std::max(S_scale, 1.0);
-
-            double L_eff = 0.0;
-            if (L1 != 0.0 || L2 != 0.0 || L3 != 0.0) {
-                // L2 can strongly affect high-k modes; use a conservative effective scale.
-                L_eff = std::max({
-                    std::abs(L1),
-                    std::abs(L2),
-                    std::abs(L1 + L2),
-                    std::abs(L1 + 2.0 * L2),
-                    std::abs(L3) * S_scale
-                });
-            } else {
-                L_eff = std::abs(kappa);
-            }
-            if (!(L_eff > 0.0)) L_eff = 1e-12;
-            double D = L_eff / gamma; if (D == 0) D = 1e-12;
-            double dt_diff_total = 0.5 * (min_dx * min_dx) / (6.0 * D);
-            // Anisotropic elasticity (especially L2/L3) tends to be stiffer and is more prone to exciting
-            // Nyquist checkerboard modes with explicit Euler; tighten the cap.
-            if (L2 != 0.0 || L3 != 0.0) dt_diff_total *= 0.25;
 
             // Semi-implicit stabilization for stiff elastic Laplacian term:
             // backward-Euler on +L_stab*Laplace(Q)/gamma, explicit on everything else.
@@ -1999,74 +2540,49 @@ int main(int argc, char** argv) {
                 if (jacobi_iters < 0) jacobi_iters = 0;
             }
 
-            // If semi-implicit is enabled, relax the elastic dt cap to only cover the remaining explicit stiffness:
-            // L_explicit_eff ~ max( |L_base - sign(L_base)*L_stab|, |L2|, |L1+L2|, |L1+2L2|, |L3|*S_scale ).
-            // This way, in one-constant mode with L_stab≈kappa, dt_max becomes bulk-limited instead of dx^2-limited.
-            double dt_diff = dt_diff_total;
-            if (use_semi_implicit && L_stab > 0.0 && jacobi_iters > 0) {
-                const double L_stab_signed = (L_base >= 0.0) ? L_stab : -L_stab;
-                const double L_rem = std::abs(L_base - L_stab_signed);
-                double L_eff_explicit = 0.0;
-                if (using_LdG_elastic) {
-                    L_eff_explicit = std::max({
-                        L_rem,
-                        std::abs(L2),
-                        std::abs((L1) + L2),
-                        std::abs((L1) + 2.0 * L2),
-                        std::abs(L3) * S_scale
-                    });
-                } else {
-                    // one-constant mode: only the remainder of kappa*Laplace is explicit
-                    L_eff_explicit = L_rem;
-                }
+            DtEstimateRequest dt_request;
+            dt_request.dx = dx;
+            dt_request.dy = dy;
+            dt_request.dz = dz;
+            dt_request.gamma = gamma;
+            dt_request.a = a;
+            dt_request.b = b;
+            dt_request.c = c;
+            dt_request.T_star = T_star;
+            dt_request.modechoice = modechoice;
+            dt_request.kappa = kappa;
+            dt_request.L1 = L1;
+            dt_request.L2 = L2;
+            dt_request.L3 = L3;
+            dt_request.S_ref_used = S_ref_used;
+            dt_request.S0 = S0;
+            dt_request.T_a = T_high;
+            dt_request.T_b = T_low;
+            dt_request.use_semi_implicit = use_semi_implicit;
+            dt_request.L_stab = L_stab;
+            dt_request.jacobi_iters = jacobi_iters;
+            const DtEstimateResult dt_estimate = estimate_stable_dt_window(dt_request);
+            print_dt_estimate_summary(dt_estimate);
 
-                if (L_eff_explicit > 0.0) {
-                    const double D_exp = L_eff_explicit / gamma;
-                    dt_diff = 0.5 * (min_dx * min_dx) / (6.0 * D_exp);
-                    if (L2 != 0.0 || L3 != 0.0) dt_diff *= 0.25;
-                } else {
-                    dt_diff = std::numeric_limits<double>::infinity();
-                }
-            }
+            double dt = cfg_or_prompt<double>(cfg, "dt", "Enter time step dt (s)", dt_estimate.dt_max, interactive);
+            if (dt > dt_estimate.dt_max) dt = dt_estimate.dt_max;
 
-            // Bulk stiffness can be much larger than elastic diffusion (especially deep in nematic),
-            // so explicit Euler typically needs a dt cap based on |A|,|B|,|C|.
-            auto bulk_rate_at_T = [&](double Tval) -> double {
-                double A_t = 0.0, B_t = 0.0, C_t = 0.0;
-                bulk_ABC_from_convention(a, b, c, Tval, T_star, modechoice, A_t, B_t, C_t);
-                const double S2 = S_scale * S_scale;
-                return std::abs(A_t) + std::abs(B_t) * S_scale + std::abs(C_t) * S2;
-            };
-            const double bulk_rate = std::max(bulk_rate_at_T(T_high), bulk_rate_at_T(T_low));
-            // Use a conservative factor; the bulk cubic/quartic nonlinearity can destabilize Euler if dt is too large.
-            const double dt_bulk = (bulk_rate > 0.0) ? (0.02 * gamma / bulk_rate) : std::numeric_limits<double>::infinity();
-
-            double dt_max = std::min(dt_diff, dt_bulk);
-            if (!(dt_max > 0.0) || !std::isfinite(dt_max)) dt_max = dt_diff;
-
-            std::cout << "\nMaximum stable dt estimates:\n"
-                      << "  dt_diff (elastic) ≈ " << dt_diff << " s\n"
-                      << "  dt_diff_total      ≈ " << dt_diff_total << " s" << (use_semi_implicit ? " (before semi-implicit)" : "") << "\n"
-                      << "  dt_bulk (bulk)    ≈ " << dt_bulk << " s\n"
-                      << "  dt_max            = " << dt_max << " s" << std::endl;
-            double dt = cfg_or_prompt<double>(cfg, "dt", "Enter time step dt (s)", dt_max, interactive);
-            if (dt > dt_max) dt = dt_max;
-
-            // Optional numerical guards to detect (and optionally mitigate) the runaway-S / Nyquist checkerboard.
+            // Optional numerical guards to detect runaway-S / Nyquist checkerboard.
+            // IMPORTANT: quench/KZ runs keep dt fixed because the temperature protocol is iteration-driven.
             const bool enable_instability_guard = cfg_or_prompt_yes_no(
                 cfg,
                 "enable_instability_guard",
-                "Enable instability guard? (abort/adjust if S blows up or Nyquist checkerboard grows)",
+                "Enable instability guard? (abort if S blows up or Nyquist checkerboard grows)",
                 true,
                 interactive
             );
-            const bool enable_adaptive_dt = enable_instability_guard && cfg_or_prompt_yes_no(
-                cfg,
-                "enable_adaptive_dt",
-                "Guard: adapt dt downward when instability is detected? (no rollback)",
-                true,
-                interactive
-            );
+            const auto adaptive_dt_cfg_it = cfg.find("enable_adaptive_dt");
+            if (adaptive_dt_cfg_it != cfg.end()) {
+                std::cout << "[Protocol] Ignoring legacy enable_adaptive_dt=" << adaptive_dt_cfg_it->second
+                          << " in quench mode. Kibble-Zurek runs use fixed dt." << std::endl;
+            }
+            std::cout << "[Protocol] Quench/KZ runs enforce fixed dt = " << dt
+                      << " s. Instability handling may abort the run, but it will not change dt." << std::endl;
             const double S_abort = enable_instability_guard
                 ? cfg_or_prompt<double>(cfg, "S_abort", "Guard: abort if max S exceeds", 2.0, interactive)
                 : 0.0;
@@ -2088,17 +2604,17 @@ int main(int argc, char** argv) {
 
             // Optional convergence/early-stop guard (useful when you only care about final aligned state).
             // For a quench/ramp, we only allow early-stop once the protocol has reached the final temperature.
-            // Criterion: relative energy change + relative radiality change between consecutive samples,
-            // optionally combined with an absolute radiality threshold.
+            // Criterion: relative energy change + absolute change in a topology-aware 2D defect proxy.
+            // Radiality remains a diagnostic observable only.
             const bool enable_early_stop = cfg_or_prompt_yes_no(
                 cfg,
                 "enable_early_stop",
-                "Enable early-stop once converged at final T? (rel. ΔF/F + rel. ΔR̄/R̄)",
+                "Enable early-stop once converged at final T? (rel. ΔF/F + abs. Δdefect2D)",
                 false,
                 interactive
             );
             const double radiality_threshold = enable_early_stop
-                ? cfg_or_prompt<double>(cfg, "radiality_threshold", "Radiality threshold (Rbar, 0=disable)", 0.998, interactive)
+                ? cfg_or_prompt<double>(cfg, "radiality_threshold", "Diagnostic-only radiality threshold (Rbar, 0=disable)", 0.998, interactive)
                 : 0.0;
 
             const bool console_output = cfg_or_prompt_yes_no(
@@ -2118,15 +2634,19 @@ int main(int argc, char** argv) {
                 true,
                 interactive
             );
+            const bool track_defects_2d = log_defects_2d || enable_early_stop;
             int defects_z_slice = Nz / 2;
             double defects_S_threshold = 0.1;
             double defects_charge_cutoff = 0.25;
-            if (log_defects_2d) {
+            if (track_defects_2d) {
                 defects_z_slice = cfg_or_prompt<int>(cfg, "defects_z_slice", "Quench: z_slice for 2D proxy (0..Nz-1)", defects_z_slice, interactive);
                 if (defects_z_slice < 0) defects_z_slice = 0;
                 if (defects_z_slice >= Nz) defects_z_slice = Nz - 1;
                 defects_S_threshold = cfg_or_prompt<double>(cfg, "defects_S_threshold", "Quench: S_threshold for 2D proxy", defects_S_threshold, interactive);
                 defects_charge_cutoff = cfg_or_prompt<double>(cfg, "defects_charge_cutoff", "Quench: charge_cutoff |s|>", defects_charge_cutoff, interactive);
+            }
+            if (enable_early_stop) {
+                std::cout << "[Convergence] Quench early-stop uses energy + 2D defect proxy stability; radiality is diagnostic only." << std::endl;
             }
 
             const bool log_xi_grad_2d = cfg_or_prompt_yes_no(
@@ -2144,11 +2664,6 @@ int main(int argc, char** argv) {
                 if (xi_z_slice >= Nz) xi_z_slice = Nz - 1;
                 xi_S_threshold = cfg_or_prompt<double>(cfg, "xi_S_threshold", "Quench: S_threshold for xi proxy", xi_S_threshold, interactive);
             }
-
-            dim3 threads2D(16, 16, 1);
-            dim3 blocks2D((Nx - 1 + threads2D.x - 1) / threads2D.x, (Ny - 1 + threads2D.y - 1) / threads2D.y, 1);
-            dim3 blocksX((Nx - 1 + threads2D.x - 1) / threads2D.x, (Ny + threads2D.y - 1) / threads2D.y, 1);
-            dim3 blocksY((Nx + threads2D.x - 1) / threads2D.x, (Ny - 1 + threads2D.y - 1) / threads2D.y, 1);
 
             std::ofstream quench_log((out_dir / "quench_log.dat").string());
             quench_log << "iteration,time_s,dt_s,T_K,bulk,elastic,anchoring,total,radiality,avg_S,max_S,checker_rel,defect_density_per_plaquette,defect_plaquettes_used,xi_grad_proxy,xi_grad_edges_used\n";
@@ -2169,18 +2684,19 @@ int main(int argc, char** argv) {
                 return (iter >= pre_equil_iters + ramp_iters);
             };
 
-            auto compute_S_shell = [&](double Tcur) -> double {
-                double A_c = 0.0, B_c = 0.0, C_c = 0.0;
-                bulk_ABC_from_convention(a, b, c, Tcur, T_star, modechoice, A_c, B_c, C_c);
-                double S_eq_cur = S_eq_uniaxial_from_ABC(A_c, B_c, C_c);
-                return (S_eq_cur > 0.0) ? S_eq_cur : 0.0;
-            };
+            if (boundary_order_mode == BoundaryOrderMode::Equilibrium) {
+                std::cout << "[Boundary] Quench shell order follows S_eq(T): S_shell(T_high)=" << compute_S_shell(T_high)
+                          << ", S_shell(T_low)=" << compute_S_shell(T_low) << std::endl;
+            } else {
+                std::cout << "[Boundary] Quench shell order fixed at S_shell=" << boundary_S_custom << std::endl;
+            }
 
             double physical_time = 0.0;
             double prev_F_for_stop = std::numeric_limits<double>::quiet_NaN();
-            double prev_R_for_stop = std::numeric_limits<double>::quiet_NaN();
+            double prev_defect_for_stop = std::numeric_limits<double>::quiet_NaN();
             bool kz_entered_window = false;
             int kz_exit_iter = -1;
+            bool quench_aborted_due_to_instability = false;
             for (int iter = 0; iter < total_iters; ++iter) {
                 const double T_current = compute_T_current(iter);
                 DimensionalParams params_q = {a, b, c, T_current, T_star, L1, L2, L3, W};
@@ -2192,8 +2708,7 @@ int main(int argc, char** argv) {
                 if (L3 != 0.0) {
                     computeChemicalPotentialL3Kernel<<<numBlocks, threadsPerBlock>>>(d_Q, d_mu, Nx, Ny, Nz, dx, dy, dz, params_q, d_Dcol_x, d_Dcol_y, d_Dcol_z);
                 }
-                const double shell_thickness = std::min({dx, dy, dz});
-                applyWeakAnchoringPenaltyKernel<<<numBlocks, threadsPerBlock>>>(d_mu, d_Q, Nx, Ny, Nz, d_is_shell, S_shell, W, shell_thickness);
+                applyWeakAnchoringPenaltyKernel<<<numBlocks, threadsPerBlock>>>(d_mu, d_Q, Nx, Ny, Nz, d_is_shell, S_shell, W, shell_effective_thickness);
 
                 if (use_semi_implicit && L_stab > 0.0 && jacobi_iters > 0) {
                     computeRhsSemiImplicitKernel<<<numBlocks, threadsPerBlock>>>(
@@ -2280,61 +2795,14 @@ int main(int argc, char** argv) {
 
                     double defect_density_2d = std::numeric_limits<double>::quiet_NaN();
                     unsigned int defect_plaq_used = 0u;
-                    if (do_log && log_defects_2d) {
-                        cudaMemset(d_defects_2d_count, 0, sizeof(unsigned int));
-                        cudaMemset(d_defects_2d_plaq_used, 0, sizeof(unsigned int));
-                        computeDefectDensity2DProxyKernel<<<blocks2D, threads2D>>>(
-                            d_Q,
-                            Nx,
-                            Ny,
-                            Nz,
-                            defects_z_slice,
-                            defects_S_threshold,
-                            defects_charge_cutoff,
-                            d_defects_2d_count,
-                            d_defects_2d_plaq_used
-                        );
-                        unsigned int defect_count = 0u;
-                        cudaMemcpy(&defect_count, d_defects_2d_count, sizeof(unsigned int), cudaMemcpyDeviceToHost);
-                        cudaMemcpy(&defect_plaq_used, d_defects_2d_plaq_used, sizeof(unsigned int), cudaMemcpyDeviceToHost);
-                        defect_density_2d = (defect_plaq_used > 0u) ? (double(defect_count) / double(defect_plaq_used)) : 0.0;
+                    if (do_log && track_defects_2d) {
+                        compute_defect_density_2d(defects_z_slice, defects_S_threshold, defects_charge_cutoff, defect_density_2d, defect_plaq_used);
                     }
 
                     double xi_grad_proxy = std::numeric_limits<double>::quiet_NaN();
                     unsigned int xi_grad_edges_used = 0u;
                     if (do_log && log_xi_grad_2d) {
-                        cudaMemset(d_xi_grad_sum, 0, sizeof(double));
-                        cudaMemset(d_xi_grad_edges_used, 0, sizeof(unsigned int));
-                        computeXiGradEdgesXKernel<<<blocksX, threads2D>>>(
-                            d_Q,
-                            Nx,
-                            Ny,
-                            Nz,
-                            xi_z_slice,
-                            xi_S_threshold,
-                            d_xi_grad_sum,
-                            d_xi_grad_edges_used
-                        );
-                        computeXiGradEdgesYKernel<<<blocksY, threads2D>>>(
-                            d_Q,
-                            Nx,
-                            Ny,
-                            Nz,
-                            xi_z_slice,
-                            xi_S_threshold,
-                            d_xi_grad_sum,
-                            d_xi_grad_edges_used
-                        );
-                        double sum_sq = 0.0;
-                        cudaMemcpy(&sum_sq, d_xi_grad_sum, sizeof(double), cudaMemcpyDeviceToHost);
-                        cudaMemcpy(&xi_grad_edges_used, d_xi_grad_edges_used, sizeof(unsigned int), cudaMemcpyDeviceToHost);
-                        if (xi_grad_edges_used > 0u) {
-                            const double mean_sq = sum_sq / double(xi_grad_edges_used);
-                            const double eps = 1e-30;
-                            const double inv = (mean_sq > 0.0) ? (1.0 / sqrt(mean_sq + eps)) : (1.0 / sqrt(eps));
-                            const double xi_cap = 0.5 * double(std::min(Nx, Ny));
-                            xi_grad_proxy = std::min(inv, xi_cap);
-                        }
+                        compute_xi_grad_proxy_2d(xi_z_slice, xi_S_threshold, xi_grad_proxy, xi_grad_edges_used);
                     }
 
                     NematicField* d_nf;
@@ -2351,17 +2819,14 @@ int main(int argc, char** argv) {
                     double max_S = 0.0;
                     double checker_rel = std::numeric_limits<double>::quiet_NaN();
                     {
-                        const double cx_l = Nx / 2.0, cy_l = Ny / 2.0, cz_l = Nz / 2.0;
-                        const double R_l = std::min({ (double)Nx, (double)Ny, (double)Nz }) / 2.0;
-                        const double shell_exclude = 2.0;
+                        const double shell_exclude = 2.0 * droplet_geometry.min_spacing;
 
                         // max_S in interior
                         for (int i = 0; i < Nx; ++i) {
                             for (int j = 0; j < Ny; ++j) {
                                 for (int k = 0; k < Nz; ++k) {
-                                    const double x = i - cx_l, y = j - cy_l, z = k - cz_l;
-                                    const double r = std::sqrt(x * x + y * y + z * z);
-                                    if (r < (R_l - shell_exclude)) {
+                                    const DropletGeometryPoint point = sampleDropletGeometry(droplet_geometry, i, j, k);
+                                    if (point.signed_distance < -shell_exclude) {
                                         const size_t id = (size_t)k + (size_t)Nz * ((size_t)j + (size_t)Ny * (size_t)i);
                                         const double s = h_nf[id].S;
                                         if (std::isfinite(s)) max_S = std::max(max_S, s);
@@ -2383,9 +2848,8 @@ int main(int argc, char** argv) {
                             for (int i = 0; i < Nx; ++i) {
                                 for (int j = 0; j < Ny; ++j) {
                                     const int k = z_check;
-                                    const double x = i - cx_l, y = j - cy_l, z = k - cz_l;
-                                    const double r = std::sqrt(x * x + y * y + z * z);
-                                    if (r >= (R_l - shell_exclude)) continue;
+                                    const DropletGeometryPoint point = sampleDropletGeometry(droplet_geometry, i, j, k);
+                                    if (point.signed_distance >= -shell_exclude) continue;
                                     const size_t id = (size_t)k + (size_t)Nz * ((size_t)j + (size_t)Ny * (size_t)i);
                                     const double s = h_nf[id].S;
                                     if (!std::isfinite(s) || s <= S_thr) continue;
@@ -2422,43 +2886,36 @@ int main(int argc, char** argv) {
                                 std::cerr << "\n[InstabilityGuard] Detected runaway/aliasing at iter " << iter
                                           << ": max_S=" << max_S << ", checker_rel=" << checker_rel
                                           << ". dt=" << dt << " s" << std::endl;
-                                if (enable_adaptive_dt && dt > 0.0) {
-                                    const double dt_new = std::max(dt * 0.5, 1e-18);
-                                    if (dt_new < dt) {
-                                        std::cerr << "[InstabilityGuard] Reducing dt -> " << dt_new
-                                                  << " (no rollback; continuing)" << std::endl;
-                                        dt = dt_new;
-                                    }
-                                } else {
-                                    std::cerr << "[InstabilityGuard] Aborting to avoid corrupt final state."
-                                              << " Try smaller dt or disable L2/L3." << std::endl;
-                                    break;
-                                }
+                                std::cerr << "[InstabilityGuard] Quench/KZ contract requires fixed dt."
+                                          << " Aborting instead of changing dt."
+                                          << " Try smaller dt, stronger stabilization, or milder elastic settings." << std::endl;
+                                quench_aborted_due_to_instability = true;
+                                break;
                             }
                         }
 
                         if (enable_early_stop && has_reached_final_T(iter)) {
                             bool energy_converged = false;
-                            bool radiality_converged = false;
+                            bool defect_converged = false;
 
                             if (std::isfinite(prev_F_for_stop) && prev_F_for_stop != 0.0) {
                                 const double rel_dF = std::abs((total_F - prev_F_for_stop) / prev_F_for_stop);
                                 energy_converged = rel_dF < tolerance;
                             }
-                            if (std::isfinite(prev_R_for_stop) && prev_R_for_stop != 0.0) {
-                                const double rel_dR = std::abs((avg_rad - prev_R_for_stop) / prev_R_for_stop);
-                                radiality_converged = rel_dR < RbEps;
-                            }
+                            defect_converged = defect_density_converged(prev_defect_for_stop, defect_density_2d, defect_plaq_used);
 
-                            const bool radially_aligned = (radiality_threshold <= 0.0) ? true : (avg_rad > radiality_threshold);
-                            if (energy_converged && radiality_converged && radially_aligned) {
-                                std::cout << "\n=== Early-stop: converged at final T ===\n";
+                            const bool radiality_threshold_met = (radiality_threshold <= 0.0) ? true : (avg_rad > radiality_threshold);
+                            if (energy_converged && defect_converged) {
+                                std::cout << "\n=== Early-stop: converged at final T (energy + defect proxy stable; Rbar="
+                                          << avg_rad << ", defect2D=" << defect_density_2d
+                                          << ", radiality_threshold_met=" << (radiality_threshold_met ? "yes" : "no")
+                                          << ") ===\n";
                                 break;
                             }
 
                             // Update references for the *next* convergence check.
                             prev_F_for_stop = total_F;
-                            prev_R_for_stop = avg_rad;
+                            prev_defect_for_stop = (defect_plaq_used > 0u) ? defect_density_2d : std::numeric_limits<double>::quiet_NaN();
                         }
                     }
 
@@ -2492,6 +2949,13 @@ int main(int argc, char** argv) {
                         }
                     }
                 }
+            }
+
+            if (quench_aborted_due_to_instability) {
+                quench_log.close();
+                std::cerr << "[Quench] Run aborted by the fixed-dt instability guard."
+                          << " Final state was not saved." << std::endl;
+                return 1;
             }
 
             // Final save
@@ -2546,49 +3010,39 @@ int main(int argc, char** argv) {
 
             if (mode == 2) {
                 double noise_amplitude = cfg_or_prompt<double>(cfg, "noise_amplitude", "Noise amplitude for isotropic init", 1e-3, interactive);
-                initializeIsotropicWithNoise(h_Q, Nx, Ny, Nz, noise_amplitude);
+                initializeIsotropicWithNoise(h_Q, Nx, Ny, Nz, noise_amplitude, droplet_geometry, random_seed);
             } else {
-                initializeQTensor(h_Q, Nx, Ny, Nz, S0, mode);
+                initializeQTensor(h_Q, Nx, Ny, Nz, S0, mode, droplet_geometry, random_seed);
             }
             cudaMemcpy(d_Q, h_Q.data(), size_Q, cudaMemcpyHostToDevice);
 
-            double min_dx = std::min({ dx, dy, dz });
-            // dt_max estimate: use an effective elastic scale even if L1<=0 or L3 dominates.
-            double S_scale = std::isfinite(S_ref_used) ? std::abs(S_ref_used) : std::max({std::abs(S0), std::abs(S_eq), 0.5});
-            if (!(S_scale > 0.0)) S_scale = 0.5;
-            double L_eff = 0.0;
-            if (L1 != 0.0 || L2 != 0.0 || L3 != 0.0) {
-                L_eff = std::max({std::abs(L1), std::abs(L1 + L2), std::abs(L3) * S_scale});
-            } else {
-                L_eff = std::abs(kappa);
-            }
-            if (!(L_eff > 0.0)) L_eff = 1e-12;
-            double D = L_eff / gamma; if(D==0) D=1e-12;
-            const double dt_diff = 0.5 * (min_dx * min_dx) / (6.0 * D);
+            DtEstimateRequest dt_request;
+            dt_request.dx = dx;
+            dt_request.dy = dy;
+            dt_request.dz = dz;
+            dt_request.gamma = gamma;
+            dt_request.a = a;
+            dt_request.b = b;
+            dt_request.c = c;
+            dt_request.T_star = T_star;
+            dt_request.modechoice = modechoice;
+            dt_request.kappa = kappa;
+            dt_request.L1 = L1;
+            dt_request.L2 = L2;
+            dt_request.L3 = L3;
+            dt_request.S_ref_used = S_ref_used;
+            dt_request.S0 = S0;
+            dt_request.T_a = T_start;
+            dt_request.T_b = T_end;
+            const DtEstimateResult dt_estimate = estimate_stable_dt_window(dt_request);
+            print_dt_estimate_summary(dt_estimate);
 
-            auto bulk_rate_at_T = [&](double Tval) -> double {
-                double A_dt = 0.0, B_dt = 0.0, C_dt = 0.0;
-                bulk_ABC_from_convention(a, b, c, Tval, T_star, modechoice, A_dt, B_dt, C_dt);
-                return std::abs(A_dt) + std::abs(B_dt) * S_scale + std::abs(C_dt) * S_scale * S_scale;
-            };
-            const double bulk_rate = std::max(bulk_rate_at_T(T_start), bulk_rate_at_T(T_end));
-            const double dt_bulk = (bulk_rate > 0.0)
-                ? (0.1 * gamma / bulk_rate)
-                : std::numeric_limits<double>::infinity();
-
-            double dt_max = std::min(dt_diff, dt_bulk);
-            if (!(dt_max > 0.0) || !std::isfinite(dt_max)) dt_max = dt_diff;
-
-            std::cout << "\nMaximum stable dt estimates:\n"
-                      << "  dt_diff (elastic) ≈ " << dt_diff << " s\n"
-                      << "  dt_bulk (bulk)    ≈ " << dt_bulk << " s\n"
-                      << "  dt_max            = " << dt_max << " s" << std::endl;
-            double dt = cfg_or_prompt<double>(cfg, "dt", "Enter time step dt (s)", dt_max, interactive);
-            if (dt > dt_max) dt = dt_max;
+            double dt = cfg_or_prompt<double>(cfg, "dt", "Enter time step dt (s)", dt_estimate.dt_max, interactive);
+            if (dt > dt_estimate.dt_max) dt = dt_estimate.dt_max;
 
             // Simple physical-time floor to reduce "premature convergence" in the sweep.
-            double R_phys = (std::min({(double)Nx, (double)Ny, (double)Nz}) / 2.0) * min_dx;
-            double tau_align = (R_phys * R_phys) / D;
+            double R_phys = droplet_geometry.min_radius;
+            double tau_align = (R_phys * R_phys) / dt_estimate.D_total;
             double min_alignment_time = 0.25 * tau_align;
             std::cout << "Estimated alignment time τ_align ≈ " << tau_align << " s"
                       << ", enforcing minimum sweep time ≈ " << min_alignment_time << " s" << std::endl;
@@ -2599,13 +3053,11 @@ int main(int argc, char** argv) {
             };
 
             for (double T_current = T_start; !sweep_done(T_current); T_current += T_step) {
-                std::cout << "\n--- Running simulation for T = " << T_current << " K ---\n"; 
+                const double S_shell = compute_S_shell(T_current);
+                std::cout << "\n--- Running simulation for T = " << T_current << " K"
+                          << " with S_shell = " << S_shell
+                          << " (" << boundary_order_mode_name(boundary_order_mode) << ") ---\n";
                 DimensionalParams params_temp = {a, b, c, T_current, T_star, L1, L2, L3, W};
-
-                double A_s = 0.0, B_s = 0.0, C_s = 0.0;
-                bulk_ABC_from_convention(a, b, c, T_current, T_star, modechoice, A_s, B_s, C_s);
-                double S_eq_sweep = S_eq_uniaxial_from_ABC(A_s, B_s, C_s);
-                double S_shell = S_eq_sweep;
 
                 std::string temp_dir = "output_temp_sweep/T_" + std::to_string(T_current);
                 fs::create_directory(temp_dir);
@@ -2619,8 +3071,7 @@ int main(int argc, char** argv) {
                     if (L3 != 0.0) {
                         computeChemicalPotentialL3Kernel<<<numBlocks, threadsPerBlock>>>(d_Q, d_mu, Nx, Ny, Nz, dx, dy, dz, params_temp, d_Dcol_x, d_Dcol_y, d_Dcol_z);
                     }
-                    const double shell_thickness = std::min({dx, dy, dz});
-                    applyWeakAnchoringPenaltyKernel<<<numBlocks, threadsPerBlock>>>(d_mu, d_Q, Nx, Ny, Nz, d_is_shell, S_shell, W, shell_thickness);
+                    applyWeakAnchoringPenaltyKernel<<<numBlocks, threadsPerBlock>>>(d_mu, d_Q, Nx, Ny, Nz, d_is_shell, S_shell, W, shell_effective_thickness);
                     updateQTensorKernel<<<numBlocks, threadsPerBlock>>>(d_Q, d_mu, Nx, Ny, Nz, dt, d_is_shell, gamma, W, 0.0);
                     applyBoundaryConditionsKernel<<<numBlocks, threadsPerBlock>>>(d_Q, Nx, Ny, Nz, d_is_shell, S_shell, W);
 
@@ -2670,55 +3121,49 @@ int main(int argc, char** argv) {
             fs::create_directory("output");
 
             DimensionalParams params = {a, b, c, T, T_star, L1, L2, L3, W};
-            double min_dx = std::min({ dx, dy, dz });
-            // dt_max estimate: use an effective elastic scale even if L1<=0 or L3 dominates.
-            double S_scale = std::isfinite(S_ref_used) ? std::abs(S_ref_used) : std::max({std::abs(S0), std::abs(S_eq), 0.5});
-            if (!(S_scale > 0.0)) S_scale = 0.5;
-            double L_eff = 0.0;
-            if (L1 != 0.0 || L2 != 0.0 || L3 != 0.0) {
-                L_eff = std::max({std::abs(L1), std::abs(L1 + L2), std::abs(L3) * S_scale});
-            } else {
-                L_eff = std::abs(kappa);
-            }
-            if (!(L_eff > 0.0)) L_eff = 1e-12;
-            double D = L_eff / gamma; if(D==0) D=1e-12;
-            const double dt_diff = 0.5 * (min_dx * min_dx) / (6.0 * D);
 
-            // Bulk-driven dt cap (single temperature)
-            double A_dt = 0.0, B_dt = 0.0, C_dt = 0.0;
-            bulk_ABC_from_convention(a, b, c, T, T_star, modechoice, A_dt, B_dt, C_dt);
-            const double bulk_rate = std::abs(A_dt) + std::abs(B_dt) * S_scale + std::abs(C_dt) * S_scale * S_scale;
-            const double dt_bulk = (bulk_rate > 0.0) ? (0.1 * gamma / bulk_rate) : std::numeric_limits<double>::infinity();
+            DtEstimateRequest dt_request;
+            dt_request.dx = dx;
+            dt_request.dy = dy;
+            dt_request.dz = dz;
+            dt_request.gamma = gamma;
+            dt_request.a = a;
+            dt_request.b = b;
+            dt_request.c = c;
+            dt_request.T_star = T_star;
+            dt_request.modechoice = modechoice;
+            dt_request.kappa = kappa;
+            dt_request.L1 = L1;
+            dt_request.L2 = L2;
+            dt_request.L3 = L3;
+            dt_request.S_ref_used = S_ref_used;
+            dt_request.S0 = S0;
+            dt_request.T_a = T;
+            dt_request.T_b = T;
+            const DtEstimateResult dt_estimate = estimate_stable_dt_window(dt_request);
 
-            double dt_max = std::min(dt_diff, dt_bulk);
-            if (!(dt_max > 0.0) || !std::isfinite(dt_max)) dt_max = dt_diff;
-
-            double R_phys = (std::min({(double)Nx, (double)Ny, (double)Nz}) / 2.0) * min_dx;
-            double tau_align = (R_phys * R_phys) / D;
+            double R_phys = droplet_geometry.min_radius;
+            double tau_align = (R_phys * R_phys) / dt_estimate.D_total;
             std::cout << "\n--- Time Scale Analysis ---" << std::endl;
-            std::cout << "Diffusion coefficient D = " << D << " m²/s" << std::endl;
+            std::cout << "Diffusion coefficient D = " << dt_estimate.D_total << " m²/s" << std::endl;
             std::cout << "Droplet radius R ≈ " << R_phys << " m" << std::endl;
             std::cout << "Estimated alignment time τ_align ≈ " << tau_align << " s" << std::endl;
-            std::cout << "Maximum stable dt estimates:" << std::endl;
-            std::cout << "  dt_diff (elastic) ≈ " << dt_diff << " s" << std::endl;
-            std::cout << "  dt_bulk (bulk)    ≈ " << dt_bulk << " s" << std::endl;
-            std::cout << "  dt_max            = " << dt_max << " s" << std::endl;
+            print_dt_estimate_summary(dt_estimate);
 
-            double dt = cfg_or_prompt<double>(cfg, "dt", "Enter time step dt (s)", dt_max, interactive);
-            if (dt > dt_max) dt = dt_max;
+            double dt = cfg_or_prompt<double>(cfg, "dt", "Enter time step dt (s)", dt_estimate.dt_max, interactive);
+            if (dt > dt_estimate.dt_max) dt = dt_estimate.dt_max;
 
             if (mode == 2) {
                 double noise_amplitude = cfg_or_prompt<double>(cfg, "noise_amplitude", "Noise amplitude for isotropic init", 1e-3, interactive);
-                initializeIsotropicWithNoise(h_Q, Nx, Ny, Nz, noise_amplitude);
+                initializeIsotropicWithNoise(h_Q, Nx, Ny, Nz, noise_amplitude, droplet_geometry, random_seed);
             } else {
-                initializeQTensor(h_Q, Nx, Ny, Nz, S0, mode);
+                initializeQTensor(h_Q, Nx, Ny, Nz, S0, mode, droplet_geometry, random_seed);
             }
             cudaMemcpy(d_Q, h_Q.data(), size_Q, cudaMemcpyHostToDevice);
 
-            // Boundary amplitude used for anchoring in single-temp mode.
-            // If the bulk equilibrium is isotropic at this T, set S_shell=0 so the shell does not
-            // artificially enforce nematic order above the I-N transition.
-            const double S_shell_single = (S_eq > 0.0) ? S0 : 0.0;
+            const double S_shell_single = compute_S_shell(T);
+            std::cout << "[Boundary] Single-temp shell order at T=" << T << " K: S_shell=" << S_shell_single
+                      << " (" << boundary_order_mode_name(boundary_order_mode) << " policy)." << std::endl;
 
             const bool console_output_single = cfg_or_prompt_yes_no(
                 cfg,
@@ -2730,14 +3175,35 @@ int main(int argc, char** argv) {
             char user_choice = console_output_single ? 'y' : 'n';
 
             double prev_F = std::numeric_limits<double>::max();
-            double prev_R = std::numeric_limits<double>::quiet_NaN();
+            double prev_defect = std::numeric_limits<double>::quiet_NaN();
             double physical_time = 0.0;
             double radiality_threshold = 0.998;
             double min_alignment_time = 0.5 * tau_align;
+            int defects_z_slice_single = cfg_or_prompt<int>(cfg, "defects_z_slice", "Single-temp: z_slice for 2D defect proxy (0..Nz-1)", Nz / 2, interactive);
+            if (defects_z_slice_single < 0) defects_z_slice_single = 0;
+            if (defects_z_slice_single >= Nz) defects_z_slice_single = Nz - 1;
+            double defects_S_threshold_single = cfg_or_prompt<double>(cfg, "defects_S_threshold", "Single-temp: S_threshold for 2D defect proxy", 0.1, interactive);
+            double defects_charge_cutoff_single = cfg_or_prompt<double>(cfg, "defects_charge_cutoff", "Single-temp: charge_cutoff |s|>", 0.25, interactive);
+            const bool log_xi_grad_2d_single = cfg_or_prompt_yes_no(
+                cfg,
+                "log_xi_grad_2d",
+                "Single-temp: log 2D xi gradient proxy to iteration log?",
+                true,
+                interactive
+            );
+            int xi_z_slice_single = defects_z_slice_single;
+            double xi_S_threshold_single = defects_S_threshold_single;
+            if (log_xi_grad_2d_single) {
+                xi_z_slice_single = cfg_or_prompt<int>(cfg, "xi_z_slice", "Single-temp: z_slice for xi proxy (0..Nz-1)", xi_z_slice_single, interactive);
+                if (xi_z_slice_single < 0) xi_z_slice_single = 0;
+                if (xi_z_slice_single >= Nz) xi_z_slice_single = Nz - 1;
+                xi_S_threshold_single = cfg_or_prompt<double>(cfg, "xi_S_threshold", "Single-temp: S_threshold for xi proxy", xi_S_threshold_single, interactive);
+            }
+            std::cout << "[Convergence] Single-temp stopping uses energy + 2D defect proxy stability; radiality is diagnostic only." << std::endl;
 
             if (submode == 1) {
                 std::ofstream energy_log("free_energy_vs_iteration.dat");
-                energy_log << "iteration,free_energy,radiality,time\n";
+                energy_log << "iteration,bulk,elastic,anchoring,total,radiality,time,avg_S,max_S,defect_density_per_plaquette,defect_plaquettes_used,xi_grad_proxy,xi_grad_edges_used\n";
 
                 for (int iter = 0; iter < maxIterations; ++iter) {
                     physical_time += dt;
@@ -2752,8 +3218,7 @@ int main(int argc, char** argv) {
                         computeChemicalPotentialL3Kernel<<<numBlocks, threadsPerBlock>>>(d_Q, d_mu, Nx, Ny, Nz, dx, dy, dz, params, d_Dcol_x, d_Dcol_y, d_Dcol_z);
                         if (check_now) cuda_check_or_die("computeChemicalPotentialL3Kernel");
                     }
-                    const double shell_thickness = std::min({dx, dy, dz});
-                    applyWeakAnchoringPenaltyKernel<<<numBlocks, threadsPerBlock>>>(d_mu, d_Q, Nx, Ny, Nz, d_is_shell, S_shell_single, W, shell_thickness);
+                    applyWeakAnchoringPenaltyKernel<<<numBlocks, threadsPerBlock>>>(d_mu, d_Q, Nx, Ny, Nz, d_is_shell, S_shell_single, W, shell_effective_thickness);
                     if (check_now) cuda_check_or_die("applyWeakAnchoringPenaltyKernel");
                     updateQTensorKernel<<<numBlocks, threadsPerBlock>>>(d_Q, d_mu, Nx, Ny, Nz, dt, d_is_shell, gamma, W, 0.0);
                     if (check_now) cuda_check_or_die("updateQTensorKernel");
@@ -2777,12 +3242,14 @@ int main(int argc, char** argv) {
                             rad_count += h_count[ii];
                         }
                         double avg_rad = (rad_count > 0) ? total_rad / rad_count : 0.0;
+                        double defect_density_2d = std::numeric_limits<double>::quiet_NaN();
+                        unsigned int defect_plaq_used = 0u;
+                        compute_defect_density_2d(defects_z_slice_single, defects_S_threshold_single, defects_charge_cutoff_single, defect_density_2d, defect_plaq_used);
 
-                        energy_log << iter << "," << total_F << "," << avg_rad << "," << physical_time << "\n";
-                        if (user_choice == 'y' || user_choice == 'Y') {
-                            std::cout << "Iter " << iter << "  t=" << physical_time << " s" << "  F=" << total_F
-                                      << " (bulk=" << bulk_sum << ", el=" << elastic_sum << ", anch=" << anch_sum
-                                      << ")  R̄=" << avg_rad << std::endl;
+                        double xi_grad_proxy = std::numeric_limits<double>::quiet_NaN();
+                        unsigned int xi_grad_edges_used = 0u;
+                        if (log_xi_grad_2d_single) {
+                            compute_xi_grad_proxy_2d(xi_z_slice_single, xi_S_threshold_single, xi_grad_proxy, xi_grad_edges_used);
                         }
 
                         if (debug_dynamics) {
@@ -2825,31 +3292,43 @@ int main(int argc, char** argv) {
                         std::vector<NematicField> h_nf(num_elements);
                         cudaMemcpy(h_nf.data(), d_nf, num_elements * sizeof(NematicField), cudaMemcpyDeviceToHost);
                         cudaFree(d_nf);
+                        const double avg_S = compute_avg_S_droplet(h_nf);
+                        const double max_S = compute_max_S_droplet(h_nf);
+                        energy_log << iter << "," << bulk_sum << "," << elastic_sum << "," << anch_sum
+                                   << "," << total_F << "," << avg_rad << "," << physical_time
+                                   << "," << avg_S << "," << max_S
+                                   << "," << defect_density_2d << "," << defect_plaq_used
+                                   << "," << xi_grad_proxy << "," << xi_grad_edges_used << "\n";
+                        if (user_choice == 'y' || user_choice == 'Y') {
+                            std::cout << "Iter " << iter << "  t=" << physical_time << " s" << "  F=" << total_F
+                                      << " (bulk=" << bulk_sum << ", el=" << elastic_sum << ", anch=" << anch_sum
+                                      << ")  R̄=" << avg_rad << "  <S>=" << avg_S << "  maxS=" << max_S
+                                      << "  defect2D=" << defect_density_2d << "  xiGrad=" << xi_grad_proxy << std::endl;
+                        }
                         saveNematicFieldToFile(h_nf, Nx, Ny, Nz, "output/nematic_field_iter_" + std::to_string(iter) + ".dat");
 
                         if (iter > 100 && prev_F != 0.0) {
                             double energy_change = std::abs((total_F - prev_F) / prev_F);
                             bool energy_converged = energy_change < tolerance;
-                            bool radially_aligned = avg_rad > radiality_threshold;
                             bool time_sufficient = physical_time > min_alignment_time;
-                            bool radiality_converged = false;
-                            if (std::isfinite(prev_R) && prev_R != 0.0) {
-                                double rad_change = std::abs((avg_rad - prev_R) / prev_R);
-                                radiality_converged = rad_change < RbEps;
-                            }
-                            if (energy_converged && radiality_converged && radially_aligned && time_sufficient) {
-                                std::cout << "\n=== Convergence Achieved ===";
+                            bool defect_converged = defect_density_converged(prev_defect, defect_density_2d, defect_plaq_used);
+                            const bool radiality_threshold_met = avg_rad > radiality_threshold;
+                            if (energy_converged && defect_converged && time_sufficient) {
+                                std::cout << "\n=== Convergence Achieved (energy + defect proxy stable; Rbar="
+                                          << avg_rad << ", defect2D=" << defect_density_2d
+                                          << ", radiality_threshold_met=" << (radiality_threshold_met ? "yes" : "no")
+                                          << ") ===";
                                 break;
                             }
                         }
                         prev_F = total_F;
-                        prev_R = avg_rad;
+                        prev_defect = (defect_plaq_used > 0u) ? defect_density_2d : std::numeric_limits<double>::quiet_NaN();
                     }
                 }
                 energy_log.close();
             } else {
                 std::ofstream energy_components_log("energy_components_vs_iteration.dat");
-                energy_components_log << "iteration,bulk,elastic,anchoring,total,radiality,time\n";
+                energy_components_log << "iteration,bulk,elastic,anchoring,total,radiality,time,avg_S,max_S,defect_density_per_plaquette,defect_plaquettes_used,xi_grad_proxy,xi_grad_edges_used\n";
 
                 for (int iter = 0; iter < maxIterations; ++iter) {
                     physical_time += dt;
@@ -2864,8 +3343,7 @@ int main(int argc, char** argv) {
                         computeChemicalPotentialL3Kernel<<<numBlocks, threadsPerBlock>>>(d_Q, d_mu, Nx, Ny, Nz, dx, dy, dz, params, d_Dcol_x, d_Dcol_y, d_Dcol_z);
                         if (check_now) cuda_check_or_die("computeChemicalPotentialL3Kernel");
                     }
-                    const double shell_thickness = std::min({dx, dy, dz});
-                    applyWeakAnchoringPenaltyKernel<<<numBlocks, threadsPerBlock>>>(d_mu, d_Q, Nx, Ny, Nz, d_is_shell, S_shell_single, W, shell_thickness);
+                    applyWeakAnchoringPenaltyKernel<<<numBlocks, threadsPerBlock>>>(d_mu, d_Q, Nx, Ny, Nz, d_is_shell, S_shell_single, W, shell_effective_thickness);
                     if (check_now) cuda_check_or_die("applyWeakAnchoringPenaltyKernel");
                     updateQTensorKernel<<<numBlocks, threadsPerBlock>>>(d_Q, d_mu, Nx, Ny, Nz, dt, d_is_shell, gamma, W, 0.0);
                     if (check_now) cuda_check_or_die("updateQTensorKernel");
@@ -2889,13 +3367,14 @@ int main(int argc, char** argv) {
                             rad_count += h_count[ii];
                         }
                         double avg_rad = (rad_count > 0) ? total_rad / rad_count : 0.0;
+                        double defect_density_2d = std::numeric_limits<double>::quiet_NaN();
+                        unsigned int defect_plaq_used = 0u;
+                        compute_defect_density_2d(defects_z_slice_single, defects_S_threshold_single, defects_charge_cutoff_single, defect_density_2d, defect_plaq_used);
 
-                        energy_components_log << iter << "," << bulk_sum << "," << elastic_sum << "," << anch_sum
-                                             << "," << total_F << "," << avg_rad << "," << physical_time << "\n";
-                        if (user_choice == 'y' || user_choice == 'Y') {
-                            std::cout << "Iter " << iter << "  t=" << physical_time << " s" << "  F=" << total_F
-                                      << " (bulk=" << bulk_sum << ", el=" << elastic_sum << ", anch=" << anch_sum
-                                      << ")  R̄=" << avg_rad << std::endl;
+                        double xi_grad_proxy = std::numeric_limits<double>::quiet_NaN();
+                        unsigned int xi_grad_edges_used = 0u;
+                        if (log_xi_grad_2d_single) {
+                            compute_xi_grad_proxy_2d(xi_z_slice_single, xi_S_threshold_single, xi_grad_proxy, xi_grad_edges_used);
                         }
 
                         if (debug_dynamics) {
@@ -2938,23 +3417,36 @@ int main(int argc, char** argv) {
                         std::vector<NematicField> h_nf(num_elements);
                         cudaMemcpy(h_nf.data(), d_nf, num_elements * sizeof(NematicField), cudaMemcpyDeviceToHost);
                         cudaFree(d_nf);
+                        const double avg_S = compute_avg_S_droplet(h_nf);
+                        const double max_S = compute_max_S_droplet(h_nf);
+                        energy_components_log << iter << "," << bulk_sum << "," << elastic_sum << "," << anch_sum
+                                             << "," << total_F << "," << avg_rad << "," << physical_time
+                                             << "," << avg_S << "," << max_S
+                                             << "," << defect_density_2d << "," << defect_plaq_used
+                                             << "," << xi_grad_proxy << "," << xi_grad_edges_used << "\n";
+                        if (user_choice == 'y' || user_choice == 'Y') {
+                            std::cout << "Iter " << iter << "  t=" << physical_time << " s" << "  F=" << total_F
+                                      << " (bulk=" << bulk_sum << ", el=" << elastic_sum << ", anch=" << anch_sum
+                                      << ")  R̄=" << avg_rad << "  <S>=" << avg_S << "  maxS=" << max_S
+                                      << "  defect2D=" << defect_density_2d << "  xiGrad=" << xi_grad_proxy << std::endl;
+                        }
                         saveNematicFieldToFile(h_nf, Nx, Ny, Nz, "output/nematic_field_iter_" + std::to_string(iter) + ".dat");
 
                         if (iter > 100 && prev_F != 0.0) {
                             double energy_change = std::abs((total_F - prev_F) / prev_F);
                             bool energy_converged = energy_change < tolerance;
-                            bool radiality_converged = false;
-                            if (std::isfinite(prev_R) && prev_R != 0.0) {
-                                double rad_change = std::abs((avg_rad - prev_R) / prev_R);
-                                radiality_converged = rad_change < RbEps;
-                            }
-                            if (energy_converged && radiality_converged && avg_rad > radiality_threshold && physical_time > min_alignment_time) {
-                                std::cout << "\n=== Convergence Achieved ===";
+                            bool defect_converged = defect_density_converged(prev_defect, defect_density_2d, defect_plaq_used);
+                            const bool radiality_threshold_met = avg_rad > radiality_threshold;
+                            if (energy_converged && defect_converged && physical_time > min_alignment_time) {
+                                std::cout << "\n=== Convergence Achieved (energy + defect proxy stable; Rbar="
+                                          << avg_rad << ", defect2D=" << defect_density_2d
+                                          << ", radiality_threshold_met=" << (radiality_threshold_met ? "yes" : "no")
+                                          << ") ===";
                                 break;
                             }
                         }
                         prev_F = total_F;
-                        prev_R = avg_rad;
+                        prev_defect = (defect_plaq_used > 0u) ? defect_density_2d : std::numeric_limits<double>::quiet_NaN();
                     }
                 }
                 energy_components_log.close();

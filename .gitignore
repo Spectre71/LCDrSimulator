@@ -1,6 +1,8 @@
 pics
+validation
 venv
 x64
+literature
 conf*
 out*
 frames*
@@ -9,6 +11,7 @@ frames*
 *.vcxproj*
 *.user
 .vs*
+.github
 QSR_*
 GEMINI.md
 __pycache__
