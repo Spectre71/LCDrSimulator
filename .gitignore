@@ -12,6 +12,7 @@ frames*
 *.user
 .vs*
 .github
+.gui*
 QSR_*
 GEMINI.md
 README.md
