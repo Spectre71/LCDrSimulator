@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any
 
 from tool_catalog import QSRToolSpec, QSR_TOOL_SPECS, QSR_TOOL_SPECS_BY_KEY
+from version_catalog import COMPONENT_VERSIONS, GUI_VERSION
 
 try:
 	import tkinter as tk
@@ -50,6 +51,19 @@ class FieldSpec:
 	kind: str  # 'float'|'int'|'str'|'tri_bool'|'choice'
 	choices: list[str] | None = None
 	help_text: str | None = None
+
+
+@dataclass(frozen=True)
+class FormSection:
+	title: str
+	spec_keys: tuple[str, ...]
+	description: str | None = None
+
+
+@dataclass(frozen=True)
+class FormTab:
+	title: str
+	sections: tuple[FormSection, ...]
 
 
 def _join_lines(*parts: str) -> str:
@@ -127,7 +141,7 @@ def _parse_kv_config(text: str) -> dict[str, str]:
 class QSRGui(tk.Tk):
 	def __init__(self) -> None:
 		super().__init__()
-		self.title("QSR GUI")
+		self.title(f"QSR GUI v{GUI_VERSION}")
 		self.geometry("1100x750")
 
 		self.backend_path = tk.StringVar(value=str(_default_backend_path()))
@@ -139,13 +153,18 @@ class QSRGui(tk.Tk):
 		self._reader_thread: threading.Thread | None = None
 		self._log_queue: queue.Queue[str] = queue.Queue()
 		self._info_visible: dict[str, bool] = {}
+		self._form_section_widgets: dict[str, ttk.LabelFrame] = {}
+		self._field_row_widgets: dict[str, ttk.Frame] = {}
 
 		# Plot tab state
 		self.plot_source = tk.StringVar(value="")
 		self.plot_mode = tk.StringVar(value="6")
+		self._plot_mode_display = tk.StringVar(value="")
 		self.plot_out_dir = tk.StringVar(value="pics")
 		self._plot_vars: dict[str, tk.Variable] = {}
 		self._plot_mode_frames: dict[str, ttk.Frame] = {}
+		self._plot_mode_titles: dict[str, str] = {}
+		self._plot_mode_key_by_title: dict[str, str] = {}
 		self._plot_fig = None
 		self._plot_canvas = None
 		self._plot_toolbar = None
@@ -208,7 +227,7 @@ class QSRGui(tk.Tk):
 		self.notebook.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
 
 		self._vars: dict[str, tk.Variable] = {}
-		self._specs_by_tab: dict[str, list[FieldSpec]] = {
+		self._spec_library_groups: dict[str, list[FieldSpec]] = {
 			"General": [
 				FieldSpec(
 					"sim_mode",
@@ -1201,10 +1220,137 @@ class QSRGui(tk.Tk):
 			],
 		}
 
-		for tab_name, specs in self._specs_by_tab.items():
+		self._specs_by_key: dict[str, FieldSpec] = {
+			spec.key: spec
+			for specs in self._spec_library_groups.values()
+			for spec in specs
+		}
+		self._form_tabs: tuple[FormTab, ...] = (
+			FormTab(
+				title="Workflow",
+				sections=(
+					FormSection(
+						title="Simulation flow",
+						spec_keys=("sim_mode", "submode"),
+						description="Choose which backend workflow runs. These settings determine which later sections actually matter.",
+					),
+					FormSection(
+						title="Initial condition",
+						spec_keys=("init_mode", "random_seed", "S0", "noise_amplitude"),
+						description="Initialization controls are shared across modes, but `noise_amplitude` matters only for `init_mode=2`.",
+					),
+				),
+			),
+			FormTab(
+				title="Geometry",
+				sections=(
+					FormSection(
+						title="Grid shape",
+						spec_keys=("Nx", "Ny", "Nz"),
+						description="These set the discrete simulation volume and the memory/runtime cost.",
+					),
+					FormSection(
+						title="Physical spacing",
+						spec_keys=("dx", "dy", "dz"),
+						description="These convert the grid into physical space and directly affect stiffness and stability.",
+					),
+				),
+			),
+			FormTab(
+				title="Material",
+				sections=(
+					FormSection(
+						title="Bulk thermodynamics",
+						spec_keys=("a", "b", "c", "T", "T_star", "bulk_modechoice"),
+						description="These define the Landau-de Gennes bulk model and the reference thermodynamic state.",
+					),
+				),
+			),
+			FormTab(
+				title="Elastic & Boundary",
+				sections=(
+					FormSection(
+						title="Elastic parametrization",
+						spec_keys=("kappa", "use_frank_map", "K1", "K2", "K3", "S_ref"),
+						description="Use either the one-constant / Frank-mapped route here, or set LdG coefficients directly below.",
+					),
+					FormSection(
+						title="Direct LdG coefficients",
+						spec_keys=("L1", "L2", "L3"),
+						description="These override the one-constant path when you want explicit anisotropic LdG elasticity.",
+					),
+					FormSection(
+						title="Boundary anchoring",
+						spec_keys=("W", "boundary_order_mode", "boundary_S"),
+						description="These control how strongly and at what scalar order the shell boundary constrains the droplet.",
+					),
+				),
+			),
+			FormTab(
+				title="Solver",
+				sections=(
+					FormSection(
+						title="Time stepping",
+						spec_keys=("gamma", "dt", "use_semi_implicit", "L_stab", "jacobi_iters"),
+						description="These set the kinetic timescale and the IMEX stabilization path used by the solver.",
+					),
+					FormSection(
+						title="Convergence and logging cadence",
+						spec_keys=("iterations", "print_freq", "tolerance", "defect_density_abs_eps", "enable_early_stop", "radiality_threshold"),
+						description="These are solver controls, not generic project settings. Use them to choose stopping criteria and monitoring cadence.",
+					),
+				),
+			),
+			FormTab(
+				title="Protocols",
+				sections=(
+					FormSection(
+						title="Sweep schedule",
+						spec_keys=("T_start", "T_end", "T_step"),
+						description="Relevant when `sim_mode=2`. These fields define the temperature ladder for equilibrium sweeps.",
+					),
+					FormSection(
+						title="Quench path and output",
+						spec_keys=("out_dir", "overwrite_out_dir", "protocol", "T_high", "T_low", "pre_equil_iters", "ramp_iters", "total_iters", "logFreq"),
+						description="Relevant when `sim_mode=3`. This block defines the quench schedule, output location, and quench-log cadence.",
+					),
+					FormSection(
+						title="Snapshots and KZ window",
+						spec_keys=("snapshot_mode", "snapshotFreq", "Tc_KZ", "Tc_window_K", "kzSnapshotFreq", "save_qtensor_snapshots", "kzItersAfterStep", "kz_stop_early", "kzExtraIters", "kz_nu", "kz_z", "kz_tau0"),
+						description="These only matter when the quench path is saving snapshots. Use them to define the capture window and late-time KZ analysis offsets.",
+					),
+				),
+			),
+			FormTab(
+				title="Diagnostics",
+				sections=(
+					FormSection(
+						title="Stability safeguards",
+						spec_keys=("xi_guard_enabled", "enable_instability_guard", "S_abort", "checker_rel_abort", "enable_q_limiter", "S_cap"),
+						description="These protect against under-resolved or numerically unstable runs. They should stay conservative for production work.",
+					),
+					FormSection(
+						title="Logging and debug",
+						spec_keys=("console_output", "debug_cuda_checks", "debug_dynamics"),
+						description="Use these only when you need more visibility into runtime behavior; they can slow the solver noticeably.",
+					),
+					FormSection(
+						title="2D diagnostic proxies",
+						spec_keys=("log_defects_2d", "defects_z_slice", "defects_S_threshold", "defects_charge_cutoff", "log_xi_grad_2d", "xi_z_slice", "xi_S_threshold"),
+						description="These lightweight slice-based observables are useful for logs and screening, but they are not substitutes for full 3D post-processing.",
+					),
+				),
+			),
+		)
+
+		for tab in self._form_tabs:
 			frame = ttk.Frame(self.notebook)
-			self.notebook.add(frame, text=tab_name)
-			self._build_form(frame, specs)
+			self.notebook.add(frame, text=tab.title)
+			self._build_form(frame, tab.sections)
+
+		self._build_about_tab()
+		self._install_dynamic_form_traces()
+		self._update_dynamic_form_visibility()
 
 		# Plot tab (in-app QSRvis integration)
 		self._build_plot_tab()
@@ -1218,7 +1364,7 @@ class QSRGui(tk.Tk):
 		yscroll.pack(side=tk.RIGHT, fill=tk.Y)
 		self.log_text.configure(yscrollcommand=yscroll.set)
 
-	def _build_form(self, parent: ttk.Frame, specs: list[FieldSpec]) -> None:
+	def _build_form(self, parent: ttk.Frame, sections: tuple[FormSection, ...]) -> None:
 		canvas = tk.Canvas(parent)
 		scroll = ttk.Scrollbar(parent, orient=tk.VERTICAL, command=canvas.yview)
 		inner = ttk.Frame(canvas)
@@ -1233,60 +1379,192 @@ class QSRGui(tk.Tk):
 		canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
 		scroll.pack(side=tk.RIGHT, fill=tk.Y)
 
-		for r, spec in enumerate(specs):
-			row = ttk.Frame(inner)
-			row.grid(row=r, column=0, sticky=tk.EW, padx=(8, 8), pady=2)
-			row.columnconfigure(1, weight=1)
+		for section_index, section in enumerate(sections):
+			box = ttk.LabelFrame(inner, text=section.title)
+			box.grid(row=section_index, column=0, sticky=tk.EW, padx=(8, 8), pady=(0, 10))
+			box.columnconfigure(0, weight=1)
+			self._form_section_widgets[section.title] = box
 
-			ttk.Label(row, text=spec.label).grid(row=0, column=0, sticky=tk.W, padx=(0, 8), pady=2)
+			start_row = 0
+			if section.description:
+				ttk.Label(
+					box,
+					text=section.description,
+					justify=tk.LEFT,
+					foreground="#555",
+					wraplength=920,
+				).grid(row=0, column=0, sticky=tk.EW, padx=10, pady=(8, 8))
+				start_row = 1
 
-			if spec.kind == "tri_bool":
-				var = tk.StringVar(value="default")
-				self._vars[spec.key] = var
-				w = ttk.OptionMenu(row, var, var.get(), "default", "true", "false")
-				w.grid(row=0, column=1, sticky=tk.EW, pady=2)
-			elif spec.kind == "choice":
-				var = tk.StringVar(value="default")
-				self._vars[spec.key] = var
-				choices = spec.choices or ["default"]
-				w = ttk.OptionMenu(row, var, var.get(), *choices)
-				w.grid(row=0, column=1, sticky=tk.EW, pady=2)
-			else:
-				var = tk.StringVar(value="")
-				self._vars[spec.key] = var
-				w = ttk.Entry(row, textvariable=var)
-				w.grid(row=0, column=1, sticky=tk.EW, pady=2)
+			for row_index, spec_key in enumerate(section.spec_keys, start=start_row):
+				spec = self._specs_by_key[spec_key]
+				row = ttk.Frame(box)
+				row.grid(row=row_index, column=0, sticky=tk.EW, padx=(10, 10), pady=2)
+				row.columnconfigure(1, weight=1)
+				self._field_row_widgets[spec.key] = row
 
-			hint = spec.default_hint
-			ttk.Label(row, text=hint, foreground="#666").grid(row=0, column=2, sticky=tk.W, padx=(10, 8))
+				ttk.Label(row, text=spec.label).grid(row=0, column=0, sticky=tk.W, padx=(0, 8), pady=2)
 
-			help_text = _render_help(spec)
-			if help_text:
-				self._info_visible.setdefault(spec.key, False)
-				btn_text = tk.StringVar(value="info")
-				info = ttk.Label(row, text=help_text, justify=tk.LEFT, foreground="#444", wraplength=900)
+				if spec.kind == "tri_bool":
+					var = tk.StringVar(value="default")
+					self._vars[spec.key] = var
+					w = ttk.OptionMenu(row, var, var.get(), "default", "true", "false")
+					w.grid(row=0, column=1, sticky=tk.EW, pady=2)
+				elif spec.kind == "choice":
+					var = tk.StringVar(value="default")
+					self._vars[spec.key] = var
+					choices = spec.choices or ["default"]
+					w = ttk.OptionMenu(row, var, var.get(), *choices)
+					w.grid(row=0, column=1, sticky=tk.EW, pady=2)
+				else:
+					var = tk.StringVar(value="")
+					self._vars[spec.key] = var
+					w = ttk.Entry(row, textvariable=var)
+					w.grid(row=0, column=1, sticky=tk.EW, pady=2)
 
-				def _toggle_info(key: str = spec.key, label: ttk.Label = info, btv: tk.StringVar = btn_text) -> None:
-					vis = self._info_visible.get(key, False)
-					if vis:
-						label.grid_remove()
-						btv.set("info")
-						self._info_visible[key] = False
-					else:
-						label.grid(row=1, column=1, columnspan=3, sticky=tk.EW, pady=(2, 6))
-						btv.set("hide")
-						self._info_visible[key] = True
+				hint = spec.default_hint
+				ttk.Label(row, text=hint, foreground="#666").grid(row=0, column=2, sticky=tk.W, padx=(10, 8))
 
-				btn = ttk.Button(row, textvariable=btn_text, command=_toggle_info, width=6)
-				btn.grid(row=0, column=3, sticky=tk.E, padx=(6, 0))
-				# Hidden by default
-				info.grid(row=1, column=1, columnspan=3, sticky=tk.EW, pady=(2, 6))
-				info.grid_remove()
-			else:
-				# Keep column 3 aligned even when no help exists
-				ttk.Label(row, text="").grid(row=0, column=3, sticky=tk.E)
+				help_text = _render_help(spec)
+				if help_text:
+					self._info_visible.setdefault(spec.key, False)
+					btn_text = tk.StringVar(value="info")
+					info = ttk.Label(row, text=help_text, justify=tk.LEFT, foreground="#444", wraplength=900)
+
+					def _toggle_info(key: str = spec.key, label: ttk.Label = info, btv: tk.StringVar = btn_text) -> None:
+						vis = self._info_visible.get(key, False)
+						if vis:
+							label.grid_remove()
+							btv.set("info")
+							self._info_visible[key] = False
+						else:
+							label.grid(row=1, column=1, columnspan=3, sticky=tk.EW, pady=(2, 6))
+							btv.set("hide")
+							self._info_visible[key] = True
+
+					btn = ttk.Button(row, textvariable=btn_text, command=_toggle_info, width=6)
+					btn.grid(row=0, column=3, sticky=tk.E, padx=(6, 0))
+					info.grid(row=1, column=1, columnspan=3, sticky=tk.EW, pady=(2, 6))
+					info.grid_remove()
+				else:
+					ttk.Label(row, text="").grid(row=0, column=3, sticky=tk.E)
 
 		inner.columnconfigure(0, weight=1)
+
+	def _build_about_tab(self) -> None:
+		about_tab = ttk.Frame(self.notebook)
+		self.notebook.add(about_tab, text="About")
+
+		self._add_collapsible_info_section(
+			about_tab,
+			key="about_tab_overview",
+			title="About this workspace",
+			text=_join_lines(
+				"This tab summarizes the launcher and solver executable versions that the GUI is organized around.",
+				"The version table is loaded from version_catalog.py, so changing the declared component versions there updates the GUI title and About tab together on the next launch.",
+				"Use the Backend executable field above when you want to run a different binary than the default confined solver path.",
+			),
+			wraplength=980,
+		)
+
+		versions_box = ttk.LabelFrame(about_tab, text="Component versions")
+		versions_box.pack(side=tk.TOP, fill=tk.X, padx=10, pady=(10, 8))
+		versions_box.columnconfigure(1, weight=1)
+		ttk.Label(versions_box, text="Component", foreground="#555").grid(row=0, column=0, sticky=tk.W, padx=10, pady=(8, 4))
+		ttk.Label(versions_box, text="Artifact", foreground="#555").grid(row=0, column=1, sticky=tk.W, padx=10, pady=(8, 4))
+		ttk.Label(versions_box, text="Version", foreground="#555").grid(row=0, column=2, sticky=tk.W, padx=10, pady=(8, 4))
+		ttk.Label(versions_box, text="Notes", foreground="#555").grid(row=0, column=3, sticky=tk.W, padx=10, pady=(8, 4))
+		for row_index, component in enumerate(COMPONENT_VERSIONS, start=1):
+			ttk.Label(versions_box, text=component.label).grid(row=row_index, column=0, sticky=tk.W, padx=10, pady=3)
+			ttk.Label(versions_box, text=component.artifact, foreground="#444").grid(row=row_index, column=1, sticky=tk.W, padx=10, pady=3)
+			ttk.Label(versions_box, text=component.version).grid(row=row_index, column=2, sticky=tk.W, padx=10, pady=3)
+			ttk.Label(versions_box, text=component.notes, wraplength=420, justify=tk.LEFT, foreground="#444").grid(row=row_index, column=3, sticky=tk.W, padx=10, pady=3)
+
+		backend_box = ttk.LabelFrame(about_tab, text="Active backend executable")
+		backend_box.pack(side=tk.TOP, fill=tk.X, padx=10, pady=(0, 8))
+		ttk.Label(
+			backend_box,
+			textvariable=self.backend_path,
+			justify=tk.LEFT,
+			foreground="#444",
+			wraplength=980,
+		).pack(side=tk.TOP, fill=tk.X, padx=10, pady=10)
+
+	def _install_dynamic_form_traces(self) -> None:
+		for key in (
+			"sim_mode",
+			"protocol",
+			"init_mode",
+			"snapshot_mode",
+			"boundary_order_mode",
+			"use_frank_map",
+		):
+			var = self._vars.get(key)
+			if var is not None:
+				var.trace_add("write", lambda *_args: self._update_dynamic_form_visibility())
+
+	def _effective_choice_value(self, key: str, default: str) -> str:
+		var = self._vars.get(key)
+		if var is None:
+			return default
+		value = str(var.get()).strip()
+		if not value or value == "default":
+			return default
+		return value
+
+	def _show_form_section(self, title: str, visible: bool) -> None:
+		widget = self._form_section_widgets.get(title)
+		if widget is None:
+			return
+		if visible:
+			widget.grid()
+		else:
+			widget.grid_remove()
+
+	def _show_field_row(self, key: str, visible: bool) -> None:
+		widget = self._field_row_widgets.get(key)
+		if widget is None:
+			return
+		if visible:
+			widget.grid()
+		else:
+			widget.grid_remove()
+
+	def _update_dynamic_form_visibility(self) -> None:
+		sim_mode = self._effective_choice_value("sim_mode", "3")
+		protocol = self._effective_choice_value("protocol", "2")
+		init_mode = self._effective_choice_value("init_mode", "1")
+		snapshot_mode = self._effective_choice_value("snapshot_mode", "2")
+		boundary_order_mode = self._effective_choice_value("boundary_order_mode", "equilibrium")
+		use_frank_map = self._effective_choice_value("use_frank_map", "false").lower() == "true"
+
+		self._show_form_section("Sweep schedule", sim_mode == "2")
+		self._show_form_section("Quench path and output", sim_mode == "3")
+		self._show_form_section("Snapshots and KZ window", sim_mode == "3")
+
+		self._show_field_row("submode", sim_mode == "1")
+		self._show_field_row("random_seed", init_mode in {"0", "2"})
+		self._show_field_row("S0", init_mode in {"0", "1"})
+		self._show_field_row("noise_amplitude", init_mode == "2")
+
+		self._show_field_row("K1", use_frank_map)
+		self._show_field_row("K2", use_frank_map)
+		self._show_field_row("K3", use_frank_map)
+		self._show_field_row("S_ref", use_frank_map)
+		self._show_field_row("boundary_S", boundary_order_mode == "custom")
+
+		self._show_field_row("ramp_iters", sim_mode == "3" and protocol == "2")
+		self._show_field_row("snapshotFreq", sim_mode == "3" and snapshot_mode == "1")
+		self._show_field_row("Tc_KZ", sim_mode == "3" and snapshot_mode == "2" and protocol == "2")
+		self._show_field_row("Tc_window_K", sim_mode == "3" and snapshot_mode == "2" and protocol == "2")
+		self._show_field_row("kzSnapshotFreq", sim_mode == "3" and snapshot_mode == "2")
+		self._show_field_row("save_qtensor_snapshots", sim_mode == "3" and snapshot_mode == "2")
+		self._show_field_row("kzItersAfterStep", sim_mode == "3" and snapshot_mode == "2" and protocol == "1")
+		self._show_field_row("kz_stop_early", sim_mode == "3" and snapshot_mode == "2")
+		self._show_field_row("kzExtraIters", sim_mode == "3" and snapshot_mode == "2")
+		self._show_field_row("kz_nu", sim_mode == "3" and snapshot_mode == "2")
+		self._show_field_row("kz_z", sim_mode == "3" and snapshot_mode == "2")
+		self._show_field_row("kz_tau0", sim_mode == "3" and snapshot_mode == "2")
 
 	# ---------------- Actions ----------------
 
@@ -1311,6 +1589,7 @@ class QSRGui(tk.Tk):
 			title="About plotting",
 			text=_join_lines(
 				"This tab embeds QSRvis plotting directly in the GUI (no external subprocess).",
+				"The top selector uses descriptive titles, while the Mode options pane keeps the original QSRvis mode numbers for script-level cross-reference.",
 				"Source can be either:",
 				"  - a run directory (e.g. output_quench_10k/) OR", 
 				"  - a specific file (e.g. nematic_field_final.dat).",
@@ -1327,30 +1606,31 @@ class QSRGui(tk.Tk):
 		ttk.Button(controls, text="Browse…", command=self._browse_plot_source).grid(row=0, column=2, sticky=tk.E)
 
 		ttk.Label(controls, text="Mode:").grid(row=1, column=0, sticky=tk.W, pady=(6, 0))
-		self._plot_mode_labels = {
-			"0": "0 Final state slice",
-			"1": "1 Animation (GIF) from snapshots",
-			"2": "2 Free energy vs iteration",
-			"3": "3 Energy components vs iteration",
-			"4": "4 Sweep summary S(T), F(T)",
-			"5": "5 Animate temperature sweep (GIF)",
-			"6": "6 Quench log plots",
-			"7": "7 Quench animation (GIF)",
-			"8": "8 KZ metrics from quench",
-			"9": "9 Aggregate KZ scaling (2D proxies)",
-			"10": "10 Sweep KZ slope stability",
-			"11": "11 3D snapshot metrics preview",
-			"12": "12 Aggregate KZ scaling (3D metrics)",
+		self._plot_mode_titles = {
+			"0": "Final State Slice",
+			"1": "Snapshot Animation",
+			"2": "Free Energy vs Iteration",
+			"3": "Energy Components vs Iteration",
+			"4": "Temperature Sweep Summary",
+			"5": "Temperature Sweep Animation",
+			"6": "Quench Log Diagnostics",
+			"7": "Quench Snapshot Animation",
+			"8": "KZ Metrics from One Quench",
+			"9": "Aggregate KZ Scaling (2D Proxies)",
+			"10": "KZ Slope Stability Sweep",
+			"11": "3D Snapshot Metrics Preview",
+			"12": "Aggregate KZ Scaling (3D Metrics)",
 		}
-		self._plot_mode_title = tk.StringVar(value=self._plot_mode_labels.get(self.plot_mode.get(), ""))
+		self._plot_mode_key_by_title = {title: key for key, title in self._plot_mode_titles.items()}
+		default_plot_title = self._plot_mode_titles.get(self.plot_mode.get(), next(iter(self._plot_mode_titles.values())))
+		self._plot_mode_display.set(default_plot_title)
 		ttk.OptionMenu(
 			controls,
-			self.plot_mode,
-			self.plot_mode.get(),
-			*sorted(self._plot_mode_labels.keys(), key=lambda x: int(x)),
-			command=lambda _v: self._on_plot_mode_change(),
+			self._plot_mode_display,
+			self._plot_mode_display.get(),
+			*[self._plot_mode_titles[key] for key in sorted(self._plot_mode_titles.keys(), key=lambda value: int(value))],
+			command=lambda *_args: self._on_plot_mode_selected(),
 		).grid(row=1, column=1, sticky=tk.W, padx=(8, 8), pady=(6, 0))
-		ttk.Label(controls, textvariable=self._plot_mode_title, foreground="#555").grid(row=1, column=2, sticky=tk.W, pady=(6, 0))
 
 		ttk.Label(controls, text="Output dir:").grid(row=2, column=0, sticky=tk.W, pady=(6, 0))
 		ttk.Entry(controls, textvariable=self.plot_out_dir, width=20).grid(row=2, column=1, sticky=tk.W, padx=(8, 8), pady=(6, 0))
@@ -1514,7 +1794,7 @@ class QSRGui(tk.Tk):
 		self._add_collapsible_info_section(
 			m0,
 			key="plot_m0_about",
-			title="Mode 0: final state slice",
+			title="Mode 0: Final State Slice",
 			text=_join_lines(
 				"Renders a 2D slice from nematic_field_final.dat (or the last nematic_field_iter_*.dat if final is missing).",
 				"The grid (Nx,Ny,Nz) is inferred from the file header; you don’t have to type it.",
@@ -1552,7 +1832,7 @@ class QSRGui(tk.Tk):
 		self._add_collapsible_info_section(
 			m1,
 			key="plot_m1_about",
-			title="Mode 1: animation from snapshots",
+			title="Mode 1: Snapshot Animation",
 			text=_join_lines(
 				"Creates a GIF from nematic_field_iter_*.dat snapshots in a directory.",
 				"This requires snapshot files (snapshot_mode=1 or 2 in the backend).",
@@ -1589,7 +1869,7 @@ class QSRGui(tk.Tk):
 		self._add_collapsible_info_section(
 			m2,
 			key="plot_m2_about",
-			title="Mode 2: free energy vs iteration",
+			title="Mode 2: Free Energy vs Iteration",
 			text=_join_lines(
 				"Plots the total/free energy trace versus iteration for a single run.",
 				"Expected input: a run directory containing the backend’s energy log file(s) (e.g. output_quench*/).",
@@ -1604,7 +1884,7 @@ class QSRGui(tk.Tk):
 		self._add_collapsible_info_section(
 			m3,
 			key="plot_m3_about",
-			title="Mode 3: energy components vs iteration",
+			title="Mode 3: Energy Components vs Iteration",
 			text=_join_lines(
 				"Plots energy components (bulk / elastic / surface terms depending on what the backend logged) versus iteration.",
 				"Expected input: a run directory containing the energy components log (produced by the backend).",
@@ -1621,7 +1901,7 @@ class QSRGui(tk.Tk):
 		self._add_collapsible_info_section(
 			m4,
 			key="plot_m4_about",
-			title="Mode 4: sweep summary",
+			title="Mode 4: Temperature Sweep Summary",
 			text=_join_lines(
 				"Plots summary outputs from a temperature sweep (average S(T) and/or free energy F(T)).",
 				"Use this with output_temp_sweep/ runs that contain the sweep summary files produced by the backend.",
@@ -1639,7 +1919,7 @@ class QSRGui(tk.Tk):
 		self._add_collapsible_info_section(
 			m5,
 			key="plot_m5_about",
-			title="Mode 5: animate temperature sweep",
+			title="Mode 5: Temperature Sweep Animation",
 			text=_join_lines(
 				"Creates a GIF (or saves selected frames) across output_temp_sweep/T_*/ directories.",
 				"Source can be either the repo root (it will look for output_temp_sweep/) or the output_temp_sweep folder itself.",
@@ -1668,7 +1948,7 @@ class QSRGui(tk.Tk):
 		self._add_collapsible_info_section(
 			m6,
 			key="plot_m6_about",
-			title="Mode 6: quench log",
+			title="Mode 6: Quench Log Diagnostics",
 			text=_join_lines(
 				"Plots diagnostics from out_dir/quench_log.dat (T(t), energies, radiality, <S>, etc.).",
 				"it_min/it_max restrict the plotted iteration range (useful if you have long runs).",
@@ -1690,7 +1970,7 @@ class QSRGui(tk.Tk):
 		self._add_collapsible_info_section(
 			m7,
 			key="plot_m7_about",
-			title="Mode 7: quench animation (GIF)",
+			title="Mode 7: Quench Snapshot Animation",
 			text=_join_lines(
 				"Same as mode 1, but intended for quench runs (output_quench*/ with nematic_field_iter_*.dat).",
 				"If you ran snapshot_mode=2 (KZ), you’ll only have frames near Tc; the GIF will cover that window.",
@@ -1724,7 +2004,7 @@ class QSRGui(tk.Tk):
 		self._add_collapsible_info_section(
 			m8,
 			key="plot_m8_about",
-			title="Mode 8: KZ metrics (single run)",
+			title="Mode 8: Single-Run KZ Metrics",
 			text=_join_lines(
 				"Computes proxy correlation length xi and proxy defect density from snapshots in a single quench run.",
 				"Requires saved frames (nematic_field_iter_*.dat) around Tc (snapshot_mode=1 or 2).",
@@ -1749,7 +2029,7 @@ class QSRGui(tk.Tk):
 		self._add_collapsible_info_section(
 			m9,
 			key="plot_m9_about",
-			title="Mode 9: aggregate KZ scaling (2D proxies)",
+			title="Mode 9: Aggregate KZ Scaling (2D Proxies)",
 			text=_join_lines(
 				"Scans many quench run directories and fits log–log KZ scaling (defects and xi proxies vs ramp time or cooling rate).",
 				"parent_dir + pattern define which runs are included (e.g. parent_dir='.' and pattern='output_quench*').",
@@ -1795,7 +2075,7 @@ class QSRGui(tk.Tk):
 		self._add_collapsible_info_section(
 			m10,
 			key="plot_m10_about",
-			title="Mode 10: slope stability",
+			title="Mode 10: KZ Slope Stability Sweep",
 			text=_join_lines(
 				"Sweeps the ‘measurement time’ after Tc and checks how fitted log–log slopes change.",
 				"This is a robustness diagnostic: in real data, slopes can drift if you measure too early/late relative to the freeze-out window.",
@@ -1831,7 +2111,7 @@ class QSRGui(tk.Tk):
 		self._add_collapsible_info_section(
 			m11,
 			key="plot_m11_about",
-			title="Mode 11: 3D snapshot metrics",
+			title="Mode 11: 3D Snapshot Metrics Preview",
 			text=_join_lines(
 				"Computes 3D correlation length xi_3D and a 3D defect-line proxy from a single snapshot.",
 				"This is heavier than 2D proxies and requires SciPy + scikit-image.",
@@ -1860,7 +2140,7 @@ class QSRGui(tk.Tk):
 		self._add_collapsible_info_section(
 			m12,
 			key="plot_m12_about",
-			title="Mode 12: aggregate KZ scaling (3D metrics)",
+			title="Mode 12: Aggregate KZ Scaling (3D Metrics)",
 			text=_join_lines(
 				"Aggregates xi_3D and defect-line proxy across multiple runs and fits log–log scaling.",
 				"This is the most expensive plot mode: it loads 3D volumes per run.",
@@ -1899,9 +2179,19 @@ class QSRGui(tk.Tk):
 		add_choice(m12_body, 11, "defect_proxy", self._plot_vars["m12_proxy"], ["skeleton", "core"])
 		add_row(m12_body, 12, "max_runs (blank=all)", self._plot_vars["m12_maxruns"], width=10)
 
+	def _on_plot_mode_selected(self, selected_title: str | None = None) -> None:
+		title = (selected_title or self._plot_mode_display.get()).strip()
+		mode_key = self._plot_mode_key_by_title.get(title)
+		if mode_key is None:
+			return
+		self.plot_mode.set(mode_key)
+		self._on_plot_mode_change()
+
 	def _on_plot_mode_change(self) -> None:
 		m = self.plot_mode.get().strip()
-		self._plot_mode_title.set(self._plot_mode_labels.get(m, ""))
+		title = self._plot_mode_titles.get(m)
+		if title is not None and self._plot_mode_display.get() != title:
+			self._plot_mode_display.set(title)
 		for frm in self._plot_mode_frames.values():
 			frm.pack_forget()
 		frm = self._plot_mode_frames.get(m)

@@ -446,3 +446,21 @@ Historical output paths preserve the directory names that were in use when a bra
 * Replaced the old single-purpose GUI evaluation page with a general `Tools` workspace.
     * `GUI.py` now lists the registered post-processing utilities, shows a definition/help panel plus editable argument template, and captures stdout/stderr into the GUI while previewing generated text and figure artifacts.
     * This keeps the project’s accumulated analysis scripts accessible from the main launcher instead of leaving them as disconnected standalone entry points.
+
+### v0.4.5
+
+* Reorganized the main GUI configuration tabs around workflow meaning instead of legacy file-group names.
+    * `GUI.py` now surfaces sectioned tabs for `Workflow`, `Geometry`, `Material`, `Elastic & Boundary`, `Solver`, `Protocols`, and `Diagnostics`, with mode-specific descriptions inside each section.
+    * Iteration limits, print/log cadence, tolerances, sweep controls, and quench controls are now grouped with the solver or protocol settings they actually affect instead of being left under broad legacy tabs.
+* Replaced the numeric plot-mode dropdown labels with descriptive titles.
+    * The `Plot` tab selector now shows the actual action names such as final-state slices, quench-log plots, and aggregate KZ scaling instead of only mode numbers.
+    * The detailed `Mode options` pane remains the place where the numeric QSRvis mode identity is explained for users who still want to map the GUI back to the script interface.
+
+### v0.4.6
+
+* Completed the GUI 1.0.0 wrap-up pass with dynamic mode-aware organization.
+    * `GUI.py` now hides or reveals solver sections and field rows based on the active `sim_mode`, `protocol`, `init_mode`, snapshot mode, and boundary-order choices, so the launcher stops presenting obviously irrelevant controls at the same time.
+    * The plot-mode `Mode options` headings were normalized to one consistent naming style while preserving the numeric QSRvis mode identifiers for script-level cross-reference.
+* Added a dedicated `About` tab backed by a centralized version catalog.
+    * `version_catalog.py` now defines the displayed versions for `QSR GUI` (`1.0.0`), `QSR_cuda` (`0.4.5`), `QSR_cpu` (`prealpha`), `KZM_prooving_ground_cuda` (`1.0.0`), and `KZM_bulk_ldg_cuda` (`1.0.0`).
+    * `GUI.py` reads that catalog for the window title and About tab, so future version bumps only need one source-of-truth update.
