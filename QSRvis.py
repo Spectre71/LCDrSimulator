@@ -231,6 +231,10 @@ def tool_plot_bulk_ldg_benchmark_figure(argv: list[str] | tuple[str, ...] | None
     return run_qsr_tool("plot_bulk_ldg_benchmark_figure", argv)
 
 
+def tool_generate_production_review_figures(argv: list[str] | tuple[str, ...] | None = None) -> QSRToolResult:
+    return run_qsr_tool("generate_production_review_figures", argv)
+
+
 def interactive_qsr_tool_runner() -> QSRToolResult:
     specs = list_qsr_tools()
     print("\nAvailable post-processing tools:\n")

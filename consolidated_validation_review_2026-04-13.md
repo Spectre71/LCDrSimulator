@@ -2,11 +2,11 @@
 
 ## Purpose
 
-This file consolidates the dated validation notes and the relevant changelog context into one narrative that can be used as the starting point for paper writing, repo cleanup, and figure planning.
+This is the single maintained consolidated validation review for the current repo state.
 
-The goal here is not to replace the detailed point notes. It is to state, in one place, what the repo actually established, how the separate branches fit together, and what the present scientific accomplishment is.
+It replaces the temporary validation-folder duplicate and keeps the benchmark ladder, confined interpretation, production figure set, and paper-facing conclusion in one root-level document that can be carried directly into article drafting.
 
-## Source trail used for this consolidation
+## Source Trail Used For This Consolidation
 
 The narrative below is based on the dated notes already present in `validation/` together with the matching entries in `Changelog.md`, especially:
 
@@ -36,443 +36,190 @@ The narrative below is based on the dated notes already present in `validation/`
 - `validation/point18_size200_four_rate_ladder_2026-04-13.md`
 - `Changelog.md`
 
-## Executive summary
+## Executive Summary
 
 The repo now supports three distinct statements, and they should not be mixed together.
 
 1. The codebase can recover Kibble-Zurek-like scaling when the physics is appropriate.
-   - The periodic 3D XY proving-ground branch gives the first clean benchmark result.
-   - The periodic bulk Landau-de Gennes branch then shows that a Q-tensor nematic model without confinement can also produce a clean, refinement-stable scaling readout.
+   - The periodic `3D XY` proving-ground branch gives the first clean benchmark result.
+   - The periodic bulk `LdG` branch then shows that a `Q`-tensor nematic model without confinement can also produce a clean, refinement-stable scaling readout.
 
 2. The confined droplet is not just the bulk problem with finite resolution.
    - In the confined branch, whole-volume and late-final-state observables do not reproduce the clean bulk-like signal.
    - The dominant confined response is boundary-conditioned and geometry-conditioned.
 
 3. The confined system still contains a measurable Kibble-Zurek-like signal, but not where the original whole-volume search looked for it.
-   - The surviving signal is not a robust whole-droplet 3D core observable.
+   - The surviving signal is not a robust whole-droplet `3D` core observable.
    - It is a localized late-transient shell-subsurface signal.
    - The active dense confined baseline is the `100^3`, `W = 3e-6`, late-window annulus `[2,10)` with pooled exponent about `0.311`.
 
-That means the repo no longer tells a story of solver failure. It tells a story of regime separation:
+So the present story is regime separation rather than solver failure:
 
 - clean benchmark KZ in unconfined systems,
-- clean bridge behavior in periodic bulk nematic LdG,
+- clean bridge behavior in periodic bulk nematic `LdG`,
 - suppressed or redistributed global KZ behavior in confined droplets,
-- and a localized shell-conditioned confined KZ signal that only becomes visible after the observable is redesigned around the real confined geometry.
+- and a localized shell-conditioned confined KZ signal that only becomes visible once the observable is redesigned around the real droplet geometry.
 
-## Consolidated narrative
+## Production Figure Ladder
 
-### 1. Why the proving-ground and bulk branches were necessary
+### 1. Periodic XY Proving Ground
 
-The confined `QSR` droplet solver contains too many ingredients at once for a clean first benchmark:
+![Periodic XY benchmark](pics/production/01_periodic_xy_benchmark.png)
 
-- first-order isotropic-nematic LdG dynamics,
-- finite geometry,
-- anchoring,
-- boundary-controlled ordering,
-- and geometry-dependent post-processing.
+Caption. The final-state vortex-line density in the first non-smoke periodic `64^3` `XY` sweep scales with fitted slope `m = -0.529`, already close to the textbook `3D XY` Model-A expectation `m = -0.573`. The fixed `+0.4` after-`T_c` control is nearly flat, so the benchmark signal currently lives in the later topological readout rather than in an arbitrary early snapshot.
 
-That is why the repo first split the problem into cleaner branches instead of trying to force the droplet solver to serve as the benchmark.
+### 2. Periodic Bulk LdG Bridge
 
-#### 1.1 Periodic XY proving ground
+![Periodic bulk LdG benchmark](pics/production/02_periodic_bulk_ldg_benchmark.png)
 
-The periodic 3D XY branch exists to answer the narrow question: can the infrastructure recover a textbook Kibble-Zurek power law when the model, symmetry, and boundary conditions are the right ones?
+Caption. The first seven-rate periodic bulk `LdG` scan already gives a clean final-state defect-line slope `m = -0.515` with strong monotonicity and log-log correlation. Fixed absolute-time windows remain too transient, while matched-order windows are smoother but weaker, so the final-state line-defect readout stays the current bridge observable between the periodic `XY` benchmark and the confined droplet branch.
 
-What it established:
+![Periodic bulk LdG protocol convergence](pics/production/03_periodic_bulk_ldg_protocol_convergence.png)
 
-- The reduced smoke sweep validated the solver branch, configuration contract, topology observable, and rate-sweep tooling.
-- The first non-smoke `64^3` periodic XY sweep showed that the final-state vortex-line observable has the correct sign, strong monotonicity, and a slope close to the expected 3D XY Model-A value.
-- The matched coarse/fine protocol check showed that the benchmark branch is not just fitting noise.
+Caption. The matched fixed-`dt` refinement checks preserve the same physical quench schedule and show that the bulk branch is numerically controlled. The standard pair keeps the final-state relative mismatches near `6.9e-5` in `avg_S`, `1.20e-3` in `xi_grad_proxy`, and about `7.4e-3` in the defect observables. The slower `ramp600` pair is even tighter at the final state.
 
-What matters scientifically:
+### 3. Confined Global Controls And Localization
 
-- The branch demonstrates that the framework can produce a recognizable Kibble-Zurek signal when the physical setting is a continuous transition in a periodic system.
-- This removes the idea that the later confined difficulties must automatically mean the numerics are broken.
+![Confined global transient controls](pics/production/04_confined_global_transient_control.png)
 
-#### 1.2 Periodic bulk Landau-de Gennes branch
+Caption. The whole-volume confined `3D` proxies do not survive as a robust late bridge signal. Both the core-density and line-density slopes collapse toward zero by about `42-44 ns` after `T_c`, which is why the confined continuation cannot be framed as a simple bulk-style final-state observable problem.
 
-The bulk periodic LdG branch exists to bridge from the XY benchmark back to a Q-tensor nematic model without reintroducing confinement.
+![Confined shell localization](pics/production/05_confined_shell_localization.png)
 
-What it established:
+Caption. The localization analysis shows why the active confined readout is a fixed subsurface band rather than a whole-droplet metric. The narrow `[4,6)` and `[2,6)` bands are steeper but live on much smaller support. The broader `[2,10)` band keeps a still-positive mean exponent with much larger and more stable support, so it is the current production readout. The deep bulk region `[10,inf)` stays weak.
 
-- The periodic bulk branch orders properly once the post-ramp hold is long enough.
-- In the first seven-rate sweep, the final-state `defect_line_density` already gives a strong monotonic slope against `tau_Q`, around `-0.515`, with strong log-log correlation.
-- Two matched coarse/fine protocol checks showed that the final-state bulk readout is stable under refinement, with the only visibly larger mismatch occurring at the first discrete defect turn-on, not at the final state.
+![Confined fixed-band exponent](pics/production/06_confined_fixed_band_exponent.png)
 
-What matters scientifically:
+Caption. Once the confined readout is fixed to `[2,10)`, the dense five-window branch gives the current best exponent estimate: `alpha = 0.3108` for defect density, with normalized `95%` fit confidence width about `0.0389` and neighboring-window half-range about `0.0389`. The paired defect-share fit is weaker but still positive, reinforcing that the confined signal is real but boundary-conditioned.
 
-- This branch shows that even within a nematic Q-tensor model, one can recover a clean scaling story when confinement and anchoring are removed.
-- So the later confined result must be interpreted as a real geometry-and-boundary problem, not simply as a generic failure of LdG numerics.
+![Anchoring-strength comparison](pics/production/07_confined_anchor_strength_comparison.png)
 
-### 2. What the early confined search actually found
+Caption. The fixed-band point-2 comparison confirms that the confined exponent is non-monotonic in anchoring strength. On the common `[2,10)` readout, the late-window exponent is about `0.096` at `W = 1e-6`, `0.311` at `W = 3e-6`, and `0.273` at `W = 1e-5`. The active dense `W = 3e-6` branch remains the strongest current confined baseline rather than an arbitrary middle choice.
 
-The original strong-confinement `sanity3` transient bridge search did not produce the canonical sign expected from a bulk-like picture.
+### 4. Size-200 Controls
 
-#### 2.1 Strong confinement branch
+![Matched-rate size-200 shift](pics/production/08_confined_size200_matched_rate_shift.png)
 
-The merged strong-confinement analysis established that, in the original radial strong-boundary regime, slower quenches transiently retain more 3D structure in the early post-`T_c` window. That is the opposite sign from the canonical Kibble-Zurek expectation.
+Caption. The first matched-rate `200^3` control does not reinforce the same shell-adjacent annulus that carried the dense `100^3` confined bridge. Total late defect density rises modestly, but the `[2,10)` density, support fraction, and defect-share fraction all decrease relative to `100^3`. At the same time, the defect-weighted mean shell depth sits well deeper than the support-weighted mean, so the immediate size effect is bulkward redistribution rather than simple strengthening of the same subsurface signal.
 
-This was not a one-point accident:
+![Sparse size-200 ladder](pics/production/09_confined_size200_sparse_ladder.png)
 
-- the slow-end bridge confirmed the trend beyond a single outlier,
-- the effect was strongest around `3.4e-8` to `3.6e-8 s` after `T_c`,
-- and it decayed by about `4.0e-8` to `4.4e-8 s`.
+Caption. The first pruned `200^3` four-rate ladder still keeps the strongest rate-sensitive band shell-adjacent rather than bulk-dominated. The preferred sparse-ladder annulus remains `[2,6)`, but its support fraction shrinks from about `0.220` at sparse `100^3` to about `0.119` at sparse `200^3`. The fixed `[2,10)` exponent at `200^3` rises back near `0.509`, but the bulk exponent remains small at about `0.073`, so this is not evidence of bulk recovery. It is still a shell-conditioned signal, and the apparent return to `~0.51` remains entangled with the same sparse-ladder bias that point 15 already exposed at `100^3`.
 
-The important interpretation was already visible there: the active `sanity3` droplet regime is confinement-dominated. The shell and boundary structure compete with, and in that branch reverse, the simple bulk-like Kibble-Zurek ordering.
+## Consolidated Narrative
 
-#### 2.2 First weak-anchoring screen
+### 1. Why The Benchmark Branches Were Necessary
 
-Weak anchoring at `W = 1e-5` was the first solver-supported boundary change that opened a short canonical-sign window in the whole-volume core metric near `34 ns` after `T_c`.
+The confined `QSR` droplet solver contains too many ingredients at once for a clean first benchmark: first-order isotropic-nematic `LdG` dynamics, finite geometry, anchoring, shell ordering, and geometry-dependent post-processing.
 
-That was useful, but not yet trustworthy:
+That is why the repo first split the problem into cleaner branches instead of forcing the droplet solver to serve as the benchmark.
 
-- the sign already reversed again by `36 ns`,
-- the skeleton metric was even more short-lived,
-- and the later audit showed that the positive `34 ns` signal depended strongly on morphology settings.
+The periodic `3D XY` branch answers the narrow question of whether the infrastructure can recover a textbook Kibble-Zurek power law when the symmetry, transition, and topology observable are the right ones. It does.
 
-So the first weak-anchor screen mattered because it showed the right search axis, not because it already solved the confined problem.
+The periodic bulk `LdG` branch then bridges back to the active `Q`-tensor setting without reintroducing confinement. It shows that even within a nematic `Q`-tensor model the repo can recover a clean, refinement-stable scaling story once boundaries and droplet geometry are removed.
 
-#### 2.3 QSRvis audit and the `W = 3e-6` screen
+Those two branches are why the confined result should now be interpreted as a real geometry-and-boundary problem rather than as generic solver failure.
 
-The code-path audit confirmed that the 3D analysis implementation itself was consistent. What failed was the robustness of the observable interpretation.
+### 2. What The Early Confined Search Actually Found
 
-Then the weaker `W = 3e-6` screen made the permissive whole-volume low-`S` signal look stronger, but the conservative preset collapsed to zero.
+The original strong-confinement `sanity3` transient bridge search did not produce the canonical sign expected from a bulk-like picture. Slower quenches transiently retained more `3D` structure in the early post-`T_c` window, and the effect decayed later.
 
-That result was crucial because it separated two claims:
+Weak anchoring at `W = 1e-5` opened a short canonical-sign window in permissive whole-volume metrics, but that result was not robust. The sign reversed quickly, the skeleton metric was even less stable, and the later audit showed strong morphology dependence.
 
-- yes, the default low-`S` volume proxy can produce a positive early-time signal,
-- no, that is not yet the same thing as a morphology-robust confined defect-scaling law.
+The weaker `W = 3e-6` screen clarified the situation further: permissive whole-volume low-`S` metrics could look positive, but conservative interior-core definitions collapsed. That separated “a positive proxy can be manufactured” from “a morphology-robust confined scaling law exists.”
 
-### 3. What timing and normalization clarified
+### 3. What Timing And Normalization Clarified
 
-The repo then resolved two interpretation issues that would otherwise contaminate any later paper conclusion.
+The repo also resolved two interpretation issues that would otherwise contaminate any paper conclusion.
 
-#### 3.1 `Tc_KZ` is not a computed freeze-out time
+First, `Tc_KZ` in the current workflow is not a computed freeze-out time `t_hat`. It is a transition-temperature marker used for snapshot placement and for aligning measurements relative to the logged `T_c` crossing extracted from `quench_log.dat`.
 
-The current workflow does not compute the literature freeze-out time `t_hat`.
+Second, droplet-normalized observables removed an important false positive. Some earlier whole-volume weak-anchor signals looked stronger in slower runs largely because the ordered droplet itself was still developing. Once the metrics were normalized by the actual ordered droplet volume, that apparent positive whole-volume core signal disappeared.
 
-What it actually does is:
+### 4. Why The Whole-Volume And Final-State Confined Observables Were Rejected
 
-- use `Tc_KZ` as a transition-temperature marker for snapshot placement and post-processing alignment,
-- determine the actual `T_c` crossing time from `quench_log.dat`,
-- and then measure at fixed physical offsets after that crossing or at a branch-dependent alternative readout such as final state or matched order.
+Several tempting confined observables were explicitly tested and rejected.
 
-The note on `Tc_KZ = 310.2` also showed that this value is physically consistent with the model: it is just the rounded bulk coexistence temperature implied by the active coefficients, not an arbitrary parameter.
+- Event-based timing alone did not rescue the early weak-anchor core result.
+- Strict biaxial-core proxies could produce positive windows under permissive morphology handling, but those windows collapsed once the interior region was defined more physically by shell-excluded distance.
+- The periodic bulk final-state bridge did not survive in confinement. Even after removing the early-stop loophole, the whole-volume droplet-normalized final `3D` metrics stayed flat or zero.
+- In the cleaner late `50-60 ns` and then `45-65 ns` windows, the `2D` logged signal remained modestly positive, but the tested global `3D` low-`S` and strict-biaxial observables were already flat or zero.
 
-#### 3.2 Droplet-normalized observables removed a misleading positive signal
+That is the key negative result: the confined signal survives, but not as a global `3D` defect observable of the type originally targeted.
 
-When the early weak-anchor observables were normalized by system volume, the slower branch could look artificially more defect-rich simply because the ordered droplet itself was still developing.
+### 5. How The Correct Confined Observable Was Found
 
-Once the observable was normalized by the actual ordered droplet volume, that apparent positive whole-volume core signal disappeared.
+The later confined work succeeded because it stopped asking the whole droplet to behave like the periodic bulk branch and instead localized the observable where the confined signal actually lives.
 
-This mattered because it showed that part of the earlier positive trend was not true defect enrichment inside the ordered droplet. It was delayed droplet establishment.
+The equatorial slab and full axial-profile analyses showed that the surviving late signal was not just one special slice, but they also showed that axial position was not the real discriminator. The strongest individual slices were shell-adjacent.
 
-### 4. Why whole-volume and final-state confined observables were rejected
+The shell-depth analysis then measured the signal directly in inward distance from the interface. That established two things at once:
 
-At that stage, several tempting but misleading confined observables were explicitly tested and rejected.
+- the strongest slopes are not in the outermost skin but a few layers inside the boundary,
+- the deeper interior carries only a much weaker component.
 
-#### 4.1 Event-based timing and strict biaxial cores
+Band decomposition turned that into a stable observable-design problem. The early sparse ladder selected `[2,6)` as the best common annulus. The later dense ten-rate ladder broadened the defensible band to `[2,10)` and simultaneously lowered the pooled exponent from about `0.510` to about `0.311`.
 
-Reanalyzing the early weak-anchor screens at fixed `avg_S` milestones did not restore a robust canonical core trend.
+That dense-ladder update is one of the most important results in the repo. It showed that the original `~0.51` confined value was a sparse-ladder effect, not the final confined answer.
 
-The stricter low-`S` plus biaxiality proxy could produce a positive default result on the transient Q-tensor probe, but that result collapsed when the interior region was defined more physically by shell-excluded distance rather than permissive morphological dilation.
+### 6. Anchoring Dependence And Size Dependence
 
-So event-based timing alone did not rescue the old core result, and the first strict-core success did not survive a stronger interior definition.
-
-#### 4.2 Final-state confined bridge observable
-
-The periodic bulk branch identified a clean final-state readout. That immediately raised the natural question of whether the same logic would survive in confinement.
-
-It did not.
-
-Point 3 showed that on the early-stop weak-anchor sweeps, the final retained confined 3D defect metrics were flat across rate or zero under the stricter preset.
-
-Point 4 then removed the obvious loophole by running a true no-early-stop final-hold branch. Even then:
-
-- the final logged times moved later in a real way,
-- the 2D final midplane defect signal changed with rate,
-- but the whole-volume droplet-normalized final 3D metrics stayed effectively flat or zero.
-
-So the confined branch does not preserve the same kind of final-state bridge observable that works in the periodic bulk branch.
-
-#### 4.3 Global 3D transient observables in the cleaner late window
-
-Point 5 used log-window screening on the no-early-stop `W = 3e-6` branch to identify the cleaner post-critical band.
-
-The very strong `40 ns` signal was rejected as too contaminated by ordering lag. The more defensible branch was the weaker but cleaner `50-60 ns` band.
-
-Point 6 then created the snapshot-rich rerun needed to evaluate real 3D fields in that band.
-
-Point 7 finally answered the question directly:
-
-- the 2D logged signal remains modestly positive in the `50-60 ns` window,
-- but the tested global 3D low-`S` and strict-biaxial observables are already flat or zero there.
-
-That is the key negative result: the confined signal survives, but not as a global 3D defect observable of the type initially targeted.
-
-### 5. How the correct confined observable was found
-
-The later confined work succeeded because it stopped asking the whole droplet to behave like the periodic bulk branch and instead localized the observable in the geometry where the signal actually lives.
-
-#### 5.1 Equatorial slab and full axial profile
-
-Point 8 showed that the surviving late-transient signal is not just one special slice. A finite-thickness equatorial slab still carries a positive defect-vs-rate trend.
-
-Point 9 then showed that axial thickness is not the real discriminator either. The slice-based signal remains positive even when integrated over the full `z` range, while the strongest individual slices are displaced toward shell-adjacent regions rather than sitting exactly at the midplane.
-
-That shifted the problem from axial localization to radial localization.
-
-#### 5.2 Shell-depth analysis and band decomposition
-
-Point 10 measured the signal directly in inward distance from the droplet interface.
-
-That result did two important things:
-
-- it showed that the strongest slopes are not in the outermost skin but a few layers inside the boundary,
-- and it showed that the deeper interior still carries a weaker positive component.
-
-Point 11 then converted that profile into a stable observable design problem and selected the best common multibin focus annulus.
-
-The conclusion was that the best confined signal is not the outer skin and not the deep bulk. It is the sub-surface annulus `[2,6)`.
-
-Just as important, the defect-share diagnostics showed that the rate dependence is not a simple whole-profile amplification. It is a redistribution of defect weight outward toward that sub-surface annulus.
-
-#### 5.3 Neighboring-window stability
-
-Point 12 found a real blocker: after the first cleanup, the retained `window60` snapshots were too sparse to test `45/55/65 ns` honestly because the requested windows aliased onto the same files.
-
-That led to the `window65` rerun and the one-command follow-up path.
-
-Point 13 then showed that the `[2,6)` annulus remains the best common focus band across genuine `45/50/55/60/65 ns` windows. That turned the shell-localized signal from a two-window hint into a real late-window result.
-
-### 6. How the confined exponent changed once the sampling was good enough
-
-#### 6.1 First explicit confined exponent
-
-Point 14 extracted the first exponent from the validated localized observable. On the original four-rate `window65` ladder, the `[2,6)` focus annulus gave a pooled exponent around `0.510`, with skin and bulk both clearly weaker.
-
-That was the first explicit confined-bridge exponent and it was physically useful, but it still came from only four rates.
-
-#### 6.2 Dense rate-ladder refinement changed the baseline
-
-Point 15 is one of the most important notes in the repo because it showed that the original `~0.51` result was a sparse-ladder effect, not the final confined answer.
-
-On the dense ten-rate ladder:
-
-- the preferred annulus broadened from `[2,6)` to `[2,10)`,
-- the pooled exponent dropped from about `0.510` to about `0.311`,
-- and restricting the dense branch back to the original four runs reproduced the old `0.5095` almost exactly.
-
-That means the old value was not wrong as a report of the sparse dataset. It was incomplete. The denser ladder resolved the turnover structure and changed the physically defensible baseline.
-
-This is the active confined baseline now:
-
-- branch: `validation/sanity3_rate_sweep_weak_anchor_W3em6_qtensor_window65_dense`
-- preferred band: `[2,10)`
-- preferred dense exponent: `alpha ~ 0.311`
-
-### 7. What anchoring and size dependence revealed
-
-#### 7.1 Anchoring-strength dependence is non-monotonic
-
-Point 16 compared `W = 1e-5`, `3e-6`, and `1e-6` on the same fixed `[2,10)` readout.
-
-The result is non-monotonic:
+Anchoring dependence is non-monotonic on the fixed `[2,10)` readout:
 
 - `W = 1e-5`: about `0.273`
 - `W = 3e-6`: about `0.311`
 - `W = 1e-6`: about `0.096`
 
-The auto-selected bands also move in informative ways:
+The preferred annulus also moves with anchoring strength. Stronger anchoring broadens the shell-adjacent signal, the intermediate branch gives the cleanest fixed `[2,10)` baseline, and the weakest branch leaves only a shallow near-shell remnant. That is strong evidence that the confined result is boundary-conditioned.
 
-- stronger anchoring broadens the signal toward a large shell-adjacent region,
-- the intermediate branch keeps the clean `[2,10)` localization,
-- and the weakest branch leaves only a shallow near-shell remnant.
+The first larger-droplet controls do not support bulk recovery either.
 
-This is strong evidence that the confined result is boundary-conditioned. The exponent and the preferred shell region both depend on anchoring.
+Point 17 showed that at matched rate the `200^3` run redistributes defects deeper inward while reducing the relative importance of the active shell-adjacent annulus.
 
-#### 7.2 First larger-droplet controls do not support bulk recovery
+Point 18 then showed that the rate-sensitive part of the `200^3` signal still remains shell-adjacent rather than bulk-dominated. The strongest sparse-ladder band stays `[2,6)`, support becomes smaller, and the bulk exponent remains small. The only superficially bulk-like feature is that the fixed `[2,10)` sparse-ladder exponent rises back near `0.509`, but point 15 already proved that sparse ladders can artificially support such values even at `100^3`.
 
-Point 17 used a single `200^3` matched-rate run to ask a narrow localization question. That result showed:
+So the correct reading is not “size restores textbook KZ.” The correct reading is that the signal remains shell-conditioned, its support becomes more selective at larger size, and the present `200^3` exponent story is still entangled with sparse-ladder bias.
 
-- total late defect density increases modestly,
-- but the relative importance of the active shell-adjacent `[2,10)` annulus decreases,
-- and defect localization shifts deeper inward.
+### 7. Timing And Observation Windows To Quote Going Forward
 
-That by itself already argued against a simple “larger droplet just strengthens the same shell result” story.
+The repo now supports a precise operational statement about timing.
 
-Point 18 then ran the first pruned `200^3` four-rate ladder. That result is subtle but decisive in one respect:
+In every branch, the observation time is defined relative to the logged crossing of the imposed temperature ramp through the reference transition temperature. The code does not directly compute the Kibble-Zurek freeze-out time `t_hat`.
 
-- the strongest rate-sensitive band still remains shell-adjacent at `[2,6)`, not in the deep bulk,
-- the bulk exponent remains small,
-- so the larger droplet still does not behave like bulk recovery.
+The branch-specific readouts are therefore chosen by stability and observable coherence rather than by claiming a directly measured freeze-out time:
 
-At the same time, the fixed `[2,10)` exponent at `200^3` comes out near `0.509`, which is numerically reminiscent of the old sparse `100^3` result. But point 15 already proved that sparse ladders can artificially support such values.
+- periodic `XY`: the meaningful current readout is the later final-state vortex-line density,
+- periodic bulk `LdG`: the meaningful current readout is the final-state bulk defect-line density,
+- confined droplet: the meaningful current readout is a late transient shell-subsurface window rather than a whole-volume final-state observable.
 
-So the correct reading is not “size restores textbook KZ.” The correct reading is:
+### 8. Current Accomplishment And Active Conclusion
 
-- the rate-sensitive signal remains shell-conditioned,
-- its support becomes smaller at larger size,
-- and the present `200^3` exponent story is still entangled with sparse-ladder bias.
+The present accomplishment of the repo is not merely that it found some nonzero confined fit. It established a full validation ladder from textbook-like benchmark physics to the real confined droplet problem.
 
-## What this means for timing and observation windows
+The clean unconfined Kibble-Zurek signal is reproducible in periodic systems. In confined droplets, that signal is suppressed, redistributed, and localized rather than globally expressed in the same way.
 
-The repo now supports a precise and defensible statement about how the observation time was chosen.
+The active paper-facing conclusion should therefore be carried forward in this order:
 
-### 1. What is and is not being measured
+1. periodic `XY` proving ground: benchmark topology-aware KZ signal recovered,
+2. periodic bulk `LdG`: the same overall observable philosophy survives in an unconfined nematic `Q`-tensor solver and passes fixed-`dt` refinement checks,
+3. confined droplet: the strongest measurable rate-dependent response is not a whole-volume late-final-state bridge, but a localized boundary-conditioned late-window signal carried by the fixed annulus `[2,10)`.
 
-- `T_c` or `Tc_KZ` in the current workflow is a transition-temperature marker used to define the observation origin.
-- The actual crossing time is reconstructed from `quench_log.dat`.
-- The current solver and post-processing do not directly compute the literature freeze-out time `t_hat`.
+The active confined baseline is still the dense `100^3`, `W = 3e-6` branch with fixed `[2,10)` readout and pooled exponent `alpha ~ 0.311`.
 
-So the observation rule is operational rather than claiming a direct measured freeze-out time.
+Future writing should treat the larger-size and anchoring studies as refinements of that confined-shell picture rather than as evidence that the droplet simply tends back to the bulk law.
 
-### 2. Operational timing rule by branch
+## Reproduction
 
-For all branches, the repo first identifies the crossing time `t_c` from the logged temperature history. The measurement is then taken at a branch-dependent readout chosen for physical rather than cosmetic reasons.
+All production figures above were regenerated directly from reduced artifacts already present in the repo. No new simulation reruns were required for this figure set.
 
-The branch logic is now clear:
+Use this command to regenerate the full production ladder, including the size-`200^3` controls:
 
-- Periodic XY proving ground:
-  - the early fixed-after-`T_c` window is too flat,
-  - the first stable KZ-sensitive observable is the final-state vortex-line density,
-  - so that becomes the benchmark readout.
+```bash
+"/media/spectre71/850 EVO/myFiles/Programming/VS/MAGISTERIJ/QSR/venv/bin/python" tools/generate_production_review_figures.py --output-dir pics/production
+```
 
-- Periodic bulk LdG:
-  - fixed absolute-time windows near onset are too fragile,
-  - matched-order windows are cleaner but weaker,
-  - the final-state bulk defect-line density is the strongest stable readout,
-  - so that becomes the bridge readout.
+If you intentionally want only the benchmark-to-dense-`100^3` ladder, omit the size-`200^3` panels with:
 
-- Confined droplet:
-  - the early `40 ns` transient signal is too contaminated by ordering lag,
-  - the cleaner late window is identified from the log-window scan first,
-  - then the real snapshot-rich rerun validates the `50-60 ns` band,
-  - then the neighboring-window rerun expands that to a stable `45-65 ns` late-window band,
-  - and only after that is the signal restricted to the shell-subsurface region where it is actually localized.
-
-### 3. Recommended paper language on timing
-
-The safest paper-facing statement is:
-
-"In all branches, the observation time was defined relative to the logged crossing of the imposed temperature ramp through the reference transition temperature. The analysis does not directly compute the Kibble-Zurek freeze-out time `t_hat`; instead it uses branch-specific post-critical observation windows chosen by stability and observable coherence. In the periodic benchmark and periodic bulk branches, the cleanest readout is the later final state. In the confined droplet, the cleanest readout is a late transient shell-subsurface window rather than a global final-state observable." 
-
-That statement is aligned with what the code and notes actually do.
-
-## How the pieces fit together physically
-
-The repo now supports one coherent physical picture.
-
-### 1. Unconfined systems
-
-When confinement and anchoring are removed, the code can recover clean Kibble-Zurek-like behavior:
-
-- first in the 3D XY proving ground,
-- then in the periodic bulk Q-tensor nematic bridge.
-
-This means the infrastructure is capable of seeing the expected physics when the geometry and boundary conditions do not dominate the dynamics.
-
-### 2. Confined droplets
-
-Once real boundaries and anchoring are present, the dominant regime changes.
-
-The important point is not that the microscopic model becomes something else. The point is that the observed dynamics are co-determined by:
-
-- finite spatial extent,
-- shell ordering,
-- anchoring strength,
-- access of defects to the boundary,
-- and geometry-conditioned annihilation and redistribution.
-
-That is why:
-
-- the whole-volume confined 3D observables fail,
-- the final-state bridge fails,
-- the deeper bulk remains weak,
-- and the strongest rate-sensitive signal lives in a shell-subsurface annulus instead.
-
-### 3. The confined result is therefore not "no KZ"
-
-The confined result is more precise than a simple negative statement.
-
-It is:
-
-- not a clean whole-system bulk-like KZ law,
-- not a morphology-robust early whole-volume core law,
-- not a final-state bulk bridge,
-- but yes, a localized late-transient shell-conditioned KZ-like scaling signal.
-
-That is a stronger and more interesting conclusion than either "the solver failed" or "the confined system behaves just like bulk." 
-
-## What these notes accomplished
-
-Taken together, the validation notes accomplished six concrete things.
-
-1. They validated the infrastructure in clean benchmark settings.
-   - The repo can recover expected KZ-like behavior in periodic, unconfined systems.
-
-2. They validated a nematic Q-tensor bridge without confinement.
-   - The periodic bulk LdG branch behaves as a controlled bridge between the XY benchmark and the confined droplet problem.
-
-3. They falsified several tempting but incorrect confined observables.
-   - Early whole-volume low-`S` cores, strict-core claims, final-state confined 3D observables, and late global 3D transient proxies were all tested and either shown to be flat, zero, or morphology-sensitive.
-
-4. They identified the correct confined observable and timing strategy.
-   - The surviving confined signal is late-transient, localized, and shell-subsurface.
-
-5. They quantified how that confined signal depends on sampling, anchoring, and size.
-   - The rate ladder density matters.
-   - Anchoring dependence is non-monotonic.
-   - Increasing droplet size does not move the dominant signal into the bulk.
-
-6. They established the active confined baseline that should be quoted going forward.
-   - Dense `100^3`, `W = 3e-6`, real `45-65 ns` late windows, fixed annulus `[2,10)`, exponent about `0.311`.
-
-## Current accomplishment
-
-Based on the notes consolidated here, the present accomplishment of the repo is the following.
-
-### 1. Benchmark accomplishment
-
-The repo now contains a complete validation ladder from textbook-like benchmark physics to the confined droplet problem:
-
-- periodic XY proving ground,
-- periodic bulk Landau-de Gennes bridge,
-- confined droplet branch.
-
-That means the final confined interpretation is anchored by successful benchmark branches rather than by isolated droplet fits.
-
-### 2. Confined-physics accomplishment
-
-The confined droplet work has moved beyond the vague statement that confinement "makes things messy." It has identified what specifically happens:
-
-- strong confinement reverses the naive whole-volume transient sign,
-- weak anchoring alone does not restore a robust global defect law,
-- the apparent positive early signal is largely tied to morphology sensitivity and droplet-establishment delay,
-- a real confined scaling signal survives only after the observable is localized in the shell-subsurface region,
-- and the active dense confined exponent is significantly smaller than the old sparse estimate.
-
-### 3. Paper-level accomplishment
-
-The most important paper-facing accomplishment is this:
-
-The repo demonstrates that Kibble-Zurek-like dynamics can be recovered cleanly in unconfined systems, but in heavily confined droplets with real boundaries they are not globally expressed in the same way. Instead, the confined signal is suppressed, redistributed, and localized into a shell-subsurface late-transient annulus.
-
-That is the result.
-
-Not:
-
-- "the solver could not find KZ," and not
-- "the confined system just has the same bulk law with noise."
-
-But rather:
-
-- unconfined systems recover the expected benchmark behavior,
-- confined droplets realize a boundary-conditioned dynamical regime,
-- and the correct confined observable is local, not global.
-
-### 4. Active conclusion to carry forward
-
-If the repo needs one concise current conclusion before article writing begins, it should be this:
-
-The current evidence supports a boundary-conditioned confined regime rather than bulk recovery. The clean unconfined Kibble-Zurek signal is reproducible in periodic systems, but in confined droplets the strongest measurable rate-dependent response lives in a shell-subsurface annulus, not in whole-droplet observables. The active confined baseline is therefore the dense `100^3`, `W = 3e-6`, `[2,10)` late-window readout with `alpha ~ 0.311`, and future writing should treat larger-size and anchoring studies as refinements of that confined-shell picture rather than as evidence that the droplet simply tends back to the bulk law.
+```bash
+"/media/spectre71/850 EVO/myFiles/Programming/VS/MAGISTERIJ/QSR/venv/bin/python" tools/generate_production_review_figures.py --output-dir pics/production --skip-size200
+```

@@ -17,14 +17,14 @@ COMPONENT_VERSIONS: tuple[ComponentVersion, ...] = (
 		key="gui",
 		label="QSR GUI",
 		artifact="GUI.py",
-		version="1.0.0",
-		notes="Versioned launcher milestone for the reorganized GUI.",
+		version="1.0.1",
+		notes="Launcher update with production-review tooling and IMEX-aware form cleanup.",
 	),
 	ComponentVersion(
 		key="qsr_cuda",
 		label="Confined QSR solver",
 		artifact="exe/QSR_cuda",
-		version="0.4.5",
+		version="0.4.8",
 		notes="Active CUDA solver branch.",
 	),
 	ComponentVersion(

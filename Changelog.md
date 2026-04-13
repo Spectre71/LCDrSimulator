@@ -464,3 +464,21 @@ Historical output paths preserve the directory names that were in use when a bra
 * Added a dedicated `About` tab backed by a centralized version catalog.
     * `version_catalog.py` now defines the displayed versions for `QSR GUI` (`1.0.0`), `QSR_cuda` (`0.4.5`), `QSR_cpu` (`prealpha`), `KZM_prooving_ground_cuda` (`1.0.0`), and `KZM_bulk_ldg_cuda` (`1.0.0`).
     * `GUI.py` reads that catalog for the window title and About tab, so future version bumps only need one source-of-truth update.
+
+### v0.4.7
+
+* Added a production review-figure generator driven by the existing reduced validation artifacts.
+    * `tools/generate_production_review_figures.py` regenerates a paper-facing figure ladder into `pics/production/` without rerunning the underlying simulations.
+    * The current production set covers the periodic `XY` benchmark, the periodic bulk `LdG` bridge, bulk protocol refinement, confined whole-volume control plots, confined shell localization, the fixed `[2,10)` confined exponent, and the fixed-band anchoring comparison.
+
+### v0.4.8
+
+* Integrated the production-review figure ladder into the shared post-processing interfaces.
+    * `tool_catalog.py`, `GUI.py`, and `QSRvis.py` now expose `tools/generate_production_review_figures.py` through the main `Tools` workflow instead of leaving it as a standalone script.
+    * The tool definition text now states that the figure ladder requires already reduced artifacts and is intended for the final paper-facing review pass rather than unfinished raw sweeps.
+* Extended the production figure set with the current `200^3` controls and consolidated the review back to one maintained root document.
+    * `tools/generate_production_review_figures.py` now also regenerates the matched-rate `200^3` redistribution figure and the sparse-ladder `200^3` comparison figure, both from existing reduced artifacts.
+    * `consolidated_validation_review_2026-04-13.md` is now the single maintained consolidated review, with the embedded production ladder including the size-`200^3` controls; the temporary validation-folder duplicate was removed.
+* Polished the launcher around the production-review workflow.
+    * `version_catalog.py` bumps the GUI to `1.0.1`.
+    * `GUI.py` now moves the `About` tab to the far right, hides `L_stab` and `jacobi_iters` when IMEX is off, and omits those keys from generated configs when semi-implicit stepping is disabled so stale hidden values do not leak into runs.

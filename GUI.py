@@ -1348,13 +1348,13 @@ class QSRGui(tk.Tk):
 			self.notebook.add(frame, text=tab.title)
 			self._build_form(frame, tab.sections)
 
-		self._build_about_tab()
 		self._install_dynamic_form_traces()
 		self._update_dynamic_form_visibility()
 
 		# Plot tab (in-app QSRvis integration)
 		self._build_plot_tab()
 		self._build_evaluation_tab()
+		self._build_about_tab()
 
 		# Log view
 		ttk.Label(log_container, text="Backend output:").pack(side=tk.TOP, anchor=tk.W)
@@ -1498,6 +1498,7 @@ class QSRGui(tk.Tk):
 			"snapshot_mode",
 			"boundary_order_mode",
 			"use_frank_map",
+			"use_semi_implicit",
 		):
 			var = self._vars.get(key)
 			if var is not None:
@@ -1537,6 +1538,7 @@ class QSRGui(tk.Tk):
 		snapshot_mode = self._effective_choice_value("snapshot_mode", "2")
 		boundary_order_mode = self._effective_choice_value("boundary_order_mode", "equilibrium")
 		use_frank_map = self._effective_choice_value("use_frank_map", "false").lower() == "true"
+		use_semi_implicit = self._effective_choice_value("use_semi_implicit", "true").lower() == "true"
 
 		self._show_form_section("Sweep schedule", sim_mode == "2")
 		self._show_form_section("Quench path and output", sim_mode == "3")
@@ -1552,6 +1554,8 @@ class QSRGui(tk.Tk):
 		self._show_field_row("K3", use_frank_map)
 		self._show_field_row("S_ref", use_frank_map)
 		self._show_field_row("boundary_S", boundary_order_mode == "custom")
+		self._show_field_row("L_stab", use_semi_implicit)
+		self._show_field_row("jacobi_iters", use_semi_implicit)
 
 		self._show_field_row("ramp_iters", sim_mode == "3" and protocol == "2")
 		self._show_field_row("snapshotFreq", sim_mode == "3" and snapshot_mode == "1")
@@ -1671,6 +1675,7 @@ class QSRGui(tk.Tk):
 			text=_join_lines(
 				"This tab runs the post-processing and validation utilities collected under tools/ through QSRvis wrappers.",
 				"Use it for benchmark reductions, confined-observable scans, shell-band selection, exponent extraction, and figure regeneration.",
+				"Publication-facing figure generators assume the reduced CSV/Markdown artifacts already exist; they are not substitutes for the underlying reduction steps.",
 				"The Primary path entry is inserted into the {source} placeholder for tools that need a sweep root or config path.",
 				"Output dir is inserted into the {out_dir} placeholder and is also used for preview discovery when the tool writes PNG, Markdown, TXT, or CSV artifacts.",
 				"If a tool ignores Primary path by default, its definition box states that explicitly and you can still override paths manually in the argument template.",
@@ -3158,6 +3163,10 @@ class QSRGui(tk.Tk):
 		# If sim_mode is not set at all, default GUI to quench (3).
 		if "sim_mode" not in items:
 			items["sim_mode"] = "3"
+
+		if self._effective_choice_value("use_semi_implicit", "true").lower() != "true":
+			items.pop("L_stab", None)
+			items.pop("jacobi_iters", None)
 		return items
 
 	def _resolve_run_output_dir(self, items: dict[str, str]) -> Path:

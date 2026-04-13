@@ -184,6 +184,20 @@ QSR_TOOL_SPECS: tuple[QSRToolSpec, ...] = (
         uses_source=False,
         source_label="Primary path (unused by default)",
     ),
+    QSRToolSpec(
+        key="generate_production_review_figures",
+        label="Generate Production Review Figures",
+        module_name="tools.generate_production_review_figures",
+        summary="Regenerate the full paper-facing validation-review figure ladder, including the current 200^3 controls, from existing reduced artifacts.",
+        help_text=_lines(
+            "Use this only after the benchmark summaries, bulk protocol comparisons, dense confined shell-focus reductions, anchoring comparison, and any 200^3 reduced controls you want to cite already exist.",
+            "This is the final presentation pass for the consolidated review, not an exploratory plotting step for unfinished raw sweeps.",
+            "The default GUI template appends /production to the chosen output root so the standard output location stays under pics/production. If you intentionally want a different exact target or want to omit the size-200 controls, edit the argument string manually.",
+        ),
+        arg_template='--output-dir "{out_dir}/production"',
+        uses_source=False,
+        source_label="Primary path (unused by default)",
+    ),
 )
 
 
