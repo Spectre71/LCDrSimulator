@@ -13,8 +13,6 @@ frames*
 .vs*
 .github
 .gui*
-QSR_*
-KZM_bulk_ldg_cuda
-KZM_prooving_ground_cuda
+QSR.*
 GEMINI.md
 __pycache__

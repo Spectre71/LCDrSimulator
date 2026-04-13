@@ -431,3 +431,9 @@ Historical output paths preserve the directory names that were in use when a bra
     * The affected tools now use generalized names such as `tools/analyze_confined_final_state.py`, `tools/analyze_shell_depth.py`, `tools/analyze_shell_focus_exponent.py`, and `tools/check_quench_protocol_convergence.py`.
 * Normalized the primary documentation for external reproducibility.
     * `README.md` now presents a concise user manual, and the changelog prose now describes physical baselines and benchmark roles instead of relying on internal branch shorthand.
+
+### v0.4.3
+* Added executables to `exe` folder for ease of use and updated `README.md` to reflect the new paths.
+    * The `exe` folder now contains `KZM_prooving_ground_cuda`, `KZM_bulk_ldg_cuda`, and `QSR_cuda` executables for the periodic XY, periodic bulk-LdG, and confined QSR branches, respectively.
+    * The `README.md` now documents the new executable paths for running the different branches and their associated configs.
+* Update `GUI.py` to default to the new `exe/QSR_cuda` path and added a note about the change in the README.

@@ -37,25 +37,25 @@ The repository also includes two benchmark solvers used to validate Kibble-Zurek
 CUDA solver:
 
 ```bash
-nvcc -O3 -arch=sm_75 -std=c++17 -o QSR_cuda QSR.cu
+nvcc -O3 -arch=sm_75 -std=c++17 -o exe/QSR_cuda QSR.cu
 ```
 
 CPU reference solver:
 
 ```bash
-g++ -O3 -std=c++23 -fopenmp -o QSR_cpu QSR.cpp
+g++ -O3 -std=c++23 -fopenmp -o exe/QSR_cpu QSR.cpp
 ```
 
 Periodic XY benchmark:
 
 ```bash
-nvcc -O3 -arch=sm_75 -std=c++17 -o KZM_prooving_ground_cuda KZM_prooving_ground.cu
+nvcc -O3 -arch=sm_75 -std=c++17 -o exe/KZM_prooving_ground_cuda KZM_prooving_ground.cu
 ```
 
 Periodic bulk-LdG benchmark:
 
 ```bash
-nvcc -O3 -arch=sm_75 -std=c++17 -o KZM_bulk_ldg_cuda KZM_bulk_ldg.cu
+nvcc -O3 -arch=sm_75 -std=c++17 -o exe/KZM_bulk_ldg_cuda KZM_bulk_ldg.cu
 ```
 
 Replace `sm_75` with the architecture of the target GPU.
@@ -84,7 +84,7 @@ venv/bin/python GUI.py
 The solver is intended to be driven by configuration files:
 
 ```bash
-./QSR_cuda --config <config.cfg>
+./exe/QSR_cuda --config <config.cfg>
 ```
 
 Configuration files use `key = value` syntax with optional `#` comments. Example configurations are provided under `configs/` and `configs/validation/`.
@@ -154,7 +154,7 @@ The main analysis entry points are:
 venv/bin/python tools/check_quench_protocol_convergence.py \
   <coarse.cfg> \
   <fine.cfg> \
-  --binary ./QSR_cuda \
+  --binary ./exe/QSR_cuda \
   --output-root validation/protocol_convergence
 ```
 
@@ -165,7 +165,7 @@ For quench studies, the fine configuration should preserve the physical protocol
 ```bash
 venv/bin/python tools/quench_rate_sweep.py run \
   <base.cfg> \
-  --binary ./QSR_cuda \
+  --binary ./exe/QSR_cuda \
   --output-root validation/confined_rate_sweep \
   --ramp-values 25,50,100,200,400 \
   --keep-going

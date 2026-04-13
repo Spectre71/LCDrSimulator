@@ -92,7 +92,7 @@ def _repo_root() -> Path:
 
 def _default_backend_path() -> Path:
 	# Prefer local ./QSR_cuda built binary.
-	return _repo_root() / "QSR_cuda"
+	return _repo_root() / "exe" / "QSR_cuda"
 
 
 def _write_kv_config(path: Path, items: dict[str, str]) -> None:
