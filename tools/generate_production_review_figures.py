@@ -776,7 +776,7 @@ def plot_size200_matched_rate_shift(output_dir: Path) -> Path:
     defect_depth = np.array([to_float(row["defect_depth_mean_200"]) for row in rows], dtype=float)
     ax_depth.plot(x_ns, support_depth, color="#2563eb", marker="o", ms=5.2, linewidth=1.8, label="support-weighted")
     ax_depth.plot(x_ns, defect_depth, color="#b91c1c", marker="s", ms=5.2, linewidth=1.8, label="defect-weighted")
-    ax_depth.set_title("C. 200^3 shell-depth moments")
+    ax_depth.set_title(r"C. $200^3$ shell-depth moments")
     ax_depth.set_xlabel(r"Late window after $T_c$ [ns]")
     ax_depth.set_ylabel("Mean shell depth [layers]")
     style_axis(ax_depth)
@@ -812,17 +812,17 @@ def plot_size200_sparse_ladder(output_dir: Path) -> Path:
     ax_bands.scatter(size200_support, size200_alpha, color="#fca5a5", edgecolor="none", s=40, alpha=0.8, label="200^3 sparse bands")
 
     highlight_specs = (
-        (sparse100_band_rows, "[2,6)", "#1d4ed8", "o", "100^3 [2,6)"),
-        (size200_band_rows, "[2,6)", "#b91c1c", "s", "200^3 [2,6)"),
-        (sparse100_band_rows, "[2,10)", "#0f766e", "D", "100^3 [2,10)"),
-        (size200_band_rows, "[2,10)", "#c2410c", "^", "200^3 [2,10)"),
+        (sparse100_band_rows, "[2,6)", "#1d4ed8", "o", "100^3 [2,6)", (-58, 10)),
+        (size200_band_rows, "[2,6)", "#b91c1c", "s", "200^3 [2,6)", (8, 8)),
+        (sparse100_band_rows, "[2,10)", "#0f766e", "D", "100^3 [2,10)", (8, 8)),
+        (size200_band_rows, "[2,10)", "#c2410c", "^", "200^3 [2,10)", (8, -14)),
     )
-    for rows, label, color, marker, note in highlight_specs:
+    for rows, label, color, marker, note, offset in highlight_specs:
         row = find_exact_row(rows, band_label=label)
         x_val = to_float(row["mean_support_fraction_across_offsets"])
         y_val = to_float(row["mean_density_slope_vs_rate"])
         ax_bands.scatter([x_val], [y_val], color=color, marker=marker, s=92, zorder=3)
-        ax_bands.annotate(note, (x_val, y_val), xytext=(6, 7), textcoords="offset points", fontsize=8.8, color=color)
+        ax_bands.annotate(note, (x_val, y_val), xytext=offset, textcoords="offset points", fontsize=8.8, color=color)
 
     ax_bands.set_title("A. Sparse-ladder band selection by droplet size")
     ax_bands.set_xlabel("Mean support fraction across windows")
