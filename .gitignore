@@ -4,6 +4,7 @@ venv
 x64
 literature/*
 configs/*
+research_temp*
 out*
 frames*
 *.dat
