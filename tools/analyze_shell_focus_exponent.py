@@ -6,6 +6,7 @@ import argparse
 import csv
 from pathlib import Path
 import sys
+from typing import TypedDict
 
 import matplotlib
 
@@ -24,6 +25,16 @@ REGION_COLORS = {
     "focus": "#b91c1c",
     "bulk": "#0f766e",
 }
+
+
+class CommonLogSlopeFit(TypedDict):
+    slope: float
+    standard_error: float
+    ci95_norm: float
+    rmse_log: float
+    intercepts: dict[int, float]
+    n_points: int
+    dof: int
 
 
 def parse_args() -> argparse.Namespace:
@@ -179,7 +190,7 @@ def fit_common_log_slope_with_window_intercepts(
     window_ids: np.ndarray,
     *,
     ordered_window_ids: list[int],
-) -> dict[str, float | dict[int, float]]:
+) -> CommonLogSlopeFit:
     mask = np.isfinite(x) & np.isfinite(y) & (x > 0.0) & (y > 0.0)
     if int(np.count_nonzero(mask)) < 3:
         return {
@@ -316,7 +327,7 @@ def plot_summary(
     region_density_rows = [row for row in common_rows if row["observable"] == "density"]
     comparison_regions = [str(row["region"]) for row in region_density_rows if str(row["region"]) != "focus"]
     offsets_ns = sorted({float(row["offset_ns"]) for row in detail_rows if row["region"] == "focus"})
-    colors = plt.cm.plasma(np.linspace(0.12, 0.88, len(offsets_ns)))
+    colors = matplotlib.colormaps["plasma"](np.linspace(0.12, 0.88, len(offsets_ns)))
     color_map = {offset: color for offset, color in zip(offsets_ns, colors, strict=True)}
 
     plt.rcParams.update(

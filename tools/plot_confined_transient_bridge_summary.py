@@ -4,6 +4,7 @@ import argparse
 import csv
 from pathlib import Path
 
+from matplotlib.axes import Axes
 import matplotlib.pyplot as plt
 import numpy as np
 
@@ -40,7 +41,7 @@ def load_run_series(csv_path: Path) -> tuple[np.ndarray, np.ndarray]:
     return t_ramp_ns, defect
 
 
-def plot_top_panel(ax: plt.Axes, summary_rows: list[dict[str, str]], cohort: str, offsets_s: list[float], title: str) -> None:
+def plot_top_panel(ax: Axes, summary_rows: list[dict[str, str]], cohort: str, offsets_s: list[float], title: str) -> None:
     colors = {
         3.4e-8: "#0f766e",
         3.6e-8: "#c2410c",
@@ -72,7 +73,7 @@ def plot_top_panel(ax: plt.Axes, summary_rows: list[dict[str, str]], cohort: str
     ax.set_xlabel(r"$t_{ramp}$ [ns]")
 
 
-def plot_bottom_panel(ax: plt.Axes, summary_rows: list[dict[str, str]], title: str) -> None:
+def plot_bottom_panel(ax: Axes, summary_rows: list[dict[str, str]], title: str) -> None:
     cohorts = [
         ("all11", "All 11 runs", "#111827", "o", "-"),
         ("no1000_10", "25 to 700", "#0f766e", "s", "--"),

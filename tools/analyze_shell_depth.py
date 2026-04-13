@@ -7,6 +7,7 @@ import csv
 from pathlib import Path
 import re
 import sys
+from typing import TypedDict
 
 import matplotlib
 
@@ -19,6 +20,43 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 import QSRvis as qv
+
+
+class ShellDepthBinRow(TypedDict):
+    depth_bin_index: int
+    depth_bin_lo: float
+    depth_bin_hi: float
+    depth_bin_label: str
+    depth_bin_is_open: bool
+    depth_bin_center_plot: float
+    depth_bin_used_plaquettes: int
+    depth_bin_defect_count: int
+    depth_bin_density: float
+
+
+class ShellDepthData(TypedDict):
+    Nx: int
+    Ny: int
+    Nz: int
+    droplet_voxels: int
+    total_used_plaquettes: int
+    total_defect_count: int
+    total_density: float
+    plaquette_depth: np.ndarray
+    plaquette_defect: np.ndarray
+    max_depth: float
+    bin_rows: list[ShellDepthBinRow]
+
+
+class ShellRunEntry(TypedDict):
+    label: str
+    metrics: dict[str, float]
+    field_path: Path
+    selected_iter: int
+    selected_time_s: float
+    actual_after_tc_s: float
+    selected_avg_s: float
+    shell: ShellDepthData
 
 
 def parse_args() -> argparse.Namespace:
@@ -234,7 +272,7 @@ def compute_shell_depth_data(
     S_droplet: float,
     charge_cutoff: float,
     bin_edges: list[float],
-) -> dict[str, object]:
+) -> ShellDepthData:
     Nx, Ny, Nz = qv.infer_grid_dims_from_nematic_field_file(str(field_path))
     S, nx, ny, _ = qv.load_nematic_field_volume(str(field_path), Nx, Ny, Nz)
     droplet, distance_inside = build_droplet_distance(S, S_droplet=float(S_droplet))
@@ -293,7 +331,7 @@ def compute_shell_depth_data(
         plaquette_depth = np.array([], dtype=float)
         plaquette_defect = np.array([], dtype=bool)
 
-    bin_rows: list[dict[str, float | int | str]] = []
+    bin_rows: list[ShellDepthBinRow] = []
     for bin_index, lo, hi, label in iter_shell_bins(bin_edges):
         if hi is None:
             sel = plaquette_depth >= float(lo)
@@ -370,7 +408,7 @@ def summarize_bin_rows(detail_rows: list[dict[str, float | int | str]]) -> list[
 
 
 def build_shell_exclusion_scan(
-    per_run_entries: list[dict[str, object]],
+    per_run_entries: list[ShellRunEntry],
     *,
     max_exclude_layers: int | None,
 ) -> list[dict[str, float | int | str]]:
@@ -575,7 +613,7 @@ def main() -> int:
     band_summary_rows: list[dict[str, float | int | str]] = []
 
     for offset_s in offsets:
-        per_run_entries: list[dict[str, object]] = []
+        per_run_entries: list[ShellRunEntry] = []
         detail_rows: list[dict[str, float | int | str]] = []
 
         for run_dir in run_dirs:

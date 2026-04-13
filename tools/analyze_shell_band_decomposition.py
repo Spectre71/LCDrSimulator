@@ -7,6 +7,7 @@ import csv
 import math
 from pathlib import Path
 import sys
+from typing import TypedDict
 
 import numpy as np
 
@@ -15,6 +16,32 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 import QSRvis as qv
+
+
+class ShellDepthBin(TypedDict):
+    depth_bin_index: int
+    depth_bin_lo: float
+    depth_bin_hi: float
+    depth_bin_label: str
+    depth_bin_center_plot: float
+    depth_bin_used_plaquettes: int
+    depth_bin_defect_count: int
+
+
+class ShellRun(TypedDict):
+    run: str
+    rate_K_per_s: float
+    t_ramp_s: float
+    target_after_Tc_s: float
+    actual_after_Tc_s: float
+    selected_time_s: float
+    selected_iter: int
+    field_file: str
+    selected_avg_S: float
+    total_used_plaquettes: int
+    total_defect_count: int
+    total_density: float
+    bins: list[ShellDepthBin]
 
 
 def parse_args() -> argparse.Namespace:
@@ -144,15 +171,15 @@ def load_shell_detail_rows(path: Path) -> list[dict[str, str]]:
         return list(csv.DictReader(handle))
 
 
-def build_per_run_bins(detail_rows: list[dict[str, str]]) -> list[dict[str, object]]:
+def build_per_run_bins(detail_rows: list[dict[str, str]]) -> list[ShellRun]:
     by_run: dict[str, list[dict[str, str]]] = {}
     for row in detail_rows:
         by_run.setdefault(row["run"], []).append(row)
 
-    runs: list[dict[str, object]] = []
+    runs: list[ShellRun] = []
     for run_name, rows in by_run.items():
         rows_sorted = sorted(rows, key=lambda row: int(row["depth_bin_index"]))
-        bins: list[dict[str, float | int | str | bool]] = []
+        bins: list[ShellDepthBin] = []
         for row in rows_sorted:
             lo = float(row["depth_bin_lo"])
             hi = parse_inf_float(row["depth_bin_hi"])
@@ -203,7 +230,7 @@ def summarize_metric(rate: np.ndarray, values: np.ndarray) -> dict[str, float | 
     }
 
 
-def build_band_scan_rows(runs: list[dict[str, object]]) -> list[dict[str, float | int | str | bool]]:
+def build_band_scan_rows(runs: list[ShellRun]) -> list[dict[str, float | int | str | bool]]:
     if not runs:
         return []
     first_bins = runs[0]["bins"]
@@ -388,7 +415,7 @@ def build_common_band_summary(
 
 
 def aggregate_region_from_indices(
-    run: dict[str, object],
+    run: ShellRun,
     *,
     start_index: int,
     end_index: int,
@@ -412,7 +439,7 @@ def aggregate_region_from_indices(
 
 
 def build_focus_region_rows(
-    runs: list[dict[str, object]],
+    runs: list[ShellRun],
     *,
     focus_row: dict[str, float | int | str | bool],
 ) -> list[dict[str, float | int | str | bool]]:
@@ -486,7 +513,7 @@ def build_focus_region_rows(
     return summary_rows
 
 
-def build_moment_rows(runs: list[dict[str, object]]) -> tuple[list[dict[str, float | int | str]], dict[str, float | int | str]]:
+def build_moment_rows(runs: list[ShellRun]) -> tuple[list[dict[str, float | int | str]], dict[str, float | int | str]]:
     moment_rows: list[dict[str, float | int | str]] = []
     rate = np.array([float(run["rate_K_per_s"]) for run in runs], dtype=float)
     tau_q = np.array([float(run["t_ramp_s"]) for run in runs], dtype=float)
@@ -562,7 +589,7 @@ def main() -> int:
 
     offsets = [float(item) for item in parse_csv_list(args.offsets)]
     band_scans_by_offset: dict[str, list[dict[str, float | int | str | bool]]] = {}
-    runs_by_offset: dict[str, list[dict[str, object]]] = {}
+    runs_by_offset: dict[str, list[ShellRun]] = {}
     region_summary_all: list[dict[str, float | int | str | bool]] = []
     moment_summary_rows: list[dict[str, float | int | str]] = []
 

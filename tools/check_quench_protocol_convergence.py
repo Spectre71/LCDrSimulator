@@ -106,7 +106,7 @@ def parse_optional_csv_list(raw: str) -> list[str]:
 
 
 def resolve_observable_fields(extra_observables_raw: str) -> tuple[str, ...]:
-    fields = list(OBSERVABLE_FIELDS)
+    fields: list[str] = list(OBSERVABLE_FIELDS)
     for field in parse_optional_csv_list(extra_observables_raw):
         if field not in fields:
             fields.append(field)
@@ -114,7 +114,7 @@ def resolve_observable_fields(extra_observables_raw: str) -> tuple[str, ...]:
 
 
 def resolve_comparison_fields(observable_fields: tuple[str, ...]) -> tuple[str, ...]:
-    fields = [field for field in COMPARISON_FIELDS if field in observable_fields]
+    fields: list[str] = [field for field in COMPARISON_FIELDS if field in observable_fields]
     for field in observable_fields:
         if field not in fields and field not in ("bulk", "elastic", "anchoring"):
             fields.append(field)

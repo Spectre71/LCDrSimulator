@@ -157,7 +157,7 @@ def aggregate_proxy(
     params = PRESETS[preset_name]
     proxy_dir = analysis_dir / preset_name / proxy
     proxy_dir.mkdir(parents=True, exist_ok=True)
-    _, _, csv_path = qv.aggregate_kz_scaling_3d(
+    aggregate_result = qv.aggregate_kz_scaling_3d(
         parent_dir=str(sweep_root),
         run_dirs=run_dirs,
         out_dir=str(proxy_dir),
@@ -180,6 +180,7 @@ def aggregate_proxy(
         write_files=True,
         close=True,
     )
+    csv_path = aggregate_result[2]
     if not csv_path:
         raise RuntimeError(f"aggregate_kz_scaling_3d did not produce a CSV for proxy={proxy}, preset={preset_name}")
     csv_path_obj = Path(csv_path)

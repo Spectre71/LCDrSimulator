@@ -227,7 +227,15 @@ def main() -> int:
         bbox={"boxstyle": "round,pad=0.4", "facecolor": "white", "alpha": 0.92, "edgecolor": "#cbd5e1"},
     )
 
-    fixed_x_ns = np.array([row.target_after_tc_s * 1e9 for row in fixed_rows], dtype=float)
+    fixed_targets = [row.target_after_tc_s for row in fixed_rows]
+    if any(target is None for target in fixed_targets):
+        raise ValueError("Fixed-window rows are missing target_after_tc_s")
+    fixed_target_ns: list[float] = []
+    for target in fixed_targets:
+        if target is None:
+            raise ValueError("Fixed-window rows are missing target_after_tc_s")
+        fixed_target_ns.append(target * 1e9)
+    fixed_x_ns = np.array(fixed_target_ns, dtype=float)
     fixed_y = np.array([row.slope_vs_tauq for row in fixed_rows], dtype=float)
     fixed_counts = [row.positive_case_count for row in fixed_rows]
     ax_fixed.plot(fixed_x_ns, fixed_y, color="#2563eb", marker="s", ms=6.0, linewidth=1.8)

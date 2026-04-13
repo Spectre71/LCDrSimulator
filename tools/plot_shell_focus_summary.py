@@ -7,10 +7,12 @@ import csv
 import math
 from pathlib import Path
 import sys
+from typing import TypedDict
 
 import matplotlib
 
 matplotlib.use("Agg")
+from matplotlib.axes import Axes
 import matplotlib.pyplot as plt
 from matplotlib.colors import Normalize, TwoSlopeNorm
 import numpy as np
@@ -32,6 +34,17 @@ REGION_MARKERS = {
     "focus": "s",
     "bulk": "^",
 }
+
+
+class ShellFocusRun(TypedDict):
+    run: str
+    rate_K_per_s: float
+    t_ramp_s: float
+    selected_avg_S: float
+    total_used_plaquettes: float
+    total_defect_count: float
+    total_density: float
+    bins: list[dict[str, str]]
 
 
 def parse_args() -> argparse.Namespace:
@@ -118,12 +131,12 @@ def load_focus_band(common_summary_path: Path) -> dict[str, str]:
     raise ValueError(f"No rows found in {common_summary_path}")
 
 
-def group_shell_detail_by_run(detail_rows: list[dict[str, str]]) -> list[dict[str, object]]:
+def group_shell_detail_by_run(detail_rows: list[dict[str, str]]) -> list[ShellFocusRun]:
     by_run: dict[str, list[dict[str, str]]] = {}
     for row in detail_rows:
         by_run.setdefault(row["run"], []).append(row)
 
-    runs: list[dict[str, object]] = []
+    runs: list[ShellFocusRun] = []
     for run_name, rows in by_run.items():
         rows_sorted = sorted(rows, key=lambda row: int(row["depth_bin_index"]))
         runs.append(
@@ -142,7 +155,7 @@ def group_shell_detail_by_run(detail_rows: list[dict[str, str]]) -> list[dict[st
     return runs
 
 
-def aggregate_region(run: dict[str, object], start_index: int, end_index: int) -> dict[str, float]:
+def aggregate_region(run: ShellFocusRun, start_index: int, end_index: int) -> dict[str, float]:
     bins = run["bins"]
     assert isinstance(bins, list)
     selected = bins[start_index : end_index + 1]
@@ -163,7 +176,7 @@ def aggregate_region(run: dict[str, object], start_index: int, end_index: int) -
 
 
 def build_per_run_region_rows(
-    runs: list[dict[str, object]],
+    runs: list[ShellFocusRun],
     *,
     focus_start: int,
     focus_end: int,
@@ -307,7 +320,7 @@ def build_region_matrix(
     return matrix
 
 
-def annotate_heatmap(ax: plt.Axes, matrix: np.ndarray) -> None:
+def annotate_heatmap(ax: Axes, matrix: np.ndarray) -> None:
     for row_idx in range(matrix.shape[0]):
         for col_idx in range(matrix.shape[1]):
             value = matrix[row_idx, col_idx]

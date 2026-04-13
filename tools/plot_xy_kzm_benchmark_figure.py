@@ -5,6 +5,7 @@ import csv
 from dataclasses import dataclass
 from pathlib import Path
 
+from matplotlib.axes import Axes
 import matplotlib.pyplot as plt
 import numpy as np
 
@@ -116,7 +117,7 @@ def intercept_with_fixed_slope(series: ObservableSeries, slope: float) -> float:
 
 
 def plot_series_with_fit(
-    ax: plt.Axes,
+    ax: Axes,
     series: ObservableSeries,
     slope: float,
     intercept: float,

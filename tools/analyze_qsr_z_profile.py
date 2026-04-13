@@ -7,6 +7,7 @@ import csv
 from pathlib import Path
 import re
 import sys
+from typing import TypedDict
 
 import matplotlib
 
@@ -19,6 +20,28 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 import QSRvis as qv
+
+
+class SliceProfileRow(TypedDict):
+    slice_index: int
+    density: float
+    defect_count: int
+    used_plaquettes: int
+
+
+class ProfileRunEntry(TypedDict):
+    label: str
+    metrics: dict[str, float]
+    field_path: Path
+    selected_iter: int
+    selected_time_s: float
+    actual_after_tc_s: float
+    selected_avg_s: float
+    Nx: int
+    Ny: int
+    Nz: int
+    z_center: int
+    rows: list[SliceProfileRow]
 
 
 def parse_args() -> argparse.Namespace:
@@ -202,10 +225,10 @@ def compute_profile_rows(
     *,
     S_threshold: float,
     charge_cutoff: float,
-) -> tuple[int, int, int, list[dict[str, float | int | str]]]:
+) -> tuple[int, int, int, list[SliceProfileRow]]:
     Nx, Ny, Nz = qv.infer_grid_dims_from_nematic_field_file(str(field_path))
     S, nx, ny, nz = qv.load_nematic_field_volume(str(field_path), Nx, Ny, Nz)
-    rows = qv._slice_profile_rows(
+    raw_rows = qv._slice_profile_rows(
         S,
         nx,
         ny,
@@ -214,6 +237,16 @@ def compute_profile_rows(
         S_threshold=float(S_threshold),
         charge_cutoff=float(charge_cutoff),
     )
+    rows: list[SliceProfileRow] = []
+    for row in raw_rows:
+        rows.append(
+            {
+                "slice_index": int(row["slice_index"]),
+                "density": float(row["density"]),
+                "defect_count": int(row["defect_count"]),
+                "used_plaquettes": int(row["used_plaquettes"]),
+            }
+        )
     return Nx, Ny, Nz, rows
 
 
@@ -399,7 +432,7 @@ def main() -> int:
     band_summary_rows: list[dict[str, float | int | str]] = []
 
     for offset_s in offsets:
-        per_run_profiles: list[dict[str, object]] = []
+        per_run_profiles: list[ProfileRunEntry] = []
         z_center_use: int | None = None
 
         for run_dir in run_dirs:
