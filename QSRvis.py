@@ -4,9 +4,16 @@ import os
 import glob
 import csv
 import imageio.v2 as imageio
+import importlib
 import re
 import io
+import shlex
+import sys
+from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
+
+from tool_catalog import QSRToolSpec, QSR_TOOL_SPECS, QSR_TOOL_SPECS_BY_KEY
 
 
 def prompt_pick_folder(
@@ -98,6 +105,171 @@ try:  # pragma: no cover
     skeletonize_3d = _skeletonize
 except Exception:  # pragma: no cover
     pass
+
+
+@dataclass(frozen=True)
+class QSRToolResult:
+    key: str
+    argv: tuple[str, ...]
+    exit_code: int
+
+
+def list_qsr_tools() -> tuple[QSRToolSpec, ...]:
+    return QSR_TOOL_SPECS
+
+
+def get_qsr_tool_spec(key: str) -> QSRToolSpec:
+    try:
+        return QSR_TOOL_SPECS_BY_KEY[key]
+    except KeyError as exc:
+        known = ", ".join(spec.key for spec in QSR_TOOL_SPECS)
+        raise KeyError(f"Unknown QSR tool '{key}'. Known tools: {known}") from exc
+
+
+def _tool_repo_root() -> Path:
+    return Path(__file__).resolve().parent
+
+
+def _interactive_tool_context(spec: QSRToolSpec) -> dict[str, str]:
+    repo_root = _tool_repo_root()
+    binary = repo_root / "exe" / "QSR_cuda"
+    if not binary.exists():
+        binary = repo_root / "QSR_cuda"
+    return {
+        "source": str(repo_root) if spec.uses_source else "",
+        "out_dir": str(repo_root / "pics"),
+        "repo_root": str(repo_root),
+        "binary": str(binary),
+    }
+
+
+def _reload_tool_module(module_name: str) -> Any:
+    module = importlib.import_module(module_name)
+    return importlib.reload(module)
+
+
+def _run_tool_module(module_name: str, argv: list[str] | tuple[str, ...] | None = None) -> int:
+    module = _reload_tool_module(module_name)
+    main_fn = getattr(module, "main", None)
+    if main_fn is None:
+        raise AttributeError(f"Tool module {module_name} does not define main()")
+
+    argv_list = list(argv or [])
+    old_argv = list(sys.argv)
+    sys.argv = [module_name.rsplit(".", 1)[-1], *argv_list]
+    try:
+        result = main_fn()
+    finally:
+        sys.argv = old_argv
+
+    if result is None:
+        return 0
+    return int(result)
+
+
+def run_qsr_tool(key: str, argv: list[str] | tuple[str, ...] | None = None) -> QSRToolResult:
+    spec = get_qsr_tool_spec(key)
+    argv_tuple = tuple(argv or ())
+    exit_code = _run_tool_module(spec.module_name, argv_tuple)
+    return QSRToolResult(key=key, argv=argv_tuple, exit_code=exit_code)
+
+
+def run_qsr_tool_from_string(key: str, arg_string: str) -> QSRToolResult:
+    argv = shlex.split(arg_string) if arg_string.strip() else []
+    return run_qsr_tool(key, argv)
+
+
+def tool_analyze_kzm_prooving_ground(argv: list[str] | tuple[str, ...] | None = None) -> QSRToolResult:
+    return run_qsr_tool("analyze_kzm_prooving_ground", argv)
+
+
+def tool_analyze_kzm_bulk_ldg(argv: list[str] | tuple[str, ...] | None = None) -> QSRToolResult:
+    return run_qsr_tool("analyze_kzm_bulk_ldg", argv)
+
+
+def tool_check_quench_protocol_convergence(argv: list[str] | tuple[str, ...] | None = None) -> QSRToolResult:
+    return run_qsr_tool("check_quench_protocol_convergence", argv)
+
+
+def tool_analyze_confined_final_state(argv: list[str] | tuple[str, ...] | None = None) -> QSRToolResult:
+    return run_qsr_tool("analyze_confined_final_state", argv)
+
+
+def tool_analyze_midplane_slab(argv: list[str] | tuple[str, ...] | None = None) -> QSRToolResult:
+    return run_qsr_tool("analyze_midplane_slab", argv)
+
+
+def tool_analyze_qsr_z_profile(argv: list[str] | tuple[str, ...] | None = None) -> QSRToolResult:
+    return run_qsr_tool("analyze_qsr_z_profile", argv)
+
+
+def tool_analyze_shell_depth(argv: list[str] | tuple[str, ...] | None = None) -> QSRToolResult:
+    return run_qsr_tool("analyze_shell_depth", argv)
+
+
+def tool_analyze_shell_band_decomposition(argv: list[str] | tuple[str, ...] | None = None) -> QSRToolResult:
+    return run_qsr_tool("analyze_shell_band_decomposition", argv)
+
+
+def tool_analyze_shell_focus_exponent(argv: list[str] | tuple[str, ...] | None = None) -> QSRToolResult:
+    return run_qsr_tool("analyze_shell_focus_exponent", argv)
+
+
+def tool_plot_shell_focus_summary(argv: list[str] | tuple[str, ...] | None = None) -> QSRToolResult:
+    return run_qsr_tool("plot_shell_focus_summary", argv)
+
+
+def tool_plot_confined_transient_bridge_summary(argv: list[str] | tuple[str, ...] | None = None) -> QSRToolResult:
+    return run_qsr_tool("plot_confined_transient_bridge_summary", argv)
+
+
+def tool_plot_xy_kzm_benchmark_figure(argv: list[str] | tuple[str, ...] | None = None) -> QSRToolResult:
+    return run_qsr_tool("plot_xy_kzm_benchmark_figure", argv)
+
+
+def tool_plot_bulk_ldg_benchmark_figure(argv: list[str] | tuple[str, ...] | None = None) -> QSRToolResult:
+    return run_qsr_tool("plot_bulk_ldg_benchmark_figure", argv)
+
+
+def interactive_qsr_tool_runner() -> QSRToolResult:
+    specs = list_qsr_tools()
+    print("\nAvailable post-processing tools:\n")
+    for idx, spec in enumerate(specs):
+        print(f"{idx}: {spec.label}")
+        print(f"   {spec.summary}")
+
+    raw_choice = input(f"\nChoose tool [0-{len(specs) - 1}]: ").strip()
+    while not raw_choice.isdigit() or int(raw_choice) < 0 or int(raw_choice) >= len(specs):
+        print(f"Invalid input. Please enter a number between 0 and {len(specs) - 1}.")
+        raw_choice = input(f"Choose tool [0-{len(specs) - 1}]: ").strip()
+
+    spec = specs[int(raw_choice)]
+    ctx = _interactive_tool_context(spec)
+    print(f"\nSelected: {spec.label}\n")
+    print(spec.help_text)
+    if spec.arg_template:
+        print("\nArgument template:")
+        print(f"  {spec.arg_template}")
+    if spec.uses_source:
+        source_value = input(f"\n{spec.source_label} [{ctx['source']}]: ").strip()
+        if source_value:
+            ctx["source"] = source_value
+    if spec.uses_out_dir or "{out_dir}" in spec.arg_template:
+        out_dir_value = input(f"Output dir [{ctx['out_dir']}]: ").strip()
+        if out_dir_value:
+            ctx["out_dir"] = out_dir_value
+    if "{binary}" in spec.arg_template:
+        binary_value = input(f"Binary path [{ctx['binary']}]: ").strip()
+        if binary_value:
+            ctx["binary"] = binary_value
+    arg_string = input("\nArguments (blank to use the resolved template): ").strip()
+    if not arg_string:
+        arg_string = spec.arg_template
+    try:
+        arg_string = arg_string.format(**ctx)
+    except KeyError as exc:
+        raise ValueError(f"Unknown placeholder in tool argument string: {exc}") from exc
+    return run_qsr_tool_from_string(spec.key, arg_string)
 
 def load_qtensor_data(path, comments="#"):
     """Loads Qtensor output with columns: i j k Qxx Qxy Qxz Qyx Qyy Qyz Qzx Qzy Qzz."""
@@ -4781,7 +4953,6 @@ def animate_tempSweep(
         return gif_path
     return None
 
-# Use imageio or ffmpeg to make an animation from the frames
 # ----------------------------------------------------------------------- MAIN SCRIPT ---------------------------------------------------------------------------|
 if __name__ == '__main__':
     # --- Configuration ---
@@ -4810,10 +4981,11 @@ if __name__ == '__main__':
               "10: Sweep KZ slope stability vs offset after Tc\n"
               "11: 3D metrics from a snapshot (xi_3D + defect-line proxy)\n"
               "12: Aggregate KZ scaling using 3D metrics (xi_3D + defect-line proxy)\n"
-              "Enter your choice (0-12): ").strip()
-    while not i.isdigit() or int(i) < 0 or int(i) > 12:
-        print("Invalid input. Please enter a number between 0 and 12.")
-        i = input("Please enter a number between 0 and 12: ").strip()
+              "13: Run a post-processing tool from tools/\n"
+              "Enter your choice (0-13): ").strip()
+    while not i.isdigit() or int(i) < 0 or int(i) > 13:
+        print("Invalid input. Please enter a number between 0 and 13.")
+        i = input("Please enter a number between 0 and 13: ").strip()
     i = int(i)
 # ---------------------------------------------------------------------- PART 1 ----------------------------------------------------------------------------|
     if i == 0:
@@ -5722,4 +5894,10 @@ if __name__ == '__main__':
             )
         except Exception as e:
             print(f"Error aggregating 3D KZ scaling: {e}")
+    elif i == 13:
+        try:
+            result = interactive_qsr_tool_runner()
+            print(f"Tool '{result.key}' finished with exit code {result.exit_code}.")
+        except Exception as e:
+            print(f"Error while running tool: {e}")
     # ---------------------------------------------------------------------- FIN --------------------------------------------------------------------------------|

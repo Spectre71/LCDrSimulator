@@ -437,3 +437,12 @@ Historical output paths preserve the directory names that were in use when a bra
     * The `exe` folder now contains `KZM_prooving_ground_cuda`, `KZM_bulk_ldg_cuda`, and `QSR_cuda` executables for the periodic XY, periodic bulk-LdG, and confined QSR branches, respectively.
     * The `README.md` now documents the new executable paths for running the different branches and their associated configs.
 * Update `GUI.py` to default to the new `exe/QSR_cuda` path and added a note about the change in the README.
+
+### v0.4.4
+
+* Unified the post-processing tool entry points between `QSRvis.py` and the GUI.
+    * New shared tool metadata now live in `tool_catalog.py`, so the registered confined, benchmark, and protocol-analysis scripts are described once and reused consistently.
+    * `QSRvis.py` now exposes wrapper functions for the registered `tools/` modules and adds interactive menu option `13` as a shared tool launcher.
+* Replaced the old single-purpose GUI evaluation page with a general `Tools` workspace.
+    * `GUI.py` now lists the registered post-processing utilities, shows a definition/help panel plus editable argument template, and captures stdout/stderr into the GUI while previewing generated text and figure artifacts.
+    * This keeps the project’s accumulated analysis scripts accessible from the main launcher instead of leaving them as disconnected standalone entry points.

@@ -11,6 +11,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from tool_catalog import QSRToolSpec, QSR_TOOL_SPECS, QSR_TOOL_SPECS_BY_KEY
+
 try:
 	import tkinter as tk
 	from tkinter import filedialog, messagebox
@@ -153,12 +155,17 @@ class QSRGui(tk.Tk):
 		# Evaluation tab state
 		self.eval_source = tk.StringVar(value="")
 		self.eval_out_dir = tk.StringVar(value="pics")
+		self.tool_mode = tk.StringVar(value=QSR_TOOL_SPECS[0].key)
 		self._eval_vars: dict[str, tk.Variable] = {}
 		self._eval_fig = None
 		self._eval_canvas = None
 		self._eval_toolbar = None
 		self._eval_canvas_container = None
 		self._eval_status = tk.StringVar(value="")
+		self._tool_mode_title = tk.StringVar(value=QSR_TOOL_SPECS[0].label)
+		self._tool_source_label = tk.StringVar(value=QSR_TOOL_SPECS[0].source_label)
+		self._tool_args_widget = None
+		self._tool_info_widget = None
 		self._eval_text_widget = None
 
 		self._build_ui()
@@ -1371,7 +1378,7 @@ class QSRGui(tk.Tk):
 
 	def _build_evaluation_tab(self) -> None:
 		eval_tab = ttk.Frame(self.notebook)
-		self.notebook.add(eval_tab, text="Evaluation")
+		self.notebook.add(eval_tab, text="Tools")
 
 		controls = ttk.Frame(eval_tab)
 		controls.pack(side=tk.TOP, fill=tk.X, padx=10, pady=(10, 6))
@@ -1379,62 +1386,66 @@ class QSRGui(tk.Tk):
 
 		self._add_collapsible_info_section(
 			eval_tab,
-			key="evaluation_tab_about",
-			title="About evaluation",
+			key="tools_tab_about",
+			title="About tools",
 			text=_join_lines(
-				"This tab evaluates a whole-volume defect observable from a run directory or a specific nematic_field_*.dat snapshot.",
-				"It computes two things together:",
-				"  - 3D low-S core / skeleton defect proxies (candidate Kibble-Zurek observables),",
-				"  - slice-by-slice 2D defect profiles along x/y/z (diagnostic localization only).",
-				"Use the 3D scalar densities for later scaling fits; use the slice profiles to see whether the signal is bulk-wide or shell-localized.",
-				"If Source is blank, the GUI tries the last run output directory; otherwise it falls back to the repo root.",
-				"If you want to inspect localization near nucleation rather than the final state, point Source at a specific nematic_field_iter_*.dat snapshot file.",
+				"This tab runs the post-processing and validation utilities collected under tools/ through QSRvis wrappers.",
+				"Use it for benchmark reductions, confined-observable scans, shell-band selection, exponent extraction, and figure regeneration.",
+				"The Primary path entry is inserted into the {source} placeholder for tools that need a sweep root or config path.",
+				"Output dir is inserted into the {out_dir} placeholder and is also used for preview discovery when the tool writes PNG, Markdown, TXT, or CSV artifacts.",
+				"If a tool ignores Primary path by default, its definition box states that explicitly and you can still override paths manually in the argument template.",
 			),
 			wraplength=980,
 		)
 
-		ttk.Label(controls, text="Source (run dir or file):").grid(row=0, column=0, sticky=tk.W)
-		ttk.Entry(controls, textvariable=self.eval_source).grid(row=0, column=1, sticky=tk.EW, padx=(8, 8))
-		ttk.Button(controls, text="Browse…", command=self._browse_eval_source).grid(row=0, column=2, sticky=tk.E)
+		ttk.Label(controls, text="Tool:").grid(row=0, column=0, sticky=tk.W)
+		ttk.OptionMenu(
+			controls,
+			self.tool_mode,
+			self.tool_mode.get(),
+			*[spec.key for spec in QSR_TOOL_SPECS],
+			command=lambda _v: self._on_tool_mode_change(reset_args=True),
+		).grid(row=0, column=1, sticky=tk.W, padx=(8, 8))
+		ttk.Label(controls, textvariable=self._tool_mode_title, foreground="#555").grid(row=0, column=2, sticky=tk.W)
 
-		ttk.Label(controls, text="Output dir:").grid(row=1, column=0, sticky=tk.W, pady=(6, 0))
-		ttk.Entry(controls, textvariable=self.eval_out_dir, width=20).grid(row=1, column=1, sticky=tk.W, padx=(8, 8), pady=(6, 0))
+		ttk.Label(controls, textvariable=self._tool_source_label).grid(row=1, column=0, sticky=tk.W, pady=(6, 0))
+		ttk.Entry(controls, textvariable=self.eval_source).grid(row=1, column=1, sticky=tk.EW, padx=(8, 8), pady=(6, 0))
+		ttk.Button(controls, text="Browse…", command=self._browse_eval_source).grid(row=1, column=2, sticky=tk.E, pady=(6, 0))
+
+		ttk.Label(controls, text="Output dir ({out_dir}):").grid(row=2, column=0, sticky=tk.W, pady=(6, 0))
+		ttk.Entry(controls, textvariable=self.eval_out_dir, width=24).grid(row=2, column=1, sticky=tk.W, padx=(8, 8), pady=(6, 0))
 
 		btns = ttk.Frame(controls)
-		btns.grid(row=1, column=2, sticky=tk.E, pady=(6, 0))
-		ttk.Button(btns, text="Evaluate", command=self._on_evaluate_volume).pack(side=tk.LEFT)
+		btns.grid(row=2, column=2, sticky=tk.E, pady=(6, 0))
+		ttk.Button(btns, text="Run tool", command=self._on_evaluate_volume).pack(side=tk.LEFT)
+		ttk.Button(btns, text="Reset args", command=self._reset_tool_args).pack(side=tk.LEFT, padx=(8, 0))
 		ttk.Button(btns, text="Clear", command=self._clear_evaluation).pack(side=tk.LEFT, padx=(8, 0))
 
 		status_row = ttk.Frame(eval_tab)
 		status_row.pack(side=tk.TOP, fill=tk.X, padx=10, pady=(0, 6))
 		ttk.Label(status_row, textvariable=self._eval_status, foreground="#444").pack(side=tk.LEFT)
 
-		opts = ttk.LabelFrame(eval_tab, text="Evaluation settings")
-		opts.pack(side=tk.TOP, fill=tk.X, padx=10, pady=(0, 8))
-		body = ttk.Frame(opts)
-		body.pack(side=tk.TOP, fill=tk.X, padx=8, pady=8)
+		info_box = ttk.LabelFrame(eval_tab, text="Tool definition")
+		info_box.pack(side=tk.TOP, fill=tk.BOTH, expand=False, padx=10, pady=(0, 8))
+		info_container = ttk.Frame(info_box)
+		info_container.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
+		self._tool_info_widget = tk.Text(info_container, wrap=tk.WORD, height=11)
+		self._tool_info_widget.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+		info_scroll = ttk.Scrollbar(info_container, orient=tk.VERTICAL, command=self._tool_info_widget.yview)
+		info_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+		self._tool_info_widget.configure(yscrollcommand=info_scroll.set, state=tk.DISABLED)
 
-		def add_row(frm: ttk.Frame, r: int, label: str, var: tk.Variable, *, width: int = 14) -> None:
-			ttk.Label(frm, text=label).grid(row=r, column=0, sticky=tk.W, pady=2)
-			ttk.Entry(frm, textvariable=var, width=width).grid(row=r, column=1, sticky=tk.W, padx=(8, 16), pady=2)
+		args_box = ttk.LabelFrame(eval_tab, text="Arguments")
+		args_box.pack(side=tk.TOP, fill=tk.BOTH, expand=False, padx=10, pady=(0, 8))
+		args_container = ttk.Frame(args_box)
+		args_container.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
+		self._tool_args_widget = tk.Text(args_container, wrap=tk.NONE, height=5)
+		self._tool_args_widget.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+		args_scroll = ttk.Scrollbar(args_container, orient=tk.VERTICAL, command=self._tool_args_widget.yview)
+		args_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+		self._tool_args_widget.configure(yscrollcommand=args_scroll.set)
 
-		self._eval_vars["s2d"] = tk.StringVar(value="0.1")
-		self._eval_vars["qcut"] = tk.StringVar(value="0.25")
-		self._eval_vars["band"] = tk.StringVar(value="0.1")
-		self._eval_vars["sdrop"] = tk.StringVar(value="0.1")
-		self._eval_vars["score"] = tk.StringVar(value="0.05")
-		self._eval_vars["dilate"] = tk.StringVar(value="2")
-		self._eval_vars["mincore"] = tk.StringVar(value="30")
-
-		add_row(body, 0, "2D S_threshold", self._eval_vars["s2d"], width=10)
-		add_row(body, 1, "2D charge_cutoff", self._eval_vars["qcut"], width=10)
-		add_row(body, 2, "boundary_band_frac", self._eval_vars["band"], width=10)
-		add_row(body, 3, "3D S_droplet", self._eval_vars["sdrop"], width=10)
-		add_row(body, 4, "3D S_core", self._eval_vars["score"], width=10)
-		add_row(body, 5, "3D dilate_iters", self._eval_vars["dilate"], width=10)
-		add_row(body, 6, "3D min_core_voxels", self._eval_vars["mincore"], width=10)
-
-		report_box = ttk.LabelFrame(eval_tab, text="Summary")
+		report_box = ttk.LabelFrame(eval_tab, text="Run output")
 		report_box.pack(side=tk.TOP, fill=tk.BOTH, expand=False, padx=10, pady=(0, 8))
 		report_container = ttk.Frame(report_box)
 		report_container.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
@@ -1444,13 +1455,14 @@ class QSRGui(tk.Tk):
 		eval_scroll.pack(side=tk.RIGHT, fill=tk.Y)
 		self._eval_text_widget.configure(yscrollcommand=eval_scroll.set, state=tk.DISABLED)
 		self._set_evaluation_text(
-			"Run an evaluation to compute whole-volume defect metrics, save a per-slice CSV, and preview the localization profiles."
+			"Run a tool to capture stdout/stderr, list generated artifacts, and preview the first PNG that was written."
 		)
 
-		canvas_box = ttk.LabelFrame(eval_tab, text="Profiles")
+		canvas_box = ttk.LabelFrame(eval_tab, text="Preview")
 		canvas_box.pack(side=tk.TOP, fill=tk.BOTH, expand=True, padx=10, pady=(0, 10))
 		self._eval_canvas_container = ttk.Frame(canvas_box)
 		self._eval_canvas_container.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
+		self._on_tool_mode_change(reset_args=True)
 
 	def _add_collapsible_info_section(
 		self,
@@ -1914,6 +1926,197 @@ class QSRGui(tk.Tk):
 		if p2:
 			self.eval_source.set(p2)
 
+	def _selected_tool_spec(self) -> QSRToolSpec:
+		return QSR_TOOL_SPECS_BY_KEY[self.tool_mode.get().strip()]
+
+	def _set_tool_info_text(self, text: str) -> None:
+		if self._tool_info_widget is None:
+			return
+		self._tool_info_widget.configure(state=tk.NORMAL)
+		self._tool_info_widget.delete("1.0", tk.END)
+		if text:
+			self._tool_info_widget.insert(tk.END, text)
+		self._tool_info_widget.configure(state=tk.DISABLED)
+
+	def _get_tool_args_text(self) -> str:
+		if self._tool_args_widget is None:
+			return ""
+		return self._tool_args_widget.get("1.0", tk.END).strip()
+
+	def _set_tool_args_text(self, text: str) -> None:
+		if self._tool_args_widget is None:
+			return
+		self._tool_args_widget.delete("1.0", tk.END)
+		if text:
+			self._tool_args_widget.insert(tk.END, text)
+
+	def _pick_eval_source_for_tool(self, spec: QSRToolSpec) -> str:
+		s = self.eval_source.get().strip()
+		if s:
+			return s
+		if not spec.uses_source:
+			return ""
+		if self.last_out_dir is not None:
+			return str(self.last_out_dir)
+		return str(_repo_root())
+
+	def _tool_template_context(self, spec: QSRToolSpec) -> dict[str, str]:
+		return {
+			"source": self._pick_eval_source_for_tool(spec),
+			"out_dir": self._abs_eval_out_dir(),
+			"repo_root": str(_repo_root()),
+			"binary": str(_default_backend_path()),
+		}
+
+	def _tool_definition_text(self, spec: QSRToolSpec) -> str:
+		ctx = self._tool_template_context(spec)
+		placeholder_lines = []
+		if spec.uses_source:
+			placeholder_lines.append(f"{{source}} -> {ctx['source']}")
+		else:
+			placeholder_lines.append("{source} is unused by the default template.")
+		if spec.uses_out_dir:
+			placeholder_lines.append(f"{{out_dir}} -> {ctx['out_dir']}")
+		else:
+			placeholder_lines.append("{out_dir} is unused by the default template.")
+		placeholder_lines.append(f"{{binary}} -> {ctx['binary']}")
+		placeholder_lines.append(f"{{repo_root}} -> {ctx['repo_root']}")
+		arg_template = spec.arg_template or "<no extra arguments; tool will use its own defaults>"
+		return _join_lines(
+			spec.summary,
+			"",
+			spec.help_text,
+			"",
+			f"Module: {spec.module_name}",
+			"Placeholder resolution:",
+			*placeholder_lines,
+			"",
+			"Argument template:",
+			arg_template,
+		)
+
+	def _reset_tool_args(self) -> None:
+		spec = self._selected_tool_spec()
+		self._set_tool_args_text(spec.arg_template)
+
+	def _on_tool_mode_change(self, *, reset_args: bool) -> None:
+		spec = self._selected_tool_spec()
+		self._tool_mode_title.set(spec.label)
+		self._tool_source_label.set(spec.source_label)
+		self._set_tool_info_text(self._tool_definition_text(spec))
+		if reset_args:
+			self._reset_tool_args()
+
+	def _expand_tool_arg_string(self, spec: QSRToolSpec, raw_args: str) -> str:
+		template = raw_args.strip() or spec.arg_template
+		ctx = self._tool_template_context(spec)
+		try:
+			return template.format(**ctx)
+		except KeyError as exc:
+			raise ValueError(f"Unknown placeholder in tool arguments: {exc}") from exc
+
+	def _normalize_tool_artifact_path(self, raw: str) -> Path | None:
+		candidate = raw.strip().strip('"').strip("'")
+		for marker in (" (", " [", " |"):
+			if marker in candidate:
+				candidate = candidate.split(marker, 1)[0].strip()
+		if not candidate:
+			return None
+		p = Path(candidate).expanduser()
+		if not p.is_absolute():
+			p = _repo_root() / p
+		return p if p.exists() else None
+
+	def _extract_tool_artifact_paths(self, text: str) -> list[Path]:
+		paths: list[Path] = []
+		for raw_line in text.splitlines():
+			line = raw_line.strip()
+			if not line:
+				continue
+			candidates: list[str] = []
+			if "=" in line:
+				candidates.append(line.split("=", 1)[1].strip())
+			if "->" in line:
+				candidates.append(line.split("->", 1)[1].strip())
+			if "Wrote " in line:
+				candidates.append(line.split("Wrote ", 1)[1].strip())
+			if line.startswith("Saved "):
+				candidates.append(line.split("Saved ", 1)[1].strip())
+			for raw in candidates:
+				path = self._normalize_tool_artifact_path(raw)
+				if path is not None and path not in paths:
+					paths.append(path)
+		return paths
+
+	def _read_text_preview(self, path: Path) -> str:
+		try:
+			content = path.read_text(encoding="utf-8", errors="replace")
+		except Exception as exc:
+			return f"Could not read {path}: {exc}"
+		lines = content.splitlines()
+		if len(lines) > 120:
+			return "\n".join(lines[:120]) + "\n..."
+		return content
+
+	def _preview_tool_artifacts(self, artifact_paths: list[Path], output_text: str) -> None:
+		try:
+			import matplotlib.pyplot as plt
+		except Exception:
+			plt = None
+
+		expanded: list[Path] = []
+		for path in artifact_paths:
+			if path.is_dir():
+				children = sorted(
+					[
+						child
+						for pattern in ("*.png", "*.md", "*.txt", "*.csv")
+						for child in path.glob(pattern)
+					],
+					key=lambda child: child.stat().st_mtime,
+					reverse=True,
+				)
+				expanded.extend(children[:4])
+			else:
+				expanded.append(path)
+
+		unique_paths: list[Path] = []
+		for path in expanded:
+			if path not in unique_paths:
+				unique_paths.append(path)
+
+		image_path = next((p for p in unique_paths if p.suffix.lower() in {".png", ".jpg", ".jpeg", ".gif", ".webp"}), None)
+		text_path = next((p for p in unique_paths if p.suffix.lower() in {".md", ".txt", ".csv"}), None)
+
+		message = output_text.strip() or "Tool completed successfully."
+		if unique_paths:
+			message = _join_lines(
+				message,
+				"",
+				"Artifacts:",
+				*[str(path) for path in unique_paths],
+			)
+		if text_path is not None:
+			message = _join_lines(
+				message,
+				"",
+				f"Preview: {text_path.name}",
+				self._read_text_preview(text_path),
+			)
+		self._set_evaluation_text(message)
+
+		if image_path is None or plt is None:
+			self._clear_evaluation_figure()
+			return
+
+		img = plt.imread(str(image_path))
+		fig, ax = plt.subplots(1, 1, figsize=(8.5, 6.0))
+		ax.imshow(img)
+		ax.set_axis_off()
+		ax.set_title(image_path.name)
+		fig.tight_layout()
+		self._display_evaluation_figure(fig)
+
 	def _clear_plot(self) -> None:
 		try:
 			import matplotlib.pyplot as plt
@@ -2159,6 +2362,21 @@ class QSRGui(tk.Tk):
 					self._app.update()
 				except Exception:
 					pass
+
+	class _GuiTeeStream(io.TextIOBase):
+		encoding = "utf-8"
+
+		def __init__(self, *streams: io.TextIOBase) -> None:
+			self._streams = streams
+
+		def write(self, s: str) -> int:
+			for stream in self._streams:
+				stream.write(s)
+			return len(s)
+
+		def flush(self) -> None:
+			for stream in self._streams:
+				stream.flush()
 
 	def _on_render_plot(self) -> None:
 		self._plot_status.set("Rendering…")
@@ -2596,65 +2814,46 @@ class QSRGui(tk.Tk):
 				self._append_log(f"[GUI][Plot] Error: {e}\n")
 
 	def _on_evaluate_volume(self) -> None:
-		self._eval_status.set("Evaluating…")
-		src = self._pick_eval_source()
+		spec = self._selected_tool_spec()
+		self._eval_status.set(f"Running {spec.label}…")
 		out_dir = self._abs_eval_out_dir()
 		try:
 			import QSRvis as v
 		except ModuleNotFoundError as e:
-			self._handle_missing_plot_dependency(e, context="Evaluation", status_var=self._eval_status)
+			self._handle_missing_plot_dependency(e, context="Tools", status_var=self._eval_status)
 			return
 		except Exception as e:
 			self._eval_status.set(f"Import failed: {e}")
-			self._append_log(f"[GUI][Evaluation] Import failed: {e}\n")
+			self._append_log(f"[GUI][Tools] Import failed: {e}\n")
 			return
 
 		import contextlib
 		from typing import cast
-		out_stream = QSRGui._GuiLogStream(self, prefix="[Evaluation] ")
-		err_stream = QSRGui._GuiLogStream(self, prefix="[Evaluation][stderr] ")
+		capture = io.StringIO()
+		log_out_stream = QSRGui._GuiLogStream(self, prefix=f"[Tool:{spec.key}] ")
+		log_err_stream = QSRGui._GuiLogStream(self, prefix=f"[Tool:{spec.key}][stderr] ")
+		out_stream = QSRGui._GuiTeeStream(log_out_stream, capture)
+		err_stream = QSRGui._GuiTeeStream(log_err_stream, capture)
 		with contextlib.redirect_stdout(cast(Any, out_stream)), contextlib.redirect_stderr(cast(Any, err_stream)):
 			try:
-				sthr = float(str(self._eval_vars["s2d"].get()).strip() or "0.1")
-				qcut = float(str(self._eval_vars["qcut"].get()).strip() or "0.25")
-				band = float(str(self._eval_vars["band"].get()).strip() or "0.1")
-				sdrop = float(str(self._eval_vars["sdrop"].get()).strip() or "0.1")
-				score = float(str(self._eval_vars["score"].get()).strip() or "0.05")
-				dilate = int(float(str(self._eval_vars["dilate"].get()).strip() or "2"))
-				mincore = int(float(str(self._eval_vars["mincore"].get()).strip() or "30"))
-				res = v.evaluate_volume_defects(
-					src,
-					out_dir=out_dir,
-					S_threshold_2d=sthr,
-					charge_cutoff_2d=qcut,
-					boundary_band_frac=band,
-					S_droplet=sdrop,
-					S_core=score,
-					dilate_iters=dilate,
-					min_core_voxels=mincore,
-					plot=True,
-					write_files=True,
-					show=False,
-					close=False,
-					return_fig=True,
-				)
-				fig = res.get("figure")
-				if fig is not None:
-					self._display_evaluation_figure(fig)
-				else:
-					self._clear_evaluation_figure()
-				self._set_evaluation_text(str(res.get("summary_text", "")).strip())
-				saved_paths = [
-					str(p)
-					for p in (res.get("summary_path"), res.get("csv_path"), res.get("figure_path"))
-					if p
-				]
-				self._eval_status.set(f"Saved evaluation -> {out_dir}")
-				if saved_paths:
-					self._append_log(f"[GUI][Evaluation] Saved: {', '.join(saved_paths)}\n")
+				expanded_args = self._expand_tool_arg_string(spec, self._get_tool_args_text())
+				result = v.run_qsr_tool_from_string(spec.key, expanded_args)
 			except Exception as e:
-				self._eval_status.set(f"Evaluation failed: {e}")
-				self._append_log(f"[GUI][Evaluation] Error: {e}\n")
+				output_text = capture.getvalue().strip()
+				if output_text:
+					self._set_evaluation_text(output_text)
+				self._eval_status.set(f"Tool failed: {e}")
+				self._append_log(f"[GUI][Tools] Error while running {spec.key}: {e}\n")
+				return
+
+		output_text = capture.getvalue().strip()
+		artifact_paths = self._extract_tool_artifact_paths(output_text)
+		out_path = Path(out_dir)
+		if out_path.exists() and out_path not in artifact_paths:
+			artifact_paths.append(out_path)
+		self._preview_tool_artifacts(artifact_paths, output_text)
+		self._eval_status.set(f"{spec.label} finished with exit code {result.exit_code}")
+		self._append_log(f"[GUI][Tools] {spec.key} finished with args: {expanded_args}\n")
 
 	def _collect_config_items(self) -> dict[str, str]:
 		items: dict[str, str] = {}

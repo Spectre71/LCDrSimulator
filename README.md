@@ -79,6 +79,8 @@ Launch the GUI with:
 venv/bin/python GUI.py
 ```
 
+The GUI now exposes a dedicated `Tools` tab for the shared post-processing utilities. It lets you pick a registered tool, inspect its purpose and argument template, substitute `{source}` and `{out_dir}` placeholders, and preview generated text or PNG outputs without leaving the launcher.
+
 ## Running the Solver
 
 The solver is intended to be driven by configuration files:
@@ -133,6 +135,8 @@ Raw snapshot iteration files and raw final field dumps are treated as reproducib
 ## Core Utilities
 
 The main analysis entry points are:
+
+- `QSRvis.py` option `13`: interactive wrapper around the registered `tools/` post-processing suite.
 
 - `tools/quench_rate_sweep.py`: launch parameterized quench-rate ladders.
 - `tools/check_quench_protocol_convergence.py`: run matched coarse/fine protocol checks.
