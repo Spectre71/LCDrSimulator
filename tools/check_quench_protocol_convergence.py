@@ -25,6 +25,19 @@ OBSERVABLE_FIELDS = (
     "xi_grad_proxy",
 )
 
+COMPARISON_FIELDS = (
+    "total",
+    "radiality",
+    "avg_S",
+    "max_S",
+    "defect_density_per_plaquette",
+    "xi_grad_proxy",
+)
+
+FIELD_ALIASES = {
+    "defect_density_per_plaquette": "defect_density",
+}
+
 
 @dataclass(frozen=True)
 class RunMetrics:
@@ -79,7 +92,37 @@ def parse_args() -> argparse.Namespace:
         default=float("nan"),
         help="Transition temperature used for the crossing-time comparison. Defaults to Tc_KZ from each config.",
     )
+    parser.add_argument(
+        "--extra-observables",
+        type=str,
+        default="",
+        help="Comma-separated additional quench-log columns to include in offsets/comparison outputs.",
+    )
     return parser.parse_args()
+
+
+def parse_optional_csv_list(raw: str) -> list[str]:
+    return [item.strip() for item in raw.split(",") if item.strip()]
+
+
+def resolve_observable_fields(extra_observables_raw: str) -> tuple[str, ...]:
+    fields = list(OBSERVABLE_FIELDS)
+    for field in parse_optional_csv_list(extra_observables_raw):
+        if field not in fields:
+            fields.append(field)
+    return tuple(fields)
+
+
+def resolve_comparison_fields(observable_fields: tuple[str, ...]) -> tuple[str, ...]:
+    fields = [field for field in COMPARISON_FIELDS if field in observable_fields]
+    for field in observable_fields:
+        if field not in fields and field not in ("bulk", "elastic", "anchoring"):
+            fields.append(field)
+    return tuple(fields)
+
+
+def comparison_alias(field: str) -> str:
+    return FIELD_ALIASES.get(field, field)
 
 
 def parse_kv_config(path: Path) -> dict[str, str]:
@@ -274,7 +317,11 @@ def write_metrics_csv(path: Path, metrics: list[RunMetrics]) -> None:
             writer.writerow(item.__dict__)
 
 
-def build_offset_rows(metrics: list[RunMetrics], logs: list[np.ndarray]) -> tuple[list[dict[str, float | str]], list[float]]:
+def build_offset_rows(
+    metrics: list[RunMetrics],
+    logs: list[np.ndarray],
+    observable_fields: tuple[str, ...],
+) -> tuple[list[dict[str, float | str]], list[float]]:
     reference_metrics = metrics[0]
     reference_log = logs[0]
     reference_time = series(reference_log, "time_s", "time")
@@ -292,14 +339,14 @@ def build_offset_rows(metrics: list[RunMetrics], logs: list[np.ndarray]) -> tupl
                 "time_s": target_time_s,
                 "T_K": interpolate_at(time_s, series(data, "T_K"), target_time_s),
             }
-            for field in OBSERVABLE_FIELDS:
+            for field in observable_fields:
                 row[field] = interpolate_at(time_s, series(data, field), target_time_s)
             rows.append(row)
     return rows, offsets
 
 
-def write_offsets_csv(path: Path, rows: list[dict[str, float | str]]) -> None:
-    fieldnames = ["label", "offset_s", "time_s", "T_K", *OBSERVABLE_FIELDS]
+def write_offsets_csv(path: Path, rows: list[dict[str, float | str]], observable_fields: tuple[str, ...]) -> None:
+    fieldnames = ["label", "offset_s", "time_s", "T_K", *observable_fields]
     with path.open("w", encoding="utf-8", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=fieldnames)
         writer.writeheader()
@@ -319,7 +366,13 @@ def absolute_difference(a: float, b: float) -> float:
     return abs(a - b)
 
 
-def write_comparison_csv(path: Path, metrics: list[RunMetrics], offset_rows: list[dict[str, float | str]], offsets: list[float]) -> None:
+def write_comparison_csv(
+    path: Path,
+    metrics: list[RunMetrics],
+    offset_rows: list[dict[str, float | str]],
+    offsets: list[float],
+    comparison_fields: tuple[str, ...],
+) -> None:
     reference = metrics[-1]
     fieldnames = [
         "reference_label",
@@ -327,14 +380,11 @@ def write_comparison_csv(path: Path, metrics: list[RunMetrics], offset_rows: lis
         "offset_s",
         "tc_crossing_time_diff_s",
         "abs_T_K_diff",
-        "abs_total_diff",
-        "rel_total_diff",
-        "abs_radiality_diff",
-        "abs_avg_S_diff",
-        "abs_max_S_diff",
-        "abs_defect_density_diff",
-        "abs_xi_grad_proxy_diff",
     ]
+    for field in comparison_fields:
+        alias = comparison_alias(field)
+        fieldnames.append(f"abs_{alias}_diff")
+        fieldnames.append(f"rel_{alias}_diff")
 
     rows_by_label: dict[str, dict[float, dict[str, float | str]]] = {}
     for row in offset_rows:
@@ -356,19 +406,64 @@ def write_comparison_csv(path: Path, metrics: list[RunMetrics], offset_rows: lis
                         "offset_s": offset_s,
                         "tc_crossing_time_diff_s": abs(item.tc_crossing_time_s - reference.tc_crossing_time_s),
                         "abs_T_K_diff": absolute_difference(float(test_row["T_K"]), float(ref_row["T_K"])),
-                        "abs_total_diff": absolute_difference(float(test_row["total"]), float(ref_row["total"])),
-                        "rel_total_diff": relative_difference(float(test_row["total"]), float(ref_row["total"])),
-                        "abs_radiality_diff": absolute_difference(float(test_row["radiality"]), float(ref_row["radiality"])),
-                        "abs_avg_S_diff": absolute_difference(float(test_row["avg_S"]), float(ref_row["avg_S"])),
-                        "abs_max_S_diff": absolute_difference(float(test_row["max_S"]), float(ref_row["max_S"])),
-                        "abs_defect_density_diff": absolute_difference(
-                            float(test_row["defect_density_per_plaquette"]),
-                            float(ref_row["defect_density_per_plaquette"]),
-                        ),
-                        "abs_xi_grad_proxy_diff": absolute_difference(
-                            float(test_row["xi_grad_proxy"]),
-                            float(ref_row["xi_grad_proxy"]),
-                        ),
+                        **{
+                            f"abs_{comparison_alias(field)}_diff": absolute_difference(float(test_row[field]), float(ref_row[field]))
+                            for field in comparison_fields
+                        },
+                        **{
+                            f"rel_{comparison_alias(field)}_diff": relative_difference(float(test_row[field]), float(ref_row[field]))
+                            for field in comparison_fields
+                        },
+                    }
+                )
+
+
+def write_final_state_comparison_csv(
+    path: Path,
+    metrics: list[RunMetrics],
+    logs: list[np.ndarray],
+    comparison_fields: tuple[str, ...],
+) -> None:
+    reference = metrics[-1]
+    reference_log = logs[-1]
+    reference_final_offset_s = reference.final_logged_time_s - reference.tc_crossing_time_s
+    reference_final_avg_s = float(series(reference_log, "avg_S")[-1])
+
+    fieldnames = [
+        "reference_label",
+        "test_label",
+        "observable",
+        "test_value",
+        "reference_value",
+        "abs_diff",
+        "rel_diff",
+        "test_final_offset_s",
+        "reference_final_offset_s",
+        "test_final_avg_S",
+        "reference_final_avg_S",
+    ]
+    with path.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fieldnames)
+        writer.writeheader()
+        for item, data in zip(metrics[:-1], logs[:-1]):
+            test_final_offset_s = item.final_logged_time_s - item.tc_crossing_time_s
+            test_final_avg_s = float(series(data, "avg_S")[-1])
+            for field in comparison_fields:
+                test_value = float(series(data, field)[-1])
+                reference_value = float(series(reference_log, field)[-1])
+                writer.writerow(
+                    {
+                        "reference_label": reference.label,
+                        "test_label": item.label,
+                        "observable": field,
+                        "test_value": test_value,
+                        "reference_value": reference_value,
+                        "abs_diff": absolute_difference(test_value, reference_value),
+                        "rel_diff": relative_difference(test_value, reference_value),
+                        "test_final_offset_s": test_final_offset_s,
+                        "reference_final_offset_s": reference_final_offset_s,
+                        "test_final_avg_S": test_final_avg_s,
+                        "reference_final_avg_S": reference_final_avg_s,
                     }
                 )
 
@@ -378,7 +473,13 @@ def max_finite(values: list[float]) -> float:
     return max(finite_values) if finite_values else float("nan")
 
 
-def print_summary(metrics: list[RunMetrics], offset_rows: list[dict[str, float | str]], offsets: list[float]) -> None:
+def print_summary(
+    metrics: list[RunMetrics],
+    logs: list[np.ndarray],
+    offset_rows: list[dict[str, float | str]],
+    offsets: list[float],
+    comparison_fields: tuple[str, ...],
+) -> None:
     rows_by_label: dict[str, dict[float, dict[str, float | str]]] = {}
     for row in offset_rows:
         rows_by_label.setdefault(str(row["label"]), {})[float(row["offset_s"])] = row
@@ -396,43 +497,57 @@ def print_summary(metrics: list[RunMetrics], offset_rows: list[dict[str, float |
     reference_rows = rows_by_label[reference.label]
     for item in metrics[:-1]:
         test_rows = rows_by_label[item.label]
-        total_abs_diffs = [
-            absolute_difference(float(test_rows[offset]["total"]), float(reference_rows[offset]["total"]))
-            for offset in offsets
+        summary_parts = [
+            f"dTcross={abs(item.tc_crossing_time_s - reference.tc_crossing_time_s):.6e} s",
         ]
-        total_diffs = [
-            relative_difference(float(test_rows[offset]["total"]), float(reference_rows[offset]["total"]))
-            for offset in offsets
+        for field in comparison_fields:
+            diffs = [
+                absolute_difference(float(test_rows[offset][field]), float(reference_rows[offset][field]))
+                for offset in offsets
+            ]
+            rel_diffs = [
+                relative_difference(float(test_rows[offset][field]), float(reference_rows[offset][field]))
+                for offset in offsets
+            ]
+            alias = comparison_alias(field)
+            if field == "total":
+                summary_parts.append(f"max_abs_total={max_finite(diffs):.6e}")
+                summary_parts.append(f"max_rel_total={max_finite(rel_diffs):.6e}")
+            elif field == "radiality":
+                summary_parts.append(f"max_dRbar={max_finite(diffs):.6e}")
+            elif field == "avg_S":
+                summary_parts.append(f"max_d<S>={max_finite(diffs):.6e}")
+            elif field == "defect_density_per_plaquette":
+                summary_parts.append(f"max_dDefect2D={max_finite(diffs):.6e}")
+            elif field == "xi_grad_proxy":
+                summary_parts.append(f"max_dXi={max_finite(diffs):.6e}")
+            elif field == "defect_line_density":
+                summary_parts.append(f"max_dDefectLine={max_finite(diffs):.6e}")
+            else:
+                summary_parts.append(f"max_d{alias}={max_finite(diffs):.6e}")
+        print(f"[protocol-check] {item.label} vs {reference.label}: " + ", ".join(summary_parts))
+
+    reference_log = logs[-1]
+    reference_final_offset_s = reference.final_logged_time_s - reference.tc_crossing_time_s
+    for item, data in zip(metrics[:-1], logs[:-1]):
+        final_parts = [
+            f"dFinalOffset={abs((item.final_logged_time_s - item.tc_crossing_time_s) - reference_final_offset_s):.6e} s",
+            f"dFinal<S>={absolute_difference(float(series(data, 'avg_S')[-1]), float(series(reference_log, 'avg_S')[-1])):.6e}",
         ]
-        radiality_diffs = [
-            absolute_difference(float(test_rows[offset]["radiality"]), float(reference_rows[offset]["radiality"]))
-            for offset in offsets
-        ]
-        avg_s_diffs = [
-            absolute_difference(float(test_rows[offset]["avg_S"]), float(reference_rows[offset]["avg_S"]))
-            for offset in offsets
-        ]
-        defect_diffs = [
-            absolute_difference(
-                float(test_rows[offset]["defect_density_per_plaquette"]),
-                float(reference_rows[offset]["defect_density_per_plaquette"]),
-            )
-            for offset in offsets
-        ]
-        xi_diffs = [
-            absolute_difference(float(test_rows[offset]["xi_grad_proxy"]), float(reference_rows[offset]["xi_grad_proxy"]))
-            for offset in offsets
-        ]
-        print(
-            f"[protocol-check] {item.label} vs {reference.label}: "
-            f"dTcross={abs(item.tc_crossing_time_s - reference.tc_crossing_time_s):.6e} s, "
-            f"max_abs_total={max_finite(total_abs_diffs):.6e}, "
-            f"max_rel_total={max_finite(total_diffs):.6e}, "
-            f"max_dRbar={max_finite(radiality_diffs):.6e}, "
-            f"max_d<S>={max_finite(avg_s_diffs):.6e}, "
-            f"max_dDefect2D={max_finite(defect_diffs):.6e}, "
-            f"max_dXi={max_finite(xi_diffs):.6e}"
-        )
+        for field in comparison_fields:
+            alias = comparison_alias(field)
+            diff = absolute_difference(float(series(data, field)[-1]), float(series(reference_log, field)[-1]))
+            if field == "defect_line_density":
+                final_parts.append(f"final_dDefectLine={diff:.6e}")
+            elif field == "defect_density_per_plaquette":
+                final_parts.append(f"final_dDefect2D={diff:.6e}")
+            elif field == "xi_grad_proxy":
+                final_parts.append(f"final_dXi={diff:.6e}")
+            elif field == "total":
+                final_parts.append(f"final_dTotal={diff:.6e}")
+            else:
+                final_parts.append(f"final_d{alias}={diff:.6e}")
+        print(f"[protocol-check] {item.label} vs {reference.label} final state: " + ", ".join(final_parts))
 
 
 def main() -> int:
@@ -448,6 +563,8 @@ def main() -> int:
             raise FileNotFoundError(f"Config not found: {cfg}")
 
     output_root.mkdir(parents=True, exist_ok=True)
+    observable_fields = resolve_observable_fields(args.extra_observables)
+    comparison_fields = resolve_comparison_fields(observable_fields)
 
     metrics: list[RunMetrics] = []
     logs: list[np.ndarray] = []
@@ -456,12 +573,13 @@ def main() -> int:
         metrics.append(metric)
         logs.append(log)
 
-    offset_rows, offsets = build_offset_rows(metrics, logs)
+    offset_rows, offsets = build_offset_rows(metrics, logs, observable_fields)
     write_metrics_csv(output_root / "protocol_metrics.csv", metrics)
-    write_offsets_csv(output_root / "protocol_offsets.csv", offset_rows)
+    write_offsets_csv(output_root / "protocol_offsets.csv", offset_rows, observable_fields)
     if len(metrics) > 1:
-        write_comparison_csv(output_root / "protocol_comparison.csv", metrics, offset_rows, offsets)
-    print_summary(metrics, offset_rows, offsets)
+        write_comparison_csv(output_root / "protocol_comparison.csv", metrics, offset_rows, offsets, comparison_fields)
+        write_final_state_comparison_csv(output_root / "final_state_comparison.csv", metrics, logs, comparison_fields)
+    print_summary(metrics, logs, offset_rows, offsets, comparison_fields)
     return 0
 
 

@@ -5,6 +5,7 @@ imageio
 imageio-ffmpeg
 pillow
 scipy
+scikit-image
 
 #----------------------------------COMMENTS-------------------------------------------#
 # requires python3-tk for GUI elements:

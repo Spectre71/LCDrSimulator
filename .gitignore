@@ -1,9 +1,9 @@
-pics
-validation
+pics/*
+validation/*
 venv
 x64
-literature
-conf*
+literature/*
+configs/*
 out*
 frames*
 *.dat
@@ -14,6 +14,7 @@ frames*
 .github
 .gui*
 QSR_*
+KZM_bulk_ldg_cuda
+KZM_prooving_ground_cuda
 GEMINI.md
-README.md
 __pycache__

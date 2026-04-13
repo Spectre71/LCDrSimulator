@@ -2468,6 +2468,7 @@ int main(int argc, char** argv) {
             int kzItersAfterStep = 0;
             bool kz_stop_early = false;
             int kzExtraIters = 0;
+            bool save_qtensor_snapshots = false;
             if (snapshot_mode == 2) {
                 std::cout << "\n[KZ MODE] Snapshots will be saved around Tc so you can measure at a chosen offset." << std::endl;
                 std::cout << "         Use a relatively dense snapshot frequency for flexibility (e.g. 1k–10k iters)." << std::endl;
@@ -2496,6 +2497,13 @@ int main(int argc, char** argv) {
                     kzExtraIters = cfg_or_prompt<int>(cfg, "kzExtraIters", "Extra iterations after leaving window (for coarsening/offset flexibility)", 0, interactive);
                     if (kzExtraIters < 0) kzExtraIters = 0;
                 }
+                save_qtensor_snapshots = cfg_or_prompt_yes_no(
+                    cfg,
+                    "save_qtensor_snapshots",
+                    "Also save Qtensor_output_iter_*.dat snapshots in KZ mode? (needed for biaxial-core analysis)",
+                    false,
+                    interactive
+                );
             }
 
             double noise_amplitude = 0.0;
@@ -2921,6 +2929,10 @@ int main(int argc, char** argv) {
 
                     if (do_snap) {
                         saveNematicFieldToFile(h_nf, Nx, Ny, Nz, (out_dir / ("nematic_field_iter_" + std::to_string(iter) + ".dat")).string());
+                        if (save_qtensor_snapshots) {
+                            cudaMemcpy(h_Q.data(), d_Q, size_Q, cudaMemcpyDeviceToHost);
+                            saveQTensorToFile(h_Q, Nx, Ny, Nz, (out_dir / ("Qtensor_output_iter_" + std::to_string(iter) + ".dat")).string());
+                        }
                     }
                 }
 

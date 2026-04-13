@@ -1,180 +1,232 @@
-# QSR - Landau-De Gennes Q-Tensor Solver
+# QSR
 
-## Overview
+QSR is a Landau-de Gennes Q-tensor solver for confined liquid-crystal droplets. The active implementation is the CUDA backend in `QSR.cu` and `QSR.cuh`; the CPU/OpenMP solver in `QSR.cpp` and `QSR.h` is retained as a reference path.
 
-QSR is a Landau-de Gennes Q-tensor solver for confined liquid-crystal droplets, with the active implementation in the CUDA backend. The current research workflow is centered on fixed-`dt` quench and Kibble-Zurek studies, supported by reduced validation harnesses, a Tkinter launcher, and post-processing utilities.
+The repository also includes two benchmark solvers used to validate Kibble-Zurek workflows outside confinement:
 
-The repository contains two solver paths:
+- `KZM_prooving_ground.cu` and `KZM_prooving_ground.cuh`: periodic 3D XY benchmark.
+- `KZM_bulk_ldg.cu` and `KZM_bulk_ldg.cuh`: periodic bulk Landau-de Gennes benchmark.
 
-- `QSR.cu` / `QSR.cuh`: primary CUDA implementation used for current work.
-- `QSR.cpp` / `QSR.h`: CPU/OpenMP reference implementation.
+## Features
 
-## Current Solver Scope
+- Symmetric, traceless Q-tensor with five independent components.
+- Landau-de Gennes bulk free energy with anisotropic elastic terms (`L1`, `L2`, `L3`) or Frank-mapped coefficients.
+- Strong and weak surface anchoring with explicit shell-order control through `boundary_order_mode` and `boundary_S`.
+- Shared droplet geometry in physical space across initialization, masks, anchoring, observables, and stability guards.
+- Single-temperature, temperature-sweep, and fixed-`dt` quench workflows.
+- Validation and post-processing utilities for protocol convergence, transient analysis, shell-depth localization, and exponent extraction.
 
-- Traceless, symmetric Q-tensor with 5 independent components.
-- Landau-de Gennes bulk free energy plus anisotropic elastic terms (`L1`, `L2`, `L3`) or a Frank-mapped path.
-- Strong and weak surface anchoring, with explicit shell-order control through `boundary_order_mode` and `boundary_S`.
-- Shared physical-space droplet geometry used across initialization, masks, anchoring, observables, and guards.
-- Simulation modes for single-temperature relaxation, temperature sweeps, and fixed-`dt` quenches.
-- Observable logging for total energy, energy components, radiality, average `S`, max `S`, 2D defect density, and 2D xi-gradient proxy.
+## Repository Layout
+
+- `QSR.cu`, `QSR.cuh`: primary CUDA solver.
+- `QSR.cpp`, `QSR.h`: CPU/OpenMP reference solver.
+- `KZM_prooving_ground.cu`, `KZM_prooving_ground.cuh`: periodic XY benchmark solver.
+- `KZM_bulk_ldg.cu`, `KZM_bulk_ldg.cuh`: periodic bulk-LdG benchmark solver.
+- `GUI.py`: Tkinter launcher and config editor.
+- `QSRvis.py`: plotting and post-processing library.
+- `configs/`: reusable solver and validation configurations.
+- `tools/`: analysis, benchmarking, and sweep utilities.
+- `validation/`: reduced validation outputs, analysis tables, and dated notes.
+- `pics/`: generated figures.
+- `literature/`: local physics references.
 
 ## Build
 
 ### Linux
 
-CUDA build:
+CUDA solver:
 
 ```bash
 nvcc -O3 -arch=sm_75 -std=c++17 -o QSR_cuda QSR.cu
 ```
 
-CPU reference build:
+CPU reference solver:
 
 ```bash
 g++ -O3 -std=c++23 -fopenmp -o QSR_cpu QSR.cpp
 ```
 
-Adjust `sm_XX` to your local GPU architecture.
+Periodic XY benchmark:
+
+```bash
+nvcc -O3 -arch=sm_75 -std=c++17 -o KZM_prooving_ground_cuda KZM_prooving_ground.cu
+```
+
+Periodic bulk-LdG benchmark:
+
+```bash
+nvcc -O3 -arch=sm_75 -std=c++17 -o KZM_bulk_ldg_cuda KZM_bulk_ldg.cu
+```
+
+Replace `sm_75` with the architecture of the target GPU.
 
 ### Windows
 
-Open `QSR.sln` in Visual Studio, select the desired configuration, and build the solution.
+Open `QSR.sln` in Visual Studio and build the desired configuration.
 
-## Running the CUDA Solver
+## Python Environment
 
-The recommended workflow is config-driven:
+Create a virtual environment and install the analysis dependencies:
 
 ```bash
-./QSR_cuda --config configs/q_100_K123.cfg
+python3 -m venv venv
+venv/bin/python -m pip install -r requirements.txt
 ```
-
-Config files use `key = value` syntax with optional `#` comments. Omitted keys fall back to backend defaults.
-
-### Important Config Semantics
-
-- `sim_mode = 1`: single-temperature run.
-- `sim_mode = 2`: temperature sweep.
-- `sim_mode = 3`: quench / Kibble-Zurek workflow.
-- `random_seed`: fixes stochastic initialization so validation and coarse/fine comparisons are reproducible.
-- `boundary_order_mode = equilibrium`: uses the equilibrium shell order `max(S_eq(T), 0)`.
-- `boundary_order_mode = custom`: uses explicit `boundary_S` instead.
-- `S0`: initialization amplitude only; it is no longer the shell-order control.
-- `enable_adaptive_dt`: legacy quench key only. In quench mode it is ignored on purpose; fixed `dt` is the contract.
-- `enable_early_stop`: now relies on energy plus defect-density stability. Radiality remains diagnostic only.
-- `defect_density_abs_eps`: absolute tolerance for the defect-density stopping channel.
-
-## GUI and Plotting
 
 Launch the GUI with:
 
 ```bash
-python3 GUI.py
+venv/bin/python GUI.py
 ```
 
-Install the Python plotting dependencies with:
+## Running the Solver
+
+The solver is intended to be driven by configuration files:
 
 ```bash
-python3 -m pip install -r requirements.txt
+./QSR_cuda --config <config.cfg>
 ```
 
-`GUI.py` is a config/launcher frontend. `QSRvis.py` is the plotting and post-processing utility used by the GUI and from the command line. The plotting code accepts both the legacy single-temperature iteration schema (`free_energy,time`) and the current schema (`total,time` plus optional `anchoring`).
+Configuration files use `key = value` syntax with optional `#` comments. Example configurations are provided under `configs/` and `configs/validation/`.
+
+### Important Configuration Semantics
+
+- `sim_mode = 1`: single-temperature relaxation.
+- `sim_mode = 2`: temperature sweep.
+- `sim_mode = 3`: fixed-`dt` quench / Kibble-Zurek workflow.
+- `random_seed`: fixes stochastic initialization for reproducible comparisons.
+- `boundary_order_mode = equilibrium`: uses the equilibrium shell order `max(S_eq(T), 0)`.
+- `boundary_order_mode = custom`: uses explicit `boundary_S`.
+- `S0`: initialization amplitude only; it is not the shell-order control.
+- `enable_adaptive_dt`: legacy quench key. In quench mode it is ignored by design.
+- `enable_early_stop`: uses energy plus defect-density stability. Radiality remains diagnostic.
+- `defect_density_abs_eps`: absolute tolerance for the defect-density stopping channel.
 
 ## Output Files
 
 Typical outputs include:
 
-- `free_energy_vs_iteration.dat`: single-temperature submode 1 iteration log.
-- `energy_components_vs_iteration.dat`: single-temperature submode 2 iteration log.
-- `quench_log.dat`: quench log with time, temperature, energy components, and observables.
-- `Qtensor_output_*.dat`: saved Q-tensor snapshots or final states.
-- `run_config.cfg`: config snapshot preserved alongside GUI-launched runs.
+- `quench_log.dat`: time, temperature, energies, and observables for quench runs.
+- `free_energy_vs_iteration.dat`: single-temperature iteration log.
+- `energy_components_vs_iteration.dat`: component-wise single-temperature log.
+- `Qtensor_output_*.dat`: saved Q-tensor states or snapshots.
+- `nematic_field_iter_*.dat`, `Qtensor_output_iter_*.dat`, `xy_field_iter_*.dat`, `q_tensor_iter_*.dat`: optional raw snapshot payloads.
+- `run_config.cfg`: preserved configuration snapshot for a completed run.
 
 Output locations depend on the workflow:
 
-- single-temperature runs typically write under `output/`
-- sweeps under `output_temp_sweep/`
+- single-temperature runs usually write under `output/`
+- temperature sweeps under `output_temp_sweep/`
 - quenches under the configured `out_dir`
 
-## Validation and Analysis Utilities
+## Validation Data Policy
 
-Reduced validation configs live under `configs/validation/`.
+The repository retains durable analysis products and removes bulky transient payloads once they have been reduced. The retained artifacts are:
 
-Current analysis harnesses:
+- generated configs and sweep plans
+- `quench_log.dat` and reduced metrics tables
+- analysis CSV, Markdown, and figure outputs
+- dated validation notes under `validation/`
 
-- Weak-anchoring mesh check:
+Raw snapshot iteration files and raw final field dumps are treated as reproducible intermediates. When a result needs additional temporal or spatial resolution, the corresponding run should be reproduced with a targeted configuration rather than relying on archived multi-gigabyte field trees.
 
-```bash
-venv/bin/python tools/weak_anchor_mesh_check.py \
-  configs/validation/weak_anchor_mesh_coarse.cfg \
-  configs/validation/weak_anchor_mesh_fine.cfg \
-  --binary ./QSR_cuda \
-  --output-root validation/weak_anchor_mesh
-```
+## Core Utilities
 
-- Fixed-`dt` quench protocol-convergence check:
+The main analysis entry points are:
 
-```bash
-venv/bin/python tools/quench_protocol_convergence_check.py \
-  configs/validation/quench_protocol_convergence_coarse.cfg \
-  configs/validation/quench_protocol_convergence_fine.cfg \
-  --binary ./QSR_cuda \
-  --output-root validation/quench_protocol_convergence
-```
+- `tools/quench_rate_sweep.py`: launch parameterized quench-rate ladders.
+- `tools/check_quench_protocol_convergence.py`: run matched coarse/fine protocol checks.
+- `tools/analyze_confined_final_state.py`: summarize final-state confined 3D defect metrics.
+- `tools/analyze_midplane_slab.py`: integrate the 2D defect metric across a centered slab.
+- `tools/analyze_shell_depth.py`: bin defects by inward shell depth and build shell-exclusion scans.
+- `tools/analyze_shell_band_decomposition.py`: choose a common shell-focus annulus from shell-depth tables.
+- `tools/plot_shell_focus_summary.py`: render skin/focus/bulk summaries from shell-band analysis.
+- `tools/analyze_shell_focus_exponent.py`: extract pooled late-window exponents for the selected shell band.
+- `tools/plot_xy_kzm_benchmark_figure.py`: render the periodic XY benchmark figure from existing analysis artifacts.
+- `tools/plot_bulk_ldg_benchmark_figure.py`: render the periodic bulk-LdG benchmark figure from existing analysis artifacts.
+- `tools/plot_confined_transient_bridge_summary.py`: render the confined transient bridge summary from existing cohort analyses.
 
-## Production Kibble-Zurek Workflow
+## Typical Workflows
 
-For production Kibble-Zurek analysis, do not rely on a single long quench. Run a matched coarse/fine pair and compare them with the protocol-convergence harness.
-
-Start by copying `configs/q_100_K123.cfg` into two production configs, for example:
-
-- `configs/q_100_K123_prod_coarse.cfg`
-- `configs/q_100_K123_prod_fine.cfg`
-
-### Keep Constant Between the Two Production Runs
-
-- droplet geometry: `Nx`, `Ny`, `Nz`, `dx`, `dy`, `dz`
-- material model: `a`, `b`, `c`, `T_star`, or the Frank constants / mapping choice used by the config
-- anchoring and boundary setup: `W`, `gamma`, `boundary_order_mode`, and `boundary_S` when custom
-- initialization and noise model: `init_mode`, `S0`, `noise_amplitude`, `random_seed`
-- quench temperatures and protocol family: `T_high`, `T_low`, `Tc_KZ`, `protocol`
-- solver path choices: `use_semi_implicit`, `L_stab`, `jacobi_iters`, limiter and guard toggles
-- logged observables and slices: defect / xi logging toggles and their slice thresholds
-
-### Change for the Fine Run
-
-- halve `dt`
-- double `pre_equil_iters`
-- double `ramp_iters`
-- double `total_iters`
-- if `kz_stop_early = true`, also double `kzExtraIters`
-- if you use `kzSnapshotFreq` and want the same physical snapshot spacing, double it as well
-
-`logFreq` does not control the physics. For analysis it is acceptable to keep it unchanged so the fine run logs more densely in physical time.
-
-### What to Send Back for Analysis
-
-After both production runs finish, I need one of the following:
-
-- the two output directories containing `quench_log.dat`
-- or the two configs plus the harness output directory from:
+### Protocol Convergence
 
 ```bash
-venv/bin/python tools/quench_protocol_convergence_check.py \
-  configs/q_100_K123_prod_coarse.cfg \
-  configs/q_100_K123_prod_fine.cfg \
+venv/bin/python tools/check_quench_protocol_convergence.py \
+  <coarse.cfg> \
+  <fine.cfg> \
   --binary ./QSR_cuda \
-  --output-root validation/quench_protocol_convergence_prod
+  --output-root validation/protocol_convergence
 ```
 
-If you run through the GUI instead of the CLI, just make sure the two runs use distinct `out_dir` values and keep the same coarse/fine refinement rule above.
+For quench studies, the fine configuration should preserve the physical protocol by halving `dt` and doubling the relevant iteration counts.
 
-## Repository Layout
+### Quench-Rate Sweep
 
-- `QSR.cu`, `QSR.cuh`: primary CUDA solver.
-- `QSR.cpp`, `QSR.h`: CPU reference solver.
-- `GUI.py`: config builder and launcher for the CUDA backend.
-- `QSRvis.py`: plots and post-processing.
-- `configs/`: reusable run configurations.
-- `tools/`: validation and analysis harnesses.
-- `validation/`: generated validation outputs.
-- `literature/`: local physics references used to verify model changes.
+```bash
+venv/bin/python tools/quench_rate_sweep.py run \
+  <base.cfg> \
+  --binary ./QSR_cuda \
+  --output-root validation/confined_rate_sweep \
+  --ramp-values 25,50,100,200,400 \
+  --keep-going
+```
+
+For large transient sweeps that only need a fixed set of late windows, add `--retain-offsets` so completed cases are pruned immediately after reduction.
+
+### Confined Localization and Exponent Extraction
+
+```bash
+venv/bin/python tools/analyze_shell_depth.py \
+  <sweep_root> \
+  --offsets 4.5e-8,5.0e-8,5.5e-8,6.0e-8,6.5e-8
+
+venv/bin/python tools/analyze_shell_band_decomposition.py \
+  <sweep_root> \
+  --offsets 4.5e-8,5.0e-8,5.5e-8,6.0e-8,6.5e-8
+
+venv/bin/python tools/plot_shell_focus_summary.py \
+  <sweep_root> \
+  --offsets 4.5e-8,5.0e-8,5.5e-8,6.0e-8,6.5e-8
+
+venv/bin/python tools/analyze_shell_focus_exponent.py \
+  <sweep_root> \
+  --offsets 4.5e-8,5.0e-8,5.5e-8,6.0e-8,6.5e-8
+```
+
+The same sweep root can also be interrogated with `tools/analyze_confined_final_state.py` or `tools/analyze_midplane_slab.py` when alternative observables are required.
+
+### Benchmark Figures
+
+Periodic XY benchmark:
+
+```bash
+venv/bin/python tools/plot_xy_kzm_benchmark_figure.py
+```
+
+Periodic bulk-LdG benchmark:
+
+```bash
+venv/bin/python tools/plot_bulk_ldg_benchmark_figure.py
+```
+
+Confined transient bridge summary:
+
+```bash
+venv/bin/python tools/plot_confined_transient_bridge_summary.py
+```
+
+## Benchmark Ladder
+
+The validation program is organized as a three-step ladder:
+
+1. periodic XY benchmark for a textbook continuous-transition reference
+2. periodic bulk Landau-de Gennes benchmark for the unconfined nematic bridge
+3. confined droplet sweeps for boundary-conditioned localization and scaling analysis
+
+This ordering keeps the confined interpretation grounded in branches where the protocol and readouts can be validated without confinement or anchoring.
+
+## Notes
+
+- The confined solver stores five independent Q-tensor components and enforces tracelessness through `Qzz = -(Qxx + Qyy)`.
+- Fixed `dt` is the required quench contract for Kibble-Zurek work in this repository.
+- Physics-facing changes should be checked against the references in `literature/` before they are promoted into the active workflows.

@@ -2,6 +2,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 import os
 import glob
+import csv
 import imageio.v2 as imageio
 import re
 import io
@@ -2248,6 +2249,9 @@ def defect_line_metrics_3d_from_field_file(
     *,
     S_droplet: float = 0.1,
     S_core: float = 0.05,
+    beta_min: float = 0.0,
+    core_region_mode: str = 'morphology',
+    shell_exclude_layers: float = 0.0,
     dilate_iters: int = 2,
     fill_holes: bool = False,
     core_erosion_iters: int = 0,
@@ -2257,11 +2261,10 @@ def defect_line_metrics_3d_from_field_file(
 ):
     """Estimate 3D defect-line content from a field file.
 
-    Current implementation is a pragmatic LdG-style proxy:
-    - identify droplet as largest connected component of S > S_droplet
-    - dilate droplet a bit to include adjacent low-S core voxels
-    - define core candidates as (dilated droplet) & (S_mag < S_core)
-    - optionally skeletonize core voxels and estimate total line length
+        Current implementation supports two core-region definitions:
+        - morphology: largest S>S_droplet component, optional hole fill / erosion / dilation
+        - distance: fill the droplet support and keep only voxels more than
+            shell_exclude_layers away from the interface before testing low-S / biaxiality
 
     Works for:
       - nematic_field_*.dat (uses S directly)
@@ -2279,26 +2282,46 @@ def defect_line_metrics_3d_from_field_file(
 
     Nx, Ny, Nz = infer_grid_dims_from_nematic_field_file(path)
     ncol = int(_infer_num_columns_from_text_file(path))
+    beta_use = None
     if ncol >= 12:
         Qxx, Qxy, Qxz, Qyy, Qyz, Qzz = load_qtensor_volume(path, Nx, Ny, Nz)
         trQ2 = Qxx * Qxx + Qyy * Qyy + Qzz * Qzz + 2.0 * (Qxy * Qxy + Qxz * Qxz + Qyz * Qyz)
+        trQ3 = (
+            Qxx**3 + Qyy**3 + Qzz**3
+            + 3.0 * Qxx * (Qxy * Qxy + Qxz * Qxz)
+            + 3.0 * Qyy * (Qxy * Qxy + Qyz * Qyz)
+            + 3.0 * Qzz * (Qxz * Qxz + Qyz * Qyz)
+            + 6.0 * Qxy * Qxz * Qyz
+        )
         S_mag = np.sqrt(np.maximum(0.0, 1.5 * trQ2))
         S_use = S_mag
+        beta_use = np.zeros_like(trQ2)
+        valid_beta = trQ2 > 1e-12
+        beta_use[valid_beta] = 1.0 - 6.0 * (trQ3[valid_beta] * trQ3[valid_beta]) / (trQ2[valid_beta] * trQ2[valid_beta] * trQ2[valid_beta])
+        beta_use = np.clip(beta_use, 0.0, 1.0)
     elif ncol >= 7:
         S, _, _, _ = load_nematic_field_volume(path, Nx, Ny, Nz)
         S_use = S
+        if float(beta_min) > 0.0:
+            raise ValueError(
+                f"Biaxial core analysis requires Qtensor snapshots, but {os.path.basename(path)} is a nematic_field dump"
+            )
     else:
         raise ValueError(f"Unsupported field file format in {path} (ncol={ncol})")
 
     S_use = np.asarray(S_use, dtype=float)
     finite = np.isfinite(S_use)
+    region_mode_norm = (core_region_mode or 'morphology').strip().lower()
+    use_distance_region = region_mode_norm in ('distance', 'dist', 'shell', 'shell_excluded', 'interface_distance')
+    if not use_distance_region and region_mode_norm not in ('morphology', 'morph', 'legacy'):
+        raise ValueError(f"Unsupported core_region_mode '{core_region_mode}'")
 
     droplet_seed = finite & (S_use > float(S_droplet))
     droplet = _largest_connected_component_3d(droplet_seed)
-    if bool(fill_holes):
+    if bool(fill_holes) or use_distance_region:
         # Important: defect cores (low-S) can appear as holes inside the droplet.
-        # Filling holes lets us detect cores *inside* the droplet without relying on dilation,
-        # and reduces the chance of capturing broad interface sheets.
+        # Distance-based shell exclusion must operate on the enclosing droplet support,
+        # not on a mask where the core itself has already been carved out as a hole.
         droplet = ndi_local.binary_fill_holes(droplet)
     droplet_vox = int(np.count_nonzero(droplet))
     if droplet_vox == 0:
@@ -2316,6 +2339,15 @@ def defect_line_metrics_3d_from_field_file(
             'line_density_per_system_voxel': float('nan'),
             'core_density_per_voxel': float('nan'),
             'core_density_per_system_voxel': float('nan'),
+            'S_droplet': float(S_droplet),
+            'S_core': float(S_core),
+            'beta_min': float(beta_min),
+            'core_region_mode': region_mode_norm,
+            'shell_exclude_layers': float(shell_exclude_layers),
+            'dilate_iters': int(dilate_iters),
+            'fill_holes': bool(fill_holes or use_distance_region),
+            'core_erosion_iters': int(core_erosion_iters),
+            'min_core_voxels': int(min_core_voxels),
         }
         if return_masks:
             out['droplet_mask'] = droplet
@@ -2323,21 +2355,29 @@ def defect_line_metrics_3d_from_field_file(
             out['skeleton_mask'] = np.zeros_like(droplet, dtype=bool)
         return out
 
-    # Define a safe interior region to avoid counting low-S interface voxels.
-    interior = droplet
-    if int(core_erosion_iters) > 0:
-        structure = np.ones((3, 3, 3), dtype=bool)
-        interior = ndi_local.binary_erosion(droplet, structure=structure, iterations=int(core_erosion_iters))
-
-    # Optional dilation can help catch slightly offset cores, but large dilation tends to
-    # include interface sheets. Keep it small in batch use (0-1).
-    if int(dilate_iters) > 0:
-        structure = np.ones((3, 3, 3), dtype=bool)
-        region = ndi_local.binary_dilation(interior, structure=structure, iterations=int(dilate_iters))
+    if use_distance_region:
+        shell_exclude_use = max(0.0, float(shell_exclude_layers))
+        distance_inside = ndi_local.distance_transform_edt(droplet)
+        region = droplet & (distance_inside > shell_exclude_use)
     else:
-        region = interior
+        # Define a safe interior region to avoid counting low-S interface voxels.
+        interior = droplet
+        if int(core_erosion_iters) > 0:
+            structure = np.ones((3, 3, 3), dtype=bool)
+            interior = ndi_local.binary_erosion(droplet, structure=structure, iterations=int(core_erosion_iters))
+
+        # Optional dilation can help catch slightly offset cores, but large dilation tends to
+        # include interface sheets. Keep it small in batch use (0-1).
+        if int(dilate_iters) > 0:
+            structure = np.ones((3, 3, 3), dtype=bool)
+            region = ndi_local.binary_dilation(interior, structure=structure, iterations=int(dilate_iters))
+        else:
+            region = interior
 
     core = region & finite & (S_use < float(S_core))
+    if float(beta_min) > 0.0:
+        assert beta_use is not None
+        core &= np.isfinite(beta_use) & (beta_use >= float(beta_min))
     core_vox = int(np.count_nonzero(core))
     if core_vox == 0:
         sys_vox = int(Nx) * int(Ny) * int(Nz)
@@ -2354,6 +2394,15 @@ def defect_line_metrics_3d_from_field_file(
             'line_density_per_system_voxel': 0.0,
             'core_density_per_voxel': 0.0,
             'core_density_per_system_voxel': 0.0,
+            'S_droplet': float(S_droplet),
+            'S_core': float(S_core),
+            'beta_min': float(beta_min),
+            'core_region_mode': region_mode_norm,
+            'shell_exclude_layers': float(shell_exclude_layers),
+            'dilate_iters': int(dilate_iters),
+            'fill_holes': bool(fill_holes or use_distance_region),
+            'core_erosion_iters': int(core_erosion_iters),
+            'min_core_voxels': int(min_core_voxels),
         }
         if return_masks:
             out['droplet_mask'] = droplet
@@ -2404,7 +2453,12 @@ def defect_line_metrics_3d_from_field_file(
         'core_density_per_system_voxel': core_density_sys,
         'S_droplet': float(S_droplet),
         'S_core': float(S_core),
+        'beta_min': float(beta_min),
+        'core_region_mode': region_mode_norm,
+        'shell_exclude_layers': float(shell_exclude_layers),
         'dilate_iters': int(dilate_iters),
+        'fill_holes': bool(fill_holes or use_distance_region),
+        'core_erosion_iters': int(core_erosion_iters),
         'min_core_voxels': int(min_core_voxels),
     }
     if return_masks:
@@ -2412,6 +2466,417 @@ def defect_line_metrics_3d_from_field_file(
         out['core_mask'] = core
         out['skeleton_mask'] = skel
     return out
+
+
+def _resolve_nematic_field_source(source: str) -> tuple[str, str]:
+    """Resolve a run directory or a field file to a nematic_field_*.dat path.
+
+    Returns:
+      (field_path, source_kind) where source_kind is 'dir' or 'file'
+    """
+    src = os.path.abspath(os.path.expanduser(source))
+    if os.path.isdir(src):
+        return _choose_final_field_file(src), 'dir'
+    if os.path.isfile(src):
+        return src, 'file'
+    raise FileNotFoundError(f"Source not found: {source}")
+
+
+def _safe_output_tag(source: str, field_path: str, source_kind: str) -> str:
+    if source_kind == 'dir':
+        base = os.path.basename(os.path.normpath(os.path.abspath(source)))
+    else:
+        base = os.path.splitext(os.path.basename(field_path))[0]
+    tag = re.sub(r'[^A-Za-z0-9._-]+', '_', base).strip('_')
+    return tag or 'volume_defects'
+
+
+def _slice_components_for_axis(
+    S: np.ndarray,
+    nx: np.ndarray,
+    ny: np.ndarray,
+    nz: np.ndarray,
+    axis: str,
+    index: int,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Return (S, comp_u, comp_v) on a 2D plane for a given normal axis.
+
+    The in-plane components are chosen so the 2D doubled-angle defect proxy sees the
+    tangent director on that plane:
+      - z-normal -> (nx, ny) on XY slices
+      - y-normal -> (nx, nz) on XZ slices
+      - x-normal -> (ny, nz) on YZ slices
+    """
+    axis_norm = (axis or 'z').strip().lower()
+    if axis_norm == 'z':
+        return S[:, :, index], nx[:, :, index], ny[:, :, index]
+    if axis_norm == 'y':
+        return S[:, index, :], nx[:, index, :], nz[:, index, :]
+    if axis_norm == 'x':
+        return S[index, :, :], ny[index, :, :], nz[index, :, :]
+    raise ValueError(f"Unsupported axis '{axis}' (expected x, y, or z)")
+
+
+def _slice_defect_stats(
+    S2: np.ndarray,
+    comp_u: np.ndarray,
+    comp_v: np.ndarray,
+    *,
+    S_threshold: float,
+    charge_cutoff: float,
+) -> tuple[float, int, int]:
+    """Return (density, defect_count, used_plaquettes) for one 2D slice."""
+    density, s_map = defect_density_2d_from_slice(
+        S2,
+        comp_u,
+        comp_v,
+        S_threshold=S_threshold,
+        charge_cutoff=charge_cutoff,
+    )
+    mask = (
+        (np.asarray(S2) > float(S_threshold))
+        & np.isfinite(S2)
+        & np.isfinite(comp_u)
+        & np.isfinite(comp_v)
+    )
+    plaq_mask = mask[:-1, :-1] & mask[1:, :-1] & mask[1:, 1:] & mask[:-1, 1:]
+    used = int(np.count_nonzero(plaq_mask))
+    count = int(np.count_nonzero(np.abs(s_map) > float(charge_cutoff)))
+    return float(density), count, used
+
+
+def _slice_profile_rows(
+    S: np.ndarray,
+    nx: np.ndarray,
+    ny: np.ndarray,
+    nz: np.ndarray,
+    *,
+    axis: str,
+    S_threshold: float,
+    charge_cutoff: float,
+) -> list[dict[str, Any]]:
+    axis_norm = (axis or 'z').strip().lower()
+    if axis_norm == 'z':
+        n_slices = int(S.shape[2])
+    elif axis_norm == 'y':
+        n_slices = int(S.shape[1])
+    elif axis_norm == 'x':
+        n_slices = int(S.shape[0])
+    else:
+        raise ValueError(f"Unsupported axis '{axis}' (expected x, y, or z)")
+
+    rows: list[dict[str, Any]] = []
+    for idx in range(n_slices):
+        S2, comp_u, comp_v = _slice_components_for_axis(S, nx, ny, nz, axis_norm, idx)
+        density, count, used = _slice_defect_stats(
+            S2,
+            comp_u,
+            comp_v,
+            S_threshold=S_threshold,
+            charge_cutoff=charge_cutoff,
+        )
+        rows.append(
+            {
+                'axis': axis_norm,
+                'slice_index': int(idx),
+                'density': float(density),
+                'defect_count': int(count),
+                'used_plaquettes': int(used),
+            }
+        )
+    return rows
+
+
+def _summarize_slice_rows(
+    rows: list[dict[str, Any]],
+    *,
+    boundary_band_frac: float,
+    top_k: int = 5,
+) -> dict[str, Any]:
+    if not rows:
+        raise ValueError("Slice-profile summary requires at least one row")
+
+    n_slices = len(rows)
+    total_count = int(sum(int(row['defect_count']) for row in rows))
+    total_used = int(sum(int(row['used_plaquettes']) for row in rows))
+    mean_density = (float(total_count) / float(total_used)) if total_used > 0 else 0.0
+    nonzero_slices = int(sum(1 for row in rows if float(row['density']) > 0.0))
+    midplane = rows[n_slices // 2].copy()
+
+    top_slices = sorted(
+        (row.copy() for row in rows),
+        key=lambda row: (float(row['density']), int(row['defect_count'])),
+        reverse=True,
+    )[: max(1, int(top_k))]
+
+    boundary_band_slices = 0
+    if float(boundary_band_frac) > 0.0:
+        boundary_band_slices = int(np.floor(float(boundary_band_frac) * float(n_slices)))
+        if boundary_band_slices <= 0:
+            boundary_band_slices = 1
+        boundary_band_slices = min(boundary_band_slices, n_slices // 2)
+
+    if boundary_band_slices > 0:
+        boundary_count = int(
+            sum(
+                int(row['defect_count'])
+                for row in rows
+                if int(row['slice_index']) < boundary_band_slices
+                or int(row['slice_index']) >= (n_slices - boundary_band_slices)
+            )
+        )
+    else:
+        boundary_count = 0
+    boundary_count_fraction = (float(boundary_count) / float(total_count)) if total_count > 0 else float('nan')
+
+    return {
+        'n_slices': int(n_slices),
+        'midplane': midplane,
+        'nonzero_slices': int(nonzero_slices),
+        'mean_density': float(mean_density),
+        'total_count': int(total_count),
+        'total_used_plaquettes': int(total_used),
+        'boundary_band_slices': int(boundary_band_slices),
+        'boundary_count': int(boundary_count),
+        'boundary_count_fraction': float(boundary_count_fraction),
+        'top_slices': top_slices,
+    }
+
+
+def _format_volume_defect_summary(summary: dict[str, Any]) -> str:
+    def _fmt(value: Any, *, digits: int = 9) -> str:
+        try:
+            value_f = float(value)
+        except Exception:
+            return str(value)
+        if not np.isfinite(value_f):
+            return 'nan'
+        return f"{value_f:.{digits}g}"
+
+    lines: list[str] = []
+    lines.append("Whole-volume defect evaluation")
+    lines.append(f"source: {summary['source']}")
+    lines.append(f"field: {summary['field_path']}")
+    lines.append(f"grid: {summary['Nx']} x {summary['Ny']} x {summary['Nz']}")
+    lines.append("")
+    lines.append("3D whole-volume proxies")
+    lines.append(f"  line_density_per_system_voxel = {_fmt(summary.get('line_density_per_system_voxel'))}")
+    lines.append(f"  core_density_per_system_voxel = {_fmt(summary.get('core_density_per_system_voxel'))}")
+    lines.append(f"  line_length_lattice = {_fmt(summary.get('line_length_lattice'))}")
+    lines.append(
+        f"  droplet_voxels = {int(summary.get('droplet_voxels', 0))}, "
+        f"core_voxels = {int(summary.get('core_voxels', 0))}, "
+        f"skeleton_voxels = {int(summary.get('skeleton_voxels', 0))}"
+    )
+    lines.append("")
+    lines.append("Per-axis 2D slice profiles")
+    slice_profiles = summary.get('slice_profiles', {})
+    for axis in ('x', 'y', 'z'):
+        prof = slice_profiles.get(axis)
+        if not prof:
+            continue
+        mid = prof['midplane']
+        top = prof['top_slices']
+        lines.append(
+            f"  {axis}: mean_density={_fmt(prof['mean_density'])}, "
+            f"nonzero_slices={prof['nonzero_slices']}/{prof['n_slices']}, "
+            f"boundary_count_fraction={_fmt(prof['boundary_count_fraction'], digits=6)}"
+        )
+        lines.append(
+            f"     midplane {axis}={mid['slice_index']}: density={_fmt(mid['density'])}, "
+            f"count={mid['defect_count']}, used={mid['used_plaquettes']}"
+        )
+        lines.append(
+            "     top slices: "
+            + ", ".join(
+                f"{axis}={row['slice_index']} (d={_fmt(row['density'])}, n={row['defect_count']}, used={row['used_plaquettes']})"
+                for row in top[:3]
+            )
+        )
+    lines.append("")
+    lines.append("Interpretation")
+    lines.append("  - Use the 3D line/core densities as whole-volume KZM candidates.")
+    lines.append("  - Use the per-slice profiles only to diagnose localization and boundary bias.")
+    lines.append("  - If the hottest slices sit near the shell, a later KZM fit may need an interior-restricted observable.")
+    return "\n".join(lines)
+
+
+def evaluate_volume_defects(
+    source: str,
+    *,
+    out_dir: str = 'pics',
+    S_threshold_2d: float = 0.1,
+    charge_cutoff_2d: float = 0.25,
+    boundary_band_frac: float = 0.1,
+    S_droplet: float = 0.1,
+    S_core: float = 0.05,
+    dilate_iters: int = 2,
+    fill_holes: bool = False,
+    core_erosion_iters: int = 0,
+    min_core_voxels: int = 30,
+    plot: bool = True,
+    write_files: bool = True,
+    show: bool = True,
+    close: bool = True,
+    return_fig: bool = False,
+):
+    """Evaluate a whole-volume defect observable and slice-localization diagnostics.
+
+    This routine is intended as the bridge between current slice-based logging and the
+    later Kibble-Zurek scaling workflow:
+      - the 3D skeleton/core densities are candidate whole-volume scalar observables,
+      - the per-slice profiles show whether the strongest defects are bulk-wide or
+        concentrated near boundaries/shell layers.
+
+    The input may be either:
+      - a run directory containing nematic_field_final.dat or nematic_field_iter_*.dat, or
+      - a specific nematic_field_*.dat snapshot file.
+    """
+    field_path, source_kind = _resolve_nematic_field_source(source)
+    Nx, Ny, Nz = infer_grid_dims_from_nematic_field_file(field_path)
+    S, nx, ny, nz = load_nematic_field_volume(field_path, Nx, Ny, Nz)
+
+    slice_rows_by_axis = {
+        axis: _slice_profile_rows(
+            S,
+            nx,
+            ny,
+            nz,
+            axis=axis,
+            S_threshold=float(S_threshold_2d),
+            charge_cutoff=float(charge_cutoff_2d),
+        )
+        for axis in ('x', 'y', 'z')
+    }
+    slice_profiles = {
+        axis: _summarize_slice_rows(rows, boundary_band_frac=float(boundary_band_frac))
+        for axis, rows in slice_rows_by_axis.items()
+    }
+
+    defect3d = defect_line_metrics_3d_from_field_file(
+        field_path,
+        S_droplet=float(S_droplet),
+        S_core=float(S_core),
+        dilate_iters=int(dilate_iters),
+        fill_holes=bool(fill_holes),
+        core_erosion_iters=int(core_erosion_iters),
+        min_core_voxels=int(min_core_voxels),
+        use_skeleton=True,
+        return_masks=False,
+    )
+
+    summary: dict[str, Any] = {
+        'source': os.path.abspath(os.path.expanduser(source)),
+        'field_path': os.path.abspath(field_path),
+        'Nx': int(Nx),
+        'Ny': int(Ny),
+        'Nz': int(Nz),
+        'S_threshold_2d': float(S_threshold_2d),
+        'charge_cutoff_2d': float(charge_cutoff_2d),
+        'boundary_band_frac': float(boundary_band_frac),
+        'slice_profiles': slice_profiles,
+    }
+    summary.update(defect3d)
+    summary_text = _format_volume_defect_summary(summary)
+
+    out_dir_abs = os.path.abspath(os.path.expanduser(out_dir))
+    if write_files or plot:
+        os.makedirs(out_dir_abs, exist_ok=True)
+    tag = _safe_output_tag(source, field_path, source_kind)
+    csv_path = os.path.join(out_dir_abs, f"{tag}_volume_defect_slices.csv")
+    summary_path = os.path.join(out_dir_abs, f"{tag}_volume_defect_summary.txt")
+    fig_path = os.path.join(out_dir_abs, f"{tag}_volume_defect_profiles.png")
+
+    if write_files:
+        with open(csv_path, 'w', encoding='utf-8', newline='') as f:
+            writer = csv.DictWriter(
+                f,
+                fieldnames=['axis', 'slice_index', 'density', 'defect_count', 'used_plaquettes'],
+            )
+            writer.writeheader()
+            for axis in ('x', 'y', 'z'):
+                for row in slice_rows_by_axis[axis]:
+                    writer.writerow(row)
+        with open(summary_path, 'w', encoding='utf-8') as f:
+            f.write(summary_text + "\n")
+
+    fig = None
+    if plot:
+        fig, axes = plt.subplots(2, 2, figsize=(13, 9))
+        axis_order = ('x', 'y', 'z')
+        plot_axes = [axes[0, 0], axes[0, 1], axes[1, 0]]
+        for ax, axis in zip(plot_axes, axis_order):
+            rows = slice_rows_by_axis[axis]
+            prof = slice_profiles[axis]
+            idx = np.asarray([int(row['slice_index']) for row in rows], dtype=float)
+            dens = np.asarray([float(row['density']) for row in rows], dtype=float)
+            hot = prof['top_slices'][0]
+            ax.plot(idx, dens, color='#1f77b4', linewidth=1.6)
+            ax.scatter([hot['slice_index']], [hot['density']], color='#d62728', s=30, zorder=3)
+            ax.axvline(float(prof['midplane']['slice_index']), color='#444444', linestyle='--', linewidth=1.0, alpha=0.7)
+            band = int(prof['boundary_band_slices'])
+            n_slices = int(prof['n_slices'])
+            if band > 0:
+                ax.axvspan(0, max(0, band - 1), color='#999999', alpha=0.12)
+                ax.axvspan(max(0, n_slices - band), max(0, n_slices - 1), color='#999999', alpha=0.12)
+            ax.set_title(f"{axis.upper()} slices")
+            ax.set_xlabel('slice index')
+            ax.set_ylabel('defect density per used plaquette')
+
+        axes[1, 1].axis('off')
+        text_lines = [
+            f"field: {os.path.basename(field_path)}",
+            f"grid: {Nx} x {Ny} x {Nz}",
+            "",
+            f"line density / system voxel: {float(summary.get('line_density_per_system_voxel', float('nan'))):.6g}",
+            f"core density / system voxel: {float(summary.get('core_density_per_system_voxel', float('nan'))):.6g}",
+            f"droplet/core/skeleton voxels: {int(summary.get('droplet_voxels', 0))} / {int(summary.get('core_voxels', 0))} / {int(summary.get('skeleton_voxels', 0))}",
+            "",
+        ]
+        for axis in axis_order:
+            prof = slice_profiles[axis]
+            hot = prof['top_slices'][0]
+            text_lines.append(
+                f"{axis}: mean={float(prof['mean_density']):.6g}, mid={float(prof['midplane']['density']):.6g}, "
+                f"hot={axis}={int(hot['slice_index'])}:{float(hot['density']):.6g}, "
+                f"boundary share={float(prof['boundary_count_fraction']):.3f}"
+            )
+        text_lines.extend(
+            [
+                "",
+                "Use the 3D densities as KZM candidates.",
+                "Use the slice curves to check whether the signal is shell-localized.",
+            ]
+        )
+        axes[1, 1].text(
+            0.0,
+            1.0,
+            "\n".join(text_lines),
+            va='top',
+            ha='left',
+            fontsize=10,
+            family='monospace',
+        )
+        fig.suptitle(f"Whole-volume defect evaluation: {tag}")
+        fig.tight_layout(rect=(0, 0, 1, 0.96))
+        if write_files:
+            fig.savefig(fig_path, dpi=160, bbox_inches='tight')
+        if show:
+            plt.show()
+        elif close and (not return_fig):
+            plt.close(fig)
+
+    result: dict[str, Any] = {
+        'summary': summary,
+        'summary_text': summary_text,
+        'slice_rows_by_axis': slice_rows_by_axis,
+        'csv_path': csv_path if write_files else None,
+        'summary_path': summary_path if write_files else None,
+        'figure_path': fig_path if (plot and write_files) else None,
+    }
+    if return_fig:
+        result['figure'] = fig
+    return result
 
 
 def _nearest_from_log(iter_log: np.ndarray, values: np.ndarray, iter_target: int) -> float:
@@ -2643,8 +3108,24 @@ def _resolve_run_dir_from_path(path: str) -> str:
     return path
 
 
-def _list_snapshot_files(run_dir: str) -> list[tuple[int, str]]:
-    files = glob.glob(os.path.join(run_dir, 'nematic_field_iter_*.dat'))
+def _run_label_from_dir(run_dir: str) -> str:
+    """Return a stable human-readable label for a run directory.
+
+    Sweep case layouts often store raw files in a generic child like `output/`.
+    In that case, prefer the parent case directory name so aggregated CSVs keep
+    unique labels instead of collapsing to repeated `output` rows.
+    """
+    d_norm = os.path.normpath(os.path.abspath(run_dir))
+    base = os.path.basename(d_norm)
+    if base.lower() in ('output', 'outputs', 'data', 'results'):
+        parent = os.path.basename(os.path.dirname(d_norm))
+        if parent:
+            return parent
+    return base or d_norm
+
+
+def _list_snapshot_files(run_dir: str, prefix: str = 'nematic_field_iter_') -> list[tuple[int, str]]:
+    files = glob.glob(os.path.join(run_dir, f'{prefix}*.dat'))
     out: list[tuple[int, str]] = []
     for fp in files:
         stem = os.path.splitext(os.path.basename(fp))[0]
@@ -2913,14 +3394,14 @@ def _estimate_ramp_from_log(iteration: np.ndarray, time_s: np.ndarray, T_K: np.n
     return t_ramp, rate_abs, 'ramp'
 
 
-def _choose_final_field_file(run_dir: str) -> str:
+def _choose_final_field_file(run_dir: str, iter_prefix: str = 'nematic_field_iter_', final_name: str = 'nematic_field_final.dat') -> str:
     """Pick a representative field file for KZ metrics."""
-    cand = os.path.join(run_dir, 'nematic_field_final.dat')
+    cand = os.path.join(run_dir, final_name)
     if os.path.exists(cand):
         return cand
-    files = glob.glob(os.path.join(run_dir, 'nematic_field_iter_*.dat'))
+    files = glob.glob(os.path.join(run_dir, f'{iter_prefix}*.dat'))
     if not files:
-        raise FileNotFoundError(f"No nematic field files found in {run_dir}")
+        raise FileNotFoundError(f"No snapshot files found in {run_dir} for prefix {iter_prefix}")
 
     def _iter_num(p: str) -> int:
         m = re.search(r'(\d+)', os.path.basename(p))
@@ -2930,14 +3411,22 @@ def _choose_final_field_file(run_dir: str) -> str:
     return files[-1]
 
 
-def _select_snapshot_by_time(run_dir: str, desired_time_s: float, it_log: np.ndarray, t_log: np.ndarray) -> str:
+def _select_snapshot_by_time(
+    run_dir: str,
+    desired_time_s: float,
+    it_log: np.ndarray,
+    t_log: np.ndarray,
+    *,
+    iter_prefix: str = 'nematic_field_iter_',
+    final_name: str = 'nematic_field_final.dat',
+) -> str:
     """Pick the snapshot file whose logged time is closest to desired_time_s."""
-    files = glob.glob(os.path.join(run_dir, 'nematic_field_iter_*.dat'))
+    files = glob.glob(os.path.join(run_dir, f'{iter_prefix}*.dat'))
     if not files:
-        cand = os.path.join(run_dir, 'nematic_field_final.dat')
+        cand = os.path.join(run_dir, final_name)
         if os.path.exists(cand):
             return cand
-        raise FileNotFoundError(f"No nematic_field_iter_*.dat or nematic_field_final.dat in {run_dir}")
+        raise FileNotFoundError(f"No {iter_prefix}*.dat or {final_name} in {run_dir}")
 
     def _iter_num(p: str) -> int:
         m = re.search(r'(\d+)', os.path.basename(p))
@@ -2959,7 +3448,7 @@ def _select_snapshot_by_time(run_dir: str, desired_time_s: float, it_log: np.nda
 
     if best_fp is None:
         # fallback
-        cand = os.path.join(run_dir, 'nematic_field_final.dat')
+        cand = os.path.join(run_dir, final_name)
         if os.path.exists(cand):
             return cand
         files.sort(key=_iter_num)
@@ -3417,7 +3906,7 @@ def aggregate_kz_scaling(
         tau_Q = float(t_ramp)
         rows.append(
             (
-                os.path.basename(run_dir),
+                _run_label_from_dir(run_dir),
                 protocol,
                 tau_Q,
                 rate_abs,
@@ -3561,6 +4050,9 @@ def aggregate_kz_scaling_3d(
     max_r: int | None = None,
     S_droplet: float = 0.1,
     S_core: float = 0.05,
+    beta_min: float = 0.0,
+    core_region_mode: str = 'morphology',
+    shell_exclude_layers: float = 0.0,
     dilate_iters: int = 2,
     fill_holes: bool = False,
     core_erosion_iters: int = 0,
@@ -3640,14 +4132,57 @@ def aggregate_kz_scaling_3d(
         return int(m.group(1)) if m else -1
 
     defect_proxy_norm = (defect_proxy or 'skeleton').strip().lower()
+    needs_qtensor_snapshot = False
     if defect_proxy_norm in ('core', 'core_density', 'corefrac', 'core_fraction', 'volume', 'vox'):
         use_skeleton = False
         defect_col_name = 'core_density_per_system_voxel'
+        defect_metric_kind = 'core_per_system_voxel'
         defect_label = 'core density proxy (core_vox/system_vox)'
+    elif defect_proxy_norm in ('core_droplet', 'core_drop', 'core_per_droplet', 'core_droplet_norm', 'core_fraction_droplet'):
+        use_skeleton = False
+        defect_col_name = 'core_density_per_voxel'
+        defect_metric_kind = 'core_per_droplet_voxel'
+        defect_label = 'core density proxy (core_vox/droplet_vox)'
+    elif defect_proxy_norm in ('skeleton_droplet', 'line_droplet', 'line_per_droplet', 'skeleton_per_droplet', 'line_droplet_norm'):
+        use_skeleton = True
+        defect_col_name = 'line_density_per_voxel'
+        defect_metric_kind = 'line_per_droplet_voxel'
+        defect_label = 'line density proxy (length/droplet_vox)'
+    elif defect_proxy_norm in ('core_biaxial', 'biax_core', 'biaxial_core'):
+        use_skeleton = False
+        needs_qtensor_snapshot = True
+        defect_col_name = 'core_density_per_system_voxel'
+        defect_metric_kind = 'biaxial_core_per_system_voxel'
+        defect_label = 'biaxial core density proxy (core_vox/system_vox)'
+    elif defect_proxy_norm in ('core_biaxial_droplet', 'biax_core_droplet', 'biaxial_core_droplet'):
+        use_skeleton = False
+        needs_qtensor_snapshot = True
+        defect_col_name = 'core_density_per_voxel'
+        defect_metric_kind = 'biaxial_core_per_droplet_voxel'
+        defect_label = 'biaxial core density proxy (core_vox/droplet_vox)'
+    elif defect_proxy_norm in ('skeleton_biaxial', 'biax_skeleton', 'biaxial_skeleton'):
+        use_skeleton = True
+        needs_qtensor_snapshot = True
+        defect_col_name = 'line_density_per_system_voxel'
+        defect_metric_kind = 'biaxial_line_per_system_voxel'
+        defect_label = 'biaxial line density proxy (length/system_vox)'
+    elif defect_proxy_norm in ('skeleton_biaxial_droplet', 'biax_skeleton_droplet', 'biaxial_skeleton_droplet'):
+        use_skeleton = True
+        needs_qtensor_snapshot = True
+        defect_col_name = 'line_density_per_voxel'
+        defect_metric_kind = 'biaxial_line_per_droplet_voxel'
+        defect_label = 'biaxial line density proxy (length/droplet_vox)'
     else:
         use_skeleton = True
         defect_col_name = 'line_density_per_system_voxel'
+        defect_metric_kind = 'line_per_system_voxel'
         defect_label = 'line density proxy (length/system_vox)'
+
+    iter_prefix = 'Qtensor_output_iter_' if needs_qtensor_snapshot else 'nematic_field_iter_'
+    final_name = 'Qtensor_output_final.dat' if needs_qtensor_snapshot else 'nematic_field_final.dat'
+    beta_min_use = float(beta_min) if needs_qtensor_snapshot else 0.0
+    if needs_qtensor_snapshot and beta_min_use <= 0.0:
+        beta_min_use = 0.5
 
     def _compute_3d_metrics_for_field(fp: str):
         xi3, _, _, dims = correlation_length_3d_from_field_file(fp, S_threshold=float(S_threshold_xi), max_r=max_r)
@@ -3657,6 +4192,9 @@ def aggregate_kz_scaling_3d(
             fp,
             S_droplet=float(S_droplet),
             S_core=float(S_core),
+            beta_min=float(beta_min_use),
+            core_region_mode=str(core_region_mode),
+            shell_exclude_layers=float(shell_exclude_layers),
             dilate_iters=int(dilate_iters),
             fill_holes=bool(fill_holes),
             core_erosion_iters=int(core_erosion_iters),
@@ -3685,7 +4223,7 @@ def aggregate_kz_scaling_3d(
             idxs = np.where(np.abs(T - Tmin) <= epsT)[0]
             t_reach = float(t[int(idxs[0])]) if idxs.size else float(t[-1])
             t_meas = t_reach + float(after_Tlow_s)
-            field_path = _select_snapshot_by_time(run_dir, t_meas, it, t)
+            field_path = _select_snapshot_by_time(run_dir, t_meas, it, t, iter_prefix=iter_prefix, final_name=final_name)
         elif measure_norm in ('after_tc', 'after_t_c', 'tc', 'after_transition'):
             if Tc is None or not np.isfinite(float(Tc)):
                 raise ValueError("measure=after_Tc requires Tc to be set")
@@ -3711,16 +4249,16 @@ def aggregate_kz_scaling_3d(
                 off = off_fixed
 
             t_meas = float(t_cross) + float(off)
-            field_path = _select_snapshot_by_time(run_dir, t_meas, it, t)
+            field_path = _select_snapshot_by_time(run_dir, t_meas, it, t, iter_prefix=iter_prefix, final_name=final_name)
         else:
-            field_path = _choose_final_field_file(run_dir)
+            field_path = _choose_final_field_file(run_dir, iter_prefix=iter_prefix, final_name=final_name)
 
         # Retry forward snapshots if the selected one is still too isotropic / empty-mask
         max_retries = 12
         tried = []
         files_sorted = None
         if measure_norm in ('after_tlow', 'after_t_low', 'tlow', 'after_final_t', 'after_tc', 'after_t_c', 'tc', 'after_transition'):
-            files_sorted = glob.glob(os.path.join(run_dir, 'nematic_field_iter_*.dat'))
+            files_sorted = glob.glob(os.path.join(run_dir, f'{iter_prefix}*.dat'))
             files_sorted.sort(key=_iter_num)
 
         fp_try = field_path
@@ -3769,13 +4307,17 @@ def aggregate_kz_scaling_3d(
 
         rows.append(
             (
-                os.path.basename(run_dir),
+                _run_label_from_dir(run_dir),
                 protocol,
                 float(t_ramp),
                 float(rate_abs),
                 float(xi3),
                 float(defect.get('line_length_lattice', float('nan'))),
                 float(defect.get(defect_col_name, float('nan'))),
+                float(defect.get('line_density_per_system_voxel', float('nan'))),
+                float(defect.get('line_density_per_voxel', float('nan'))),
+                float(defect.get('core_density_per_system_voxel', float('nan'))),
+                float(defect.get('core_density_per_voxel', float('nan'))),
                 int(defect.get('system_voxels', int(dims[0]) * int(dims[1]) * int(dims[2]))),
                 int(defect.get('droplet_voxels', 0)),
                 int(defect.get('core_voxels', 0)),
@@ -3786,38 +4328,46 @@ def aggregate_kz_scaling_3d(
                 float(S_threshold_xi),
                 float(S_droplet),
                 float(S_core),
+                float(beta_min_use),
+                str(core_region_mode),
+                float(shell_exclude_layers),
                 int(dilate_iters),
+                bool(fill_holes),
+                int(core_erosion_iters),
                 int(min_core_voxels),
                 os.path.basename(field_path),
                 float(t_cross_row),
                 float(t_sel_row),
                 float(after_tc_actual),
                 int(iter_sel),
+                defect_metric_kind,
             )
         )
 
     out_path = None
     csv_path = None
     tag = os.path.basename(parent_dir) or 'runs'
-    tag_full = f"{tag}_{measure_label}"
+    tag_full = f"{tag}_{measure_label}_{defect_proxy_norm}"
 
     if write_files:
         os.makedirs(out_dir, exist_ok=True)
         csv_path = os.path.join(out_dir, f'kz_scaling3d_{tag_full}.csv')
         with open(csv_path, 'w', encoding='utf-8') as f:
             f.write(
-                'run,protocol,t_ramp_s,rate_K_per_s,xi3d_lattice,line_length_lattice,defect_density_per_system_vox,'
+                'run,protocol,t_ramp_s,rate_K_per_s,xi3d_lattice,line_length_lattice,defect_metric,'
+                'line_density_per_system_vox,line_density_per_droplet_vox,core_density_per_system_vox,core_density_per_droplet_vox,'
                 'system_voxels,droplet_voxels,core_voxels,skeleton_voxels,'
-                'Nx,Ny,Nz,S_threshold_xi,S_droplet,S_core,dilate_iters,min_core_voxels,field_file,'
-                't_cross_s,t_selected_s,after_Tc_actual_s,iter_selected,defect_proxy\n'
+                'Nx,Ny,Nz,S_threshold_xi,S_droplet,S_core,beta_min,core_region_mode,shell_exclude_layers,dilate_iters,fill_holes,core_erosion_iters,min_core_voxels,field_file,'
+                't_cross_s,t_selected_s,after_Tc_actual_s,iter_selected,defect_metric_kind,defect_proxy\n'
             )
             for r in rows:
                 f.write(
                     f"{r[0]},{r[1]},{r[2]:.8g},{r[3]:.8g},{r[4]:.8g},{r[5]:.8g},{r[6]:.8g},"
-                    f"{int(r[7])},{int(r[8])},{int(r[9])},{int(r[10])},"
-                    f"{int(r[11])},{int(r[12])},{int(r[13])},{r[14]:.8g},{r[15]:.8g},{r[16]:.8g},"
-                    f"{int(r[17])},{int(r[18])},{r[19]},"
-                    f"{r[20]:.8g},{r[21]:.8g},{r[22]:.8g},{int(r[23])},{defect_proxy_norm}\n"
+                    f"{r[7]:.8g},{r[8]:.8g},{r[9]:.8g},{r[10]:.8g},"
+                    f"{int(r[11])},{int(r[12])},{int(r[13])},{int(r[14])},"
+                    f"{int(r[15])},{int(r[16])},{int(r[17])},{r[18]:.8g},{r[19]:.8g},{r[20]:.8g},{r[21]:.8g},"
+                    f"{r[22]},{r[23]:.8g},{int(r[24])},{int(bool(r[25]))},{int(r[26])},{int(r[27])},{r[28]},"
+                    f"{r[29]:.8g},{r[30]:.8g},{r[31]:.8g},{int(r[32])},{r[33]},{defect_proxy_norm}\n"
                 )
 
     # Prepare arrays for plotting

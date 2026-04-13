@@ -150,6 +150,17 @@ class QSRGui(tk.Tk):
 		self._plot_canvas_container = None
 		self._plot_status = tk.StringVar(value="")
 
+		# Evaluation tab state
+		self.eval_source = tk.StringVar(value="")
+		self.eval_out_dir = tk.StringVar(value="pics")
+		self._eval_vars: dict[str, tk.Variable] = {}
+		self._eval_fig = None
+		self._eval_canvas = None
+		self._eval_toolbar = None
+		self._eval_canvas_container = None
+		self._eval_status = tk.StringVar(value="")
+		self._eval_text_widget = None
+
 		self._build_ui()
 		self.after(50, self._drain_log_queue)
 
@@ -817,6 +828,7 @@ class QSRGui(tk.Tk):
 						"- 0: no iter snapshots (final-only). Fastest and smallest disk usage.",
 						"- 1 (GIF): save snapshots every snapshotFreq iterations across the whole run.",
 						"- 2 (KZ): save snapshots only near Tc (around Tc_KZ ± Tc_window_K for ramps, or for a fixed window after the step).",
+						"If save_qtensor_snapshots=true, KZ mode also writes matching Qtensor_output_iter_*.dat files for strict biaxial-core analysis.",
 						"Note: snapshots can be very large for 100^3 grids; KZ mode is designed to keep disk usage manageable.",
 					),
 				),
@@ -867,6 +879,18 @@ class QSRGui(tk.Tk):
 						"Smaller values give more temporal resolution for postprocessing but increase disk usage.",
 						"Postprocessing tip: if you compute defect density and correlation length from snapshots, you typically want enough frames to fit power laws on log–log plots without being dominated by noise.",
 						"Start with kzSnapshotFreq ~ 500–2000 and adjust based on runtime/disk constraints.",
+					),
+				),
+				FieldSpec(
+					"save_qtensor_snapshots",
+					"Save Qtensor KZ snapshots",
+					"(default: false)",
+					"tri_bool",
+					help_text=_join_lines(
+						"Only used in snapshot_mode=2 (KZ).",
+						"When enabled, each saved nematic_field_iter_*.dat frame is accompanied by a Qtensor_output_iter_*.dat frame.",
+						"Use this for strict interior defect proxies that combine low S with biaxiality.",
+						"Disk warning: Qtensor snapshots are substantially larger than nematic-field snapshots, so increase kzSnapshotFreq or narrow Tc_window_K if storage is tight.",
 					),
 				),
 				FieldSpec(
@@ -1177,6 +1201,7 @@ class QSRGui(tk.Tk):
 
 		# Plot tab (in-app QSRvis integration)
 		self._build_plot_tab()
+		self._build_evaluation_tab()
 
 		# Log view
 		ttk.Label(log_container, text="Backend output:").pack(side=tk.TOP, anchor=tk.W)
@@ -1343,6 +1368,89 @@ class QSRGui(tk.Tk):
 		canvas_box.pack(side=tk.TOP, fill=tk.BOTH, expand=True, padx=10, pady=(0, 10))
 		self._plot_canvas_container = ttk.Frame(canvas_box)
 		self._plot_canvas_container.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
+
+	def _build_evaluation_tab(self) -> None:
+		eval_tab = ttk.Frame(self.notebook)
+		self.notebook.add(eval_tab, text="Evaluation")
+
+		controls = ttk.Frame(eval_tab)
+		controls.pack(side=tk.TOP, fill=tk.X, padx=10, pady=(10, 6))
+		controls.columnconfigure(1, weight=1)
+
+		self._add_collapsible_info_section(
+			eval_tab,
+			key="evaluation_tab_about",
+			title="About evaluation",
+			text=_join_lines(
+				"This tab evaluates a whole-volume defect observable from a run directory or a specific nematic_field_*.dat snapshot.",
+				"It computes two things together:",
+				"  - 3D low-S core / skeleton defect proxies (candidate Kibble-Zurek observables),",
+				"  - slice-by-slice 2D defect profiles along x/y/z (diagnostic localization only).",
+				"Use the 3D scalar densities for later scaling fits; use the slice profiles to see whether the signal is bulk-wide or shell-localized.",
+				"If Source is blank, the GUI tries the last run output directory; otherwise it falls back to the repo root.",
+				"If you want to inspect localization near nucleation rather than the final state, point Source at a specific nematic_field_iter_*.dat snapshot file.",
+			),
+			wraplength=980,
+		)
+
+		ttk.Label(controls, text="Source (run dir or file):").grid(row=0, column=0, sticky=tk.W)
+		ttk.Entry(controls, textvariable=self.eval_source).grid(row=0, column=1, sticky=tk.EW, padx=(8, 8))
+		ttk.Button(controls, text="Browse…", command=self._browse_eval_source).grid(row=0, column=2, sticky=tk.E)
+
+		ttk.Label(controls, text="Output dir:").grid(row=1, column=0, sticky=tk.W, pady=(6, 0))
+		ttk.Entry(controls, textvariable=self.eval_out_dir, width=20).grid(row=1, column=1, sticky=tk.W, padx=(8, 8), pady=(6, 0))
+
+		btns = ttk.Frame(controls)
+		btns.grid(row=1, column=2, sticky=tk.E, pady=(6, 0))
+		ttk.Button(btns, text="Evaluate", command=self._on_evaluate_volume).pack(side=tk.LEFT)
+		ttk.Button(btns, text="Clear", command=self._clear_evaluation).pack(side=tk.LEFT, padx=(8, 0))
+
+		status_row = ttk.Frame(eval_tab)
+		status_row.pack(side=tk.TOP, fill=tk.X, padx=10, pady=(0, 6))
+		ttk.Label(status_row, textvariable=self._eval_status, foreground="#444").pack(side=tk.LEFT)
+
+		opts = ttk.LabelFrame(eval_tab, text="Evaluation settings")
+		opts.pack(side=tk.TOP, fill=tk.X, padx=10, pady=(0, 8))
+		body = ttk.Frame(opts)
+		body.pack(side=tk.TOP, fill=tk.X, padx=8, pady=8)
+
+		def add_row(frm: ttk.Frame, r: int, label: str, var: tk.Variable, *, width: int = 14) -> None:
+			ttk.Label(frm, text=label).grid(row=r, column=0, sticky=tk.W, pady=2)
+			ttk.Entry(frm, textvariable=var, width=width).grid(row=r, column=1, sticky=tk.W, padx=(8, 16), pady=2)
+
+		self._eval_vars["s2d"] = tk.StringVar(value="0.1")
+		self._eval_vars["qcut"] = tk.StringVar(value="0.25")
+		self._eval_vars["band"] = tk.StringVar(value="0.1")
+		self._eval_vars["sdrop"] = tk.StringVar(value="0.1")
+		self._eval_vars["score"] = tk.StringVar(value="0.05")
+		self._eval_vars["dilate"] = tk.StringVar(value="2")
+		self._eval_vars["mincore"] = tk.StringVar(value="30")
+
+		add_row(body, 0, "2D S_threshold", self._eval_vars["s2d"], width=10)
+		add_row(body, 1, "2D charge_cutoff", self._eval_vars["qcut"], width=10)
+		add_row(body, 2, "boundary_band_frac", self._eval_vars["band"], width=10)
+		add_row(body, 3, "3D S_droplet", self._eval_vars["sdrop"], width=10)
+		add_row(body, 4, "3D S_core", self._eval_vars["score"], width=10)
+		add_row(body, 5, "3D dilate_iters", self._eval_vars["dilate"], width=10)
+		add_row(body, 6, "3D min_core_voxels", self._eval_vars["mincore"], width=10)
+
+		report_box = ttk.LabelFrame(eval_tab, text="Summary")
+		report_box.pack(side=tk.TOP, fill=tk.BOTH, expand=False, padx=10, pady=(0, 8))
+		report_container = ttk.Frame(report_box)
+		report_container.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
+		self._eval_text_widget = tk.Text(report_container, wrap=tk.WORD, height=14)
+		self._eval_text_widget.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+		eval_scroll = ttk.Scrollbar(report_container, orient=tk.VERTICAL, command=self._eval_text_widget.yview)
+		eval_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+		self._eval_text_widget.configure(yscrollcommand=eval_scroll.set, state=tk.DISABLED)
+		self._set_evaluation_text(
+			"Run an evaluation to compute whole-volume defect metrics, save a per-slice CSV, and preview the localization profiles."
+		)
+
+		canvas_box = ttk.LabelFrame(eval_tab, text="Profiles")
+		canvas_box.pack(side=tk.TOP, fill=tk.BOTH, expand=True, padx=10, pady=(0, 10))
+		self._eval_canvas_container = ttk.Frame(canvas_box)
+		self._eval_canvas_container.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
 
 	def _add_collapsible_info_section(
 		self,
@@ -1797,6 +1905,15 @@ class QSRGui(tk.Tk):
 		if p2:
 			self.plot_source.set(p2)
 
+	def _browse_eval_source(self) -> None:
+		p = filedialog.askopenfilename(title="Select file (or cancel to pick folder)")
+		if p:
+			self.eval_source.set(p)
+			return
+		p2 = filedialog.askdirectory(title="Select folder")
+		if p2:
+			self.eval_source.set(p2)
+
 	def _clear_plot(self) -> None:
 		try:
 			import matplotlib.pyplot as plt
@@ -1822,6 +1939,35 @@ class QSRGui(tk.Tk):
 			self._plot_toolbar = None
 		self._plot_status.set("")
 
+	def _clear_evaluation_figure(self) -> None:
+		try:
+			import matplotlib.pyplot as plt
+		except Exception:
+			plt = None
+		if self._eval_fig is not None and plt is not None:
+			try:
+				plt.close(self._eval_fig)
+			except Exception:
+				pass
+		self._eval_fig = None
+		if self._eval_canvas is not None:
+			try:
+				self._eval_canvas.get_tk_widget().destroy()
+			except Exception:
+				pass
+			self._eval_canvas = None
+		if self._eval_toolbar is not None:
+			try:
+				self._eval_toolbar.destroy()
+			except Exception:
+				pass
+			self._eval_toolbar = None
+
+	def _clear_evaluation(self) -> None:
+		self._clear_evaluation_figure()
+		self._set_evaluation_text("")
+		self._eval_status.set("")
+
 	def _display_figure(self, fig: Any) -> None:
 		if FigureCanvasTkAgg is None:
 			raise RuntimeError("Matplotlib Tk backend not available (FigureCanvasTkAgg import failed)")
@@ -1837,6 +1983,21 @@ class QSRGui(tk.Tk):
 			self._plot_toolbar.update()
 			self._plot_toolbar.pack(side=tk.TOP, fill=tk.X)
 
+	def _display_evaluation_figure(self, fig: Any) -> None:
+		if FigureCanvasTkAgg is None:
+			raise RuntimeError("Matplotlib Tk backend not available (FigureCanvasTkAgg import failed)")
+		if self._eval_canvas_container is None:
+			raise RuntimeError("Evaluation canvas container not initialized")
+		self._clear_evaluation_figure()
+		self._eval_fig = fig
+		self._eval_canvas = FigureCanvasTkAgg(fig, master=self._eval_canvas_container)
+		self._eval_canvas.draw()
+		self._eval_canvas.get_tk_widget().pack(side=tk.TOP, fill=tk.BOTH, expand=True)
+		if NavigationToolbar2Tk is not None:
+			self._eval_toolbar = NavigationToolbar2Tk(self._eval_canvas, self._eval_canvas_container)
+			self._eval_toolbar.update()
+			self._eval_toolbar.pack(side=tk.TOP, fill=tk.X)
+
 	def _abs_out_dir(self) -> str:
 		out_dir = self.plot_out_dir.get().strip() or "pics"
 		p = Path(out_dir).expanduser()
@@ -1851,6 +2012,30 @@ class QSRGui(tk.Tk):
 		if self.last_out_dir is not None:
 			return str(self.last_out_dir)
 		return str(_repo_root())
+
+	def _abs_eval_out_dir(self) -> str:
+		out_dir = self.eval_out_dir.get().strip() or "pics"
+		p = Path(out_dir).expanduser()
+		if not p.is_absolute():
+			p = _repo_root() / p
+		return str(p)
+
+	def _pick_eval_source(self) -> str:
+		s = self.eval_source.get().strip()
+		if s:
+			return s
+		if self.last_out_dir is not None:
+			return str(self.last_out_dir)
+		return str(_repo_root())
+
+	def _set_evaluation_text(self, text: str) -> None:
+		if self._eval_text_widget is None:
+			return
+		self._eval_text_widget.configure(state=tk.NORMAL)
+		self._eval_text_widget.delete("1.0", tk.END)
+		if text:
+			self._eval_text_widget.insert(tk.END, text)
+		self._eval_text_widget.configure(state=tk.DISABLED)
 
 	def _pick_field_file(self, src: str) -> str:
 		p = Path(src).expanduser()
@@ -1896,8 +2081,14 @@ class QSRGui(tk.Tk):
 		argv = [argv0, str(Path(__file__).resolve())] + sys.argv[1:]
 		os.execv(argv0, argv)
 
-	def _handle_missing_plot_dependency(self, err: BaseException) -> None:
-		"""Show a clear message for missing plotting deps (matplotlib / QSRvis stack)."""
+	def _handle_missing_plot_dependency(
+		self,
+		err: BaseException,
+		*,
+		context: str = "Plot",
+		status_var: tk.StringVar | None = None,
+	) -> None:
+		"""Show a clear message for missing plotting/evaluation deps."""
 		missing = None
 		if isinstance(err, ModuleNotFoundError):
 			missing = err.name
@@ -1908,7 +2099,7 @@ class QSRGui(tk.Tk):
 			self._offer_relaunch_with_venv(missing=missing)
 
 		msg = _join_lines(
-			f"Plotting requires extra Python packages, but the current interpreter cannot import '{missing}'.",
+			f"Plotting/evaluation requires extra Python packages, but the current interpreter cannot import '{missing}'.",
 			"",
 			"Why this happens:",
 			"  You likely started the GUI with system Python (e.g. /usr/bin/python3) instead of the repo virtualenv.",
@@ -1924,12 +2115,13 @@ class QSRGui(tk.Tk):
 			f"Current Python: {sys.executable}",
 		)
 		try:
-			messagebox.showerror("Plotting dependencies missing", msg)
+			messagebox.showerror("Visualization dependencies missing", msg)
 		except Exception:
 			# If Tk messagebox isn't available for some reason, fall back to log/status.
 			pass
-		self._plot_status.set(f"Plotting unavailable: missing '{missing}'")
-		self._append_log(f"[GUI][Plot] Missing dependency: {missing} (python={sys.executable})\n")
+		target_status = status_var if status_var is not None else self._plot_status
+		target_status.set(f"{context} unavailable: missing '{missing}'")
+		self._append_log(f"[GUI][{context}] Missing dependency: {missing} (python={sys.executable})\n")
 
 	class _GuiLogStream(io.TextIOBase):
 		encoding = "utf-8"
@@ -1978,7 +2170,7 @@ class QSRGui(tk.Tk):
 			import matplotlib.pyplot as plt
 			import numpy as np
 		except ModuleNotFoundError as e:
-			self._handle_missing_plot_dependency(e)
+			self._handle_missing_plot_dependency(e, context="Plot", status_var=self._plot_status)
 			return
 		except Exception as e:
 			self._plot_status.set(f"Import failed: {e}")
@@ -2402,6 +2594,67 @@ class QSRGui(tk.Tk):
 			except Exception as e:
 				self._plot_status.set(f"Plot failed: {e}")
 				self._append_log(f"[GUI][Plot] Error: {e}\n")
+
+	def _on_evaluate_volume(self) -> None:
+		self._eval_status.set("Evaluating…")
+		src = self._pick_eval_source()
+		out_dir = self._abs_eval_out_dir()
+		try:
+			import QSRvis as v
+		except ModuleNotFoundError as e:
+			self._handle_missing_plot_dependency(e, context="Evaluation", status_var=self._eval_status)
+			return
+		except Exception as e:
+			self._eval_status.set(f"Import failed: {e}")
+			self._append_log(f"[GUI][Evaluation] Import failed: {e}\n")
+			return
+
+		import contextlib
+		from typing import cast
+		out_stream = QSRGui._GuiLogStream(self, prefix="[Evaluation] ")
+		err_stream = QSRGui._GuiLogStream(self, prefix="[Evaluation][stderr] ")
+		with contextlib.redirect_stdout(cast(Any, out_stream)), contextlib.redirect_stderr(cast(Any, err_stream)):
+			try:
+				sthr = float(str(self._eval_vars["s2d"].get()).strip() or "0.1")
+				qcut = float(str(self._eval_vars["qcut"].get()).strip() or "0.25")
+				band = float(str(self._eval_vars["band"].get()).strip() or "0.1")
+				sdrop = float(str(self._eval_vars["sdrop"].get()).strip() or "0.1")
+				score = float(str(self._eval_vars["score"].get()).strip() or "0.05")
+				dilate = int(float(str(self._eval_vars["dilate"].get()).strip() or "2"))
+				mincore = int(float(str(self._eval_vars["mincore"].get()).strip() or "30"))
+				res = v.evaluate_volume_defects(
+					src,
+					out_dir=out_dir,
+					S_threshold_2d=sthr,
+					charge_cutoff_2d=qcut,
+					boundary_band_frac=band,
+					S_droplet=sdrop,
+					S_core=score,
+					dilate_iters=dilate,
+					min_core_voxels=mincore,
+					plot=True,
+					write_files=True,
+					show=False,
+					close=False,
+					return_fig=True,
+				)
+				fig = res.get("figure")
+				if fig is not None:
+					self._display_evaluation_figure(fig)
+				else:
+					self._clear_evaluation_figure()
+				self._set_evaluation_text(str(res.get("summary_text", "")).strip())
+				saved_paths = [
+					str(p)
+					for p in (res.get("summary_path"), res.get("csv_path"), res.get("figure_path"))
+					if p
+				]
+				self._eval_status.set(f"Saved evaluation -> {out_dir}")
+				if saved_paths:
+					self._append_log(f"[GUI][Evaluation] Saved: {', '.join(saved_paths)}\n")
+			except Exception as e:
+				self._eval_status.set(f"Evaluation failed: {e}")
+				self._append_log(f"[GUI][Evaluation] Error: {e}\n")
 
 	def _collect_config_items(self) -> dict[str, str]:
 		items: dict[str, str] = {}
