@@ -482,3 +482,23 @@ Historical output paths preserve the directory names that were in use when a bra
 * Polished the launcher around the production-review workflow.
     * `version_catalog.py` bumps the GUI to `1.0.1`.
     * `GUI.py` now moves the `About` tab to the far right, hides `L_stab` and `jacobi_iters` when IMEX is off, and omits those keys from generated configs when semi-implicit stepping is disabled so stale hidden values do not leak into runs.
+
+## 14-04-2026
+
+### v0.4.9
+
+* Clarified the paper-facing production figures and manuscript captions for the current confined-KZ draft.
+    * `tools/generate_production_review_figures.py` now labels the bulk refinement pairs explicitly as the base `ramp300` and slower `ramp600` matched coarse/fine pairs instead of leaving them as ambiguous `standard` or `dt/2` labels.
+    * The size-`200^3` review figures were cleaned up so crowded legends no longer sit on top of the key curves, the sparse-ladder candidate-band legend is explicit, and the branch-comparison bars use short tick labels that are explained in the manuscript caption.
+* Tightened the manuscript methodology language around the confined exponent.
+    * `research_template_Socratic_Lectures/manuscript_qsr_kz_confined.tex` now explains why the confined study quotes a late-window operational exponent instead of claiming a direct measurement of `\hat t` or `\hat \xi`, and it states explicitly why fixed `dt` is required when the quench schedule and readout windows are defined in physical time.
+    * The manuscript now also defines `support fraction` as geometric plaquette support and `defect share` or `defect weight` as the fraction of total detected defects in the chosen shell band, which removes an earlier ambiguity in the size-comparison discussion.
+
+### v0.4.10
+
+* Made the production-review figures read more like conference-facing evidence and less like internal shorthand.
+    * `tools/generate_production_review_figures.py` now labels the XY reference line as a `3D XY Model A` Kibble-Zurek estimate, annotates the bulk `ramp300` and `ramp600` matched-refinement figure as a same-protocol smaller-`dt` control, rewrites the matched-rate `200^3` panel labels in terms of defect-search geometry versus detected defects, and replaces the sparse-ladder branch bars with sparse-control points against a dense `100^3` reference band.
+    * The sparse `100^3` and `200^3` ladder labels are now explicit about which highlighted bands are sparse auto-selected controls and which are fixed `[2,10)` comparisons.
+* Tightened the manuscript around the benchmark and control language used by those figures.
+    * `research_template_Socratic_Lectures/manuscript_qsr_kz_confined.tex` now defines the XY benchmark slope as the standard Model A Kibble-Zurek estimate with an explicit dynamic-critical reference, explains the bulk refinement figure as halving `dt` while doubling iteration counts at fixed physical protocol, and rewrites the size-`200^3` captions so `support`, `defect weight`, and the sparse-family branches are described in plain physical terms.
+    * The manuscript also removes the last legacy `Kibble-\.{Z}urek` spelling remnants and marks the sparse `200^3` four-quench value as a control-only quantity rather than a candidate exponent estimate.

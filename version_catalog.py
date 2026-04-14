@@ -24,7 +24,7 @@ COMPONENT_VERSIONS: tuple[ComponentVersion, ...] = (
 		key="qsr_cuda",
 		label="Confined QSR solver",
 		artifact="exe/QSR_cuda",
-		version="0.4.8",
+		version="0.4.10",
 		notes="Active CUDA solver branch.",
 	),
 	ComponentVersion(

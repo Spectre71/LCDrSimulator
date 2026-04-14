@@ -340,7 +340,7 @@ def plot_xy_benchmark(output_dir: Path) -> Path:
         color="#9a3412",
         linewidth=1.8,
         linestyle="--",
-        label=fr"3D XY expectation $m={expected_slope:.3f}$",
+        label=fr"3D XY Model A KZ estimate $m={expected_slope:.3f}$",
     )
     ax_main.set_title("A. Final-state benchmark")
     ax_main.set_xlabel(r"Quench time $\tau_Q$")
@@ -457,7 +457,7 @@ def plot_bulk_protocol_convergence(output_dir: Path) -> Path:
         ("rel_xi_grad_proxy_diff", r"$\xi_{grad}$", "#b45309"),
     ]
 
-    for rows, linestyle, suffix in ((standard_rows, "-", "dt/2"), (ramp600_rows, "--", "ramp600 dt/2")):
+    for rows, linestyle, suffix in ((standard_rows, "-", "base ramp300 pair"), (ramp600_rows, "--", "slower ramp600 pair")):
         x_ns = np.array([to_float(row["offset_s"]) * 1e9 for row in rows], dtype=float)
         for column, label, color in metric_specs:
             y = np.array([to_float(row[column]) for row in rows], dtype=float)
@@ -471,7 +471,23 @@ def plot_bulk_protocol_convergence(output_dir: Path) -> Path:
                 label=f"{label} ({suffix})",
             )
 
-    ax_top.set_title("A. Bulk protocol refinement over the post-$T_c$ timeline")
+    refine_note = (
+        "Matched refinement keeps the physical quench fixed:\n"
+        "fine run uses $\\Delta t/2$ with doubled iteration counts.\n"
+        "Solid = ramp300 pair, dashed = ramp600 pair."
+    )
+    ax_top.text(
+        0.02,
+        0.04,
+        refine_note,
+        transform=ax_top.transAxes,
+        ha="left",
+        va="bottom",
+        fontsize=8.9,
+        color="#0f172a",
+        bbox={"boxstyle": "round,pad=0.25", "facecolor": "white", "edgecolor": "#cbd5e1", "alpha": 0.92},
+    )
+    ax_top.set_title(r"A. Same physical ramp, smaller $\Delta t$")
     ax_top.set_xlabel(r"Offset after $T_c$ [ns]")
     ax_top.set_ylabel("Relative coarse/fine mismatch")
     style_axis(ax_top)
@@ -494,13 +510,13 @@ def plot_bulk_protocol_convergence(output_dir: Path) -> Path:
 
     standard_heights = np.where(standard_values > 0.0, standard_values, display_floor)
     ramp600_heights = np.where(ramp600_values > 0.0, ramp600_values, display_floor)
-    bars_standard = ax_bottom.bar(x - width / 2.0, standard_heights, width, color="#475569", alpha=0.88, label="standard pair")
-    bars_ramp600 = ax_bottom.bar(x + width / 2.0, ramp600_heights, width, color="#0f766e", alpha=0.88, label="ramp600 pair")
+    bars_standard = ax_bottom.bar(x - width / 2.0, standard_heights, width, color="#475569", alpha=0.88, label="base ramp300 matched pair")
+    bars_ramp600 = ax_bottom.bar(x + width / 2.0, ramp600_heights, width, color="#0f766e", alpha=0.88, label="slower ramp600 matched pair")
     ax_bottom.set_yscale("log")
     ax_bottom.set_ylim(display_floor, 2e-2)
     ax_bottom.set_xticks(x, labels)
     ax_bottom.set_ylabel("Final-state relative mismatch")
-    ax_bottom.set_title("B. Final-state agreement after matched protocol refinement")
+    ax_bottom.set_title(r"B. Final-state mismatch after matched $\Delta t$ refinement")
     style_axis(ax_bottom, grid_axis="y")
     ax_bottom.legend(loc="upper right", frameon=False)
 
@@ -733,8 +749,8 @@ def plot_size200_matched_rate_shift(output_dir: Path) -> Path:
 
     x_ns = np.array([to_float(row["offset_ns"]) for row in rows], dtype=float)
 
-    fig = plt.figure(figsize=(13.4, 4.8))
-    grid = fig.add_gridspec(1, 3, width_ratios=[1.35, 1.0, 0.95], wspace=0.28)
+    fig = plt.figure(figsize=(14.0, 4.8))
+    grid = fig.add_gridspec(1, 3, width_ratios=[1.35, 1.0, 0.95], wspace=0.34)
     ax_density = fig.add_subplot(grid[0, 0])
     ax_weights = fig.add_subplot(grid[0, 1])
     ax_depth = fig.add_subplot(grid[0, 2])
@@ -753,8 +769,6 @@ def plot_size200_matched_rate_shift(output_dir: Path) -> Path:
     ax_density.set_xlabel(r"Late window after $T_c$ [ns]")
     ax_density.set_ylabel(r"$200^3 / 100^3$")
     style_axis(ax_density)
-    ax_density.legend(loc="lower right", frameon=False)
-
     support_ratio = np.array(
         [to_float(row["focus_support_frac_200"]) / to_float(row["focus_support_frac_100"]) for row in rows],
         dtype=float,
@@ -763,24 +777,104 @@ def plot_size200_matched_rate_shift(output_dir: Path) -> Path:
         [to_float(row["focus_defect_frac_200"]) / to_float(row["focus_defect_frac_100"]) for row in rows],
         dtype=float,
     )
-    ax_weights.plot(x_ns, support_ratio, color="#1d4ed8", marker="o", ms=5.2, linewidth=1.8, label="focus support")
-    ax_weights.plot(x_ns, defect_ratio, color="#c2410c", marker="s", ms=5.2, linewidth=1.8, label="focus defect share")
+    ax_weights.plot(
+        x_ns,
+        support_ratio,
+        color="#1d4ed8",
+        marker="o",
+        ms=5.2,
+        linewidth=1.8,
+        label="geometry share\nin [2,10)",
+    )
+    ax_weights.plot(
+        x_ns,
+        defect_ratio,
+        color="#c2410c",
+        marker="s",
+        ms=5.2,
+        linewidth=1.8,
+        label="defect share\nin [2,10)",
+    )
     ax_weights.axhline(1.0, color="#475569", linewidth=1.0, linestyle="--")
-    ax_weights.set_title("B. Shell-adjacent weight loss")
+    ax_weights.text(
+        0.03,
+        0.05,
+        "Both ratios drop below 1;\n"
+        "defect share falls more than geometry share.",
+        transform=ax_weights.transAxes,
+        ha="left",
+        va="bottom",
+        fontsize=8.5,
+        color="#0f172a",
+        bbox={"boxstyle": "round,pad=0.22", "facecolor": "white", "edgecolor": "#cbd5e1", "alpha": 0.9},
+    )
+    ax_weights.set_title("B. [2,10) geometry vs defect share")
     ax_weights.set_xlabel(r"Late window after $T_c$ [ns]")
-    ax_weights.set_ylabel(r"$200^3 / 100^3$")
+    ax_weights.set_ylabel(r"$200^3 / 100^3$ ratio of [2,10) share")
     style_axis(ax_weights)
-    ax_weights.legend(loc="upper right", frameon=False)
+    ax_weights.legend(loc="upper right", bbox_to_anchor=(1.0, 0.98), frameon=False)
 
     support_depth = np.array([to_float(row["support_depth_mean_200"]) for row in rows], dtype=float)
     defect_depth = np.array([to_float(row["defect_depth_mean_200"]) for row in rows], dtype=float)
-    ax_depth.plot(x_ns, support_depth, color="#2563eb", marker="o", ms=5.2, linewidth=1.8, label="support-weighted")
-    ax_depth.plot(x_ns, defect_depth, color="#b91c1c", marker="s", ms=5.2, linewidth=1.8, label="defect-weighted")
-    ax_depth.set_title(r"C. $200^3$ shell-depth moments")
+    depth_gap = defect_depth - support_depth
+    depth_mask = (np.isfinite(support_depth) & np.isfinite(defect_depth)).tolist()
+    ax_depth.fill_between(
+        x_ns,
+        support_depth,
+        defect_depth,
+        where=depth_mask,
+        color="#fb923c",
+        alpha=0.16,
+    )
+    ax_depth.plot(
+        x_ns,
+        support_depth,
+        color="#2563eb",
+        marker="o",
+        ms=5.2,
+        linewidth=1.8,
+        label="defect-search mean depth",
+    )
+    ax_depth.plot(
+        x_ns,
+        defect_depth,
+        color="#b91c1c",
+        marker="s",
+        ms=5.2,
+        linewidth=1.8,
+        label="detected-defect mean depth",
+    )
+    ax_depth.text(
+        0.04,
+        0.05,
+        fr"defects sit deeper by about {np.nanmean(depth_gap):.1f} layers",
+        transform=ax_depth.transAxes,
+        ha="left",
+        va="bottom",
+        fontsize=8.5,
+        color="#0f172a",
+        bbox={"boxstyle": "round,pad=0.22", "facecolor": "white", "edgecolor": "#cbd5e1", "alpha": 0.9},
+    )
+    ax_depth.set_title("C. Defects sit deeper than geometry")
     ax_depth.set_xlabel(r"Late window after $T_c$ [ns]")
-    ax_depth.set_ylabel("Mean shell depth [layers]")
+    ax_depth.set_ylabel(r"Mean shell depth in $200^3$ [layers]")
     style_axis(ax_depth)
-    ax_depth.legend(loc="upper left", frameon=False)
+    ax_depth.annotate(
+        "detected-defect mean depth",
+        (x_ns[-1], defect_depth[-1]),
+        xytext=(-142, 6),
+        textcoords="offset points",
+        color="#b91c1c",
+        fontsize=9.2,
+    )
+    ax_depth.annotate(
+        "defect-search mean depth",
+        (x_ns[-1], support_depth[-1]),
+        xytext=(-142, -2),
+        textcoords="offset points",
+        color="#2563eb",
+        fontsize=9.2,
+    )
 
     path = production_path(output_dir, "08_confined_size200_matched_rate_shift.png")
     save_figure(fig, path)
@@ -808,14 +902,30 @@ def plot_size200_sparse_ladder(output_dir: Path) -> Path:
     )
     size200_alpha = np.array([to_float(row["mean_density_slope_vs_rate"]) for row in size200_band_rows], dtype=float)
 
-    ax_bands.scatter(sparse100_support, sparse100_alpha, color="#93c5fd", edgecolor="none", s=36, alpha=0.85, label="100^3 sparse bands")
-    ax_bands.scatter(size200_support, size200_alpha, color="#fca5a5", edgecolor="none", s=40, alpha=0.8, label="200^3 sparse bands")
+    ax_bands.scatter(
+        sparse100_support,
+        sparse100_alpha,
+        color="#93c5fd",
+        edgecolor="none",
+        s=36,
+        alpha=0.85,
+        label=r"sparse $100^3$ candidate bands",
+    )
+    ax_bands.scatter(
+        size200_support,
+        size200_alpha,
+        color="#fca5a5",
+        edgecolor="none",
+        s=40,
+        alpha=0.8,
+        label=r"sparse $200^3$ candidate bands",
+    )
 
     highlight_specs = (
-        (sparse100_band_rows, "[2,6)", "#1d4ed8", "o", "100^3 [2,6)", (-58, 10)),
-        (size200_band_rows, "[2,6)", "#b91c1c", "s", "200^3 [2,6)", (8, 8)),
-        (sparse100_band_rows, "[2,10)", "#0f766e", "D", "100^3 [2,10)", (8, 8)),
-        (size200_band_rows, "[2,10)", "#c2410c", "^", "200^3 [2,10)", (8, -14)),
+        (sparse100_band_rows, "[2,6)", "#1d4ed8", "o", r"$100^3$ sparse auto [2,6)", (-72, 10)),
+        (size200_band_rows, "[2,6)", "#b91c1c", "s", r"$200^3$ sparse auto [2,6)", (8, 8)),
+        (sparse100_band_rows, "[2,10)", "#0f766e", "D", r"$100^3$ fixed [2,10)", (8, 8)),
+        (size200_band_rows, "[2,10)", "#c2410c", "^", r"$200^3$ sparse fixed [2,10)", (8, -14)),
     )
     for rows, label, color, marker, note, offset in highlight_specs:
         row = find_exact_row(rows, band_label=label)
@@ -824,11 +934,11 @@ def plot_size200_sparse_ladder(output_dir: Path) -> Path:
         ax_bands.scatter([x_val], [y_val], color=color, marker=marker, s=92, zorder=3)
         ax_bands.annotate(note, (x_val, y_val), xytext=offset, textcoords="offset points", fontsize=8.8, color=color)
 
-    ax_bands.set_title("A. Sparse-ladder band selection by droplet size")
+    ax_bands.set_title("A. Sparse-ladder candidate bands (control only)")
     ax_bands.set_xlabel("Mean support fraction across windows")
     ax_bands.set_ylabel(r"Mean density exponent $\alpha$")
     style_axis(ax_bands)
-    ax_bands.legend(loc="lower right", frameon=False)
+    ax_bands.legend(loc="upper right", frameon=False)
 
     sparse100_focus = find_exact_row(sparse100_common_rows, region="focus", observable="density")
     size200_focus = find_exact_row(size200_common_rows, region="focus", observable="density")
@@ -837,35 +947,61 @@ def plot_size200_sparse_ladder(output_dir: Path) -> Path:
     size200_bulk = find_exact_row(size200_common_rows, region="bulk", observable="density")
 
     compare_cases = (
-        ("100^3 sparse\nauto [2,6)", to_float(sparse100_focus["alpha_rate_common"]), to_float(sparse100_focus["alpha_rate_ci95_norm"]), "#2563eb"),
-        ("200^3 sparse\nauto [2,6)", to_float(size200_focus["alpha_rate_common"]), to_float(size200_focus["alpha_rate_ci95_norm"]), "#b91c1c"),
-        ("100^3 dense\nfixed [2,10)", to_float(dense100_fixed["alpha_rate_common"]), to_float(dense100_fixed["alpha_rate_ci95_norm"]), "#0f766e"),
-        ("200^3 sparse\nfixed [2,10)", to_float(size200_fixed["alpha_rate_common"]), to_float(size200_fixed["alpha_rate_ci95_norm"]), "#c2410c"),
-        ("200^3 sparse\nbulk [10,inf)", to_float(size200_bulk["alpha_rate_common"]), to_float(size200_bulk["alpha_rate_ci95_norm"]), "#475569"),
+        ("$100^3$ sparse\nauto [2,6)", to_float(sparse100_focus["alpha_rate_common"]), to_float(sparse100_focus["alpha_rate_ci95_norm"]), "#2563eb", "o"),
+        ("$200^3$ sparse\nauto [2,6)", to_float(size200_focus["alpha_rate_common"]), to_float(size200_focus["alpha_rate_ci95_norm"]), "#b91c1c", "s"),
+        ("$200^3$ sparse\nfixed [2,10)", to_float(size200_fixed["alpha_rate_common"]), to_float(size200_fixed["alpha_rate_ci95_norm"]), "#c2410c", "^"),
+        ("$200^3$ sparse\nbulk $[10,\\infty)$", to_float(size200_bulk["alpha_rate_common"]), to_float(size200_bulk["alpha_rate_ci95_norm"]), "#475569", "D"),
     )
     x = np.arange(len(compare_cases), dtype=float)
     values = np.array([case[1] for case in compare_cases], dtype=float)
     errors = np.array([case[2] for case in compare_cases], dtype=float)
-    colors = [case[3] for case in compare_cases]
+    dense_ref = to_float(dense100_fixed["alpha_rate_common"])
+    dense_ref_err = to_float(dense100_fixed["alpha_rate_ci95_norm"])
 
-    bars = ax_compare.bar(x, values, color=colors, alpha=0.9)
-    ax_compare.errorbar(x, values, yerr=errors, fmt="none", ecolor="#0f172a", elinewidth=1.0, capsize=3)
+    ax_compare.axhspan(
+        dense_ref - dense_ref_err,
+        dense_ref + dense_ref_err,
+        color="#bbf7d0",
+        alpha=0.45,
+        label=r"dense $100^3$ fixed [2,10) baseline",
+        zorder=0,
+    )
+    ax_compare.axhline(dense_ref, color="#047857", linewidth=1.5, linestyle="--", zorder=1)
+    for idx, (label, value, error, color, marker) in enumerate(compare_cases):
+        ax_compare.errorbar(
+            idx,
+            value,
+            yerr=error,
+            fmt=marker,
+            ms=8.0,
+            color=color,
+            mfc=color,
+            mec="#0f172a",
+            ecolor=color,
+            elinewidth=1.1,
+            capsize=4,
+            linestyle="none",
+            zorder=3,
+        )
     ax_compare.axhline(0.0, color="#475569", linewidth=1.0)
+    ax_compare.text(
+        0.03,
+        0.05,
+        "Sparse branches are shown only as controls\nfor point-subsampling bias.",
+        transform=ax_compare.transAxes,
+        ha="left",
+        va="bottom",
+        fontsize=8.5,
+        color="#0f172a",
+        bbox={"boxstyle": "round,pad=0.22", "facecolor": "white", "edgecolor": "#cbd5e1", "alpha": 0.9},
+    )
+    ax_compare.set_xlim(-0.6, len(compare_cases) - 0.4)
+    ax_compare.set_ylim(-0.02, max(np.max(values + errors), dense_ref + dense_ref_err) * 1.15)
     ax_compare.set_xticks(x, [case[0] for case in compare_cases])
-    ax_compare.set_title("B. Size-200 sparse ladder versus the active dense baseline")
+    ax_compare.set_title(r"B. Sparse-control branches vs dense $100^3$ band")
     ax_compare.set_ylabel(r"Positive exponent $\alpha$")
     style_axis(ax_compare, grid_axis="y")
-
-    for bar, value in zip(bars, values, strict=True):
-        ax_compare.text(
-            bar.get_x() + bar.get_width() / 2.0,
-            value + 0.018,
-            f"{value:.3f}",
-            ha="center",
-            va="bottom",
-            fontsize=8.7,
-            color="#0f172a",
-        )
+    ax_compare.legend(loc="upper right", frameon=False)
 
     path = production_path(output_dir, "09_confined_size200_sparse_ladder.png")
     save_figure(fig, path)
